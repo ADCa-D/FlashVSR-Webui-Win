@@ -51,6 +51,7 @@ TLS_KEY = os.environ.get(
 AUTH_USERS = os.path.join(WORK, "auth_users.json")
 AUTH_IPS = os.path.join(WORK, "auth_ips.json")
 AUTH_SECRET = os.path.join(WORK, "auth_secret.txt")
+PWD_HINT = os.path.join(WORK, "首次登录密码.txt")
 COOKIE = "fs_sess"
 COOKIE_AGE = 30 * 86400
 
@@ -112,6 +113,13 @@ def _init_users():
         salt = uuid.uuid4().hex[:16]
         users["admin"] = dict(salt=salt, iter=PBKDF2_ITER, hash=_hash_pw(salt, pwd))
         _save_json(AUTH_USERS, users)
+        # 首次密码同时写一份到文件：控制台容易被关掉/日志被覆盖，丢了就只能重置
+        try:
+            with open(PWD_HINT, "w", encoding="utf-8") as f:
+                f.write(f"用户名: admin\n密码: {pwd}\n"
+                        f"（登录成功一次后本文件自动删除；要改密码就删 work/auth_users.json 重启）\n")
+        except OSError:
+            pass
         print("=" * 56, flush=True)
         print(f"  已创建登录账号   用户名: admin   密码: {pwd}", flush=True)
         print(f"  （记录在 {AUTH_USERS}，可用 FLASHVSR_USER/FLASHVSR_PASS 覆盖）", flush=True)
@@ -223,6 +231,11 @@ async def login_submit(request):
         return web.Response(text=html, content_type="text/html", status=401)
     ip = request.remote or ""
     _allow_ip(ip, user)                    # 记住这个 IP
+    try:                                   # 已成功登录一次，删掉明文提示文件
+        if os.path.isfile(PWD_HINT):
+            os.remove(PWD_HINT)
+    except OSError:
+        pass
     resp = web.HTTPFound("/")
     resp.set_cookie(COOKIE, _sign(f"{user}|{int(time.time()) + COOKIE_AGE}"),
                     max_age=COOKIE_AGE, httponly=True, samesite="Lax",
