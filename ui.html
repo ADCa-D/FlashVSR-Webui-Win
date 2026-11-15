@@ -360,6 +360,17 @@ $('#clearCache').onclick = async () => {
 };
 loadCache();
 
+// 刷新/换设备打开时：如果已有任务在跑，自动接上进度
+(async () => {
+  try {
+    const c = await (await fetch('/api/current')).json();
+    if (c && c.job) {
+      startWatch(c.job);
+      $('#stage').textContent = '已接上正在运行的任务…';
+    }
+  } catch(e) {}
+})();
+
 function watch(id){
   if(es) es.close();
   es = new EventSource('/api/progress/' + id);
@@ -410,7 +421,11 @@ function watch(id){
       loadHist(); loadCache();
     }
   };
-  es.onerror = () => { es.close(); $('#go').disabled = false; };
+  es.onerror = () => {
+    es.close();
+    $('#go').disabled = false;
+    $('#stage').innerHTML += ' <span style="color:#ff5f5f">（进度连接断开：刷新页面会自动接上）</span>';
+  };
 }
 
 // ---------- 编码器能力

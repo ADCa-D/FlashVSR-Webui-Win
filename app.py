@@ -264,6 +264,50 @@ async def auth_ips_clear(request):
 
 
 
+def _pid_alive(pid):
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}", "/NH"],
+                             capture_output=True, text=True, errors="replace", timeout=10)
+        return str(int(pid)) in (out.stdout or "")
+    except Exception:
+        return False
+
+
+def _adopt_orphans():
+    """面板重启后，把还没跑完的 worker 认领回来（进度不可见，但知道它在跑）。"""
+    try:
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+              "Where-Object { $_.CommandLine -match 'worker\\.py' } | "
+              "ForEach-Object { $_.ProcessId.ToString() + ' ' + $_.CommandLine }")
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, errors="replace", timeout=30)
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            m = re.match(r"^(\d+)\s+.*?work[\\/]([0-9a-f]{12})\.json", line)
+            if not m:
+                continue
+            pid, jid = int(m.group(1)), m.group(2)
+            if jid in JOBS or not _pid_alive(pid):
+                continue
+            JOBS[jid] = dict(
+                id=jid, name="(重启前启动的任务)", stage="seg", cur=0, total=0,
+                msg=f"面板重启前启动，进度不可见（worker PID {pid}）；跑完会出现在历史里",
+                started=time.time(), done=False, error=None, out=None, info=None,
+                params=None, orphan=True, pid=pid,
+            )
+            print(f"[adopt] 认领 worker PID {pid} → job {jid}", flush=True)
+    except Exception as e:  # noqa
+        print(f"[adopt] 跳过：{type(e).__name__}: {e}", flush=True)
+
+
+def _prune_orphans():
+    for jid, j in list(JOBS.items()):
+        if j.get("orphan") and not j.get("done") and not _pid_alive(j.get("pid", 0)):
+            j["done"] = True
+            j["stage"] = "done"
+            j["msg"] = "重启前的任务已结束（成品在历史里）"
+
+
 def new_job(name):
     jid = uuid.uuid4().hex[:12]
     JOBS[jid] = dict(
@@ -923,6 +967,17 @@ async def cancel(request):
     return web.json_response({"ok": True, "killed": killed})
 
 
+async def current_job(request):
+    """正在跑/最近的任务，用于刷新页面后自动接上进度。"""
+    _prune_orphans()
+    for jid, j in JOBS.items():
+        if not j.get("done"):
+            return web.json_response({"job": jid, "name": j.get("name"),
+                                      "stage": j.get("stage"),
+                                      "orphan": bool(j.get("orphan"))})
+    return web.json_response({"job": None})
+
+
 async def status(request):
     loaded = ENGINE.pipe is not None
     busy = any(not j.get("done") for j in JOBS.values())
@@ -933,6 +988,7 @@ def main():
     app = web.Application(client_max_size=8 * 1024 ** 3, middlewares=[auth_middleware])
     _gc_pending()
     _gc_preview()
+    _adopt_orphans()
     app.add_routes([
         web.get("/login", login_page),
         web.post("/login", login_submit),
@@ -956,6 +1012,7 @@ def main():
         web.post("/api/unload", unload),
         web.post("/api/job/cancel/{job}", cancel),
         web.get("/api/status", status),
+        web.get("/api/current", current_job),
     ])
     asyncio.run(serve(app))
 
@@ -994,6 +1051,10 @@ async def serve(app):
                 print(f"FlashVSR 面板（手机/无证书客户端，明文需登录）："
                       f"http://{tls_host}:{plain_port}", flush=True)
         except OSError as e:
+            if label == "本机":
+                # 本机端口都绑不上（通常是另一个面板实例还在跑）→ 直接退出，别静默空转
+                print(f"[错误] 本机端口 8288 绑定失败：{e}", flush=True)
+                raise
             # 典型场景：EasyTier 还没连上，66.66.66.67 不存在 → 不能因此拖死本机端口
             print(f"[警告] {label}端口启动失败（{e}）；其它入口继续工作", flush=True)
     await asyncio.Event().wait()
