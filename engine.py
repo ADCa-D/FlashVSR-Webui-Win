@@ -465,8 +465,9 @@ class Engine:
         self.pipe = None
         self.loaded_key = None
         self._orig_attn = None
+        self.trt = None
 
-    def ensure_loaded(self, mode="tiny", attention="sparse", on_stage=None, quant="none"):
+    def ensure_loaded(self, mode="tiny", attention="sparse", on_stage=None, quant="none", prewarm=None):
         key = (mode, attention, quant)
         if self.pipe is not None and self.loaded_key == key:
             return
@@ -521,6 +522,56 @@ class Engine:
             dec.decode_video = _decode_cl
         except Exception as e:  # noqa
             print(f"[FlashVSR] channels_last 未启用: {e}", flush=True)
+
+        # VAE 解码换 TensorRT（逐帧 9 个 past，实测 ~1.8×；任何异常都回退 torch）
+        try:
+            import trt_decoder
+            self.trt = trt_decoder.maybe_enable(
+                dec, os.path.join(os.environ.get("TEMP", "."), "flashvsr_trt_cache"),
+                log=lambda s: print(f"[TRT] {s}", flush=True))
+        except Exception as e:  # noqa
+            self.trt = None
+            print(f"[FlashVSR] TRT 解码未启用: {type(e).__name__}: {e}", flush=True)
+
+        # 建 TRT 引擎需要 3 GB workspace：临时把常驻的 DiT 挪到 CPU，建完搬回。
+        # 引擎会缓存到磁盘（TEMP\flashvsr_trt_cache），只有第一次要付这个代价。
+        if self.trt is not None and getattr(self.pipe, "dit", None) is not None:
+            dit = self.pipe.dit
+
+            def _offload_dit():
+                try:
+                    if any(p.is_cuda for p in dit.parameters()):
+                        before = torch.cuda.mem_get_info()[0]
+                        dit.to("cpu")
+                        torch.cuda.empty_cache()
+                        after = torch.cuda.mem_get_info()[0]
+                        print(f"[TRT] DiT 临时卸到 CPU：空闲 {before/2**30:.1f} → {after/2**30:.1f} GB",
+                              flush=True)
+                        return True
+                    print(f"[TRT] DiT 已在 CPU，空闲 {torch.cuda.mem_get_info()[0]/2**30:.1f} GB", flush=True)
+                except Exception as e:  # noqa
+                    print(f"[TRT] 卸 DiT 失败：{e}", flush=True)
+                return False
+
+            def _restore_dit(was_moved):
+                if was_moved:
+                    try:
+                        dit.to("cuda:0")
+                        print(f"[TRT] DiT 搬回显存，空闲 {torch.cuda.mem_get_info()[0]/2**30:.1f} GB",
+                              flush=True)
+                    except Exception as e:  # noqa
+                        print(f"[TRT] DiT 搬回显存失败：{e}", flush=True)
+
+            self.trt.before_build = _offload_dit
+            self.trt.after_build = _restore_dit
+
+        # 在 DiT 上卡之前把解码引擎建好（此时显存最空；引擎同时落盘，后续 ~1 s 加载）
+        if self.trt is not None and prewarm and hasattr(self.trt, "prewarm"):
+            try:
+                self.trt.prewarm(int(prewarm[0]), int(prewarm[1]))
+            except Exception as e:  # noqa
+                print(f"[TRT] 预热失败（会在首次解码时重试）：{type(e).__name__}: {str(e)[:200]}",
+                      flush=True)
 
         if quant in ("nvfp4", "mxfp8"):
             dit_to_cuda(self.pipe)
@@ -581,7 +632,8 @@ class Engine:
         total = len(frames)
         on_stage("decode", total, total, f"共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
         self.ensure_loaded(params.get("mode") or "tiny-long", params.get("attention") or "sparse",
-                           on_stage, quant=params.get("quant") or "none")
+                           on_stage, quant=params.get("quant") or "none",
+                           prewarm=(max(16, int(params["tile"]) * int(params["scale"]) // 8),) * 2)
 
         chunk = max(0, int(params.get("chunk") or 0))
         overlap = max(0, min(int(params.get("overlap") or 8), max(0, chunk // 4)))
@@ -719,6 +771,7 @@ class Engine:
     def unload(self):
         self.pipe = None
         self.mod = None
+        self.trt = None
         import gc
         gc.collect()
         torch.cuda.empty_cache()

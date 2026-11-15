@@ -6,6 +6,11 @@ work/
 *.npy
 *.log
 
+# TRT / ONNX 中间产物（bench 生成，几百 MB）
+*.onnx
+*.engine
+trt_cache/
+
 # Python
 __pycache__/
 *.py[cod]

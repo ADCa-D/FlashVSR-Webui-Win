@@ -566,7 +566,7 @@ async def segments(request):
                 continue
             man = E.load_manifest(p) or {}
             done = len(man.get("done") or {})
-            total = int(man.get("total") or len(man.get("plans") or []) or 0)
+            total = len(man.get("plans") or []) or int(man.get("total") or 0)
             b, _ = _dir_size(p)
             dirs.append(dict(key=name, done=done, total=total, mb=round(b / 1048576, 1)))
     return web.json_response(dict(bytes=size, mb=round(size / 1048576, 1),

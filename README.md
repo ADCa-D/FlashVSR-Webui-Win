@@ -38,6 +38,22 @@
 | 时序一致性（512 帧成片） | 段边界异常度 z 均值 **−0.07**，成片/源帧间差分比 **0.95** |
 | `tiny` vs `tiny-long` | 50.1 vs 50.5 s，峰值 6.01 vs **5.86 GiB**，输出**逐位一致** |
 
+### 解码器（TCDecoder）为什么默认不走 TensorRT
+
+VAE 解码占 kernel 时间约 65%，理论上最值得加速。实测确实能加速，但**8 GB 卡装不下**：
+
+| 方案 | 解码单帧（latent 96 / 768² 输出） | 端到端 4× 25 帧 | 显存代价 | 结果 |
+|---|---|---|---|---|
+| torch eager（默认） | 164 ms | 62 s | — | ✅ |
+| torch.compile（融合 cat/conv/add/relu） | 141 ms（1.16×） | OOM | inductor 额外吃 ~2 GB | ❌ |
+| TensorRT（fp16 + 9 个显式 past） | ~90 ms（约 1.8×） | OOM | 构建 3 GB workspace，会话常驻 3.2 GB | ❌ |
+| fp16 替代 bf16 | 162 ms（1.3%） | — | 0 | 无意义 |
+
+- TRT 版解码器**数值与 torch 逐帧路径完全一致**（同 fp16 时 maxdiff 0.0；bf16 权重下 0.012），代码在 `trt_decoder.py`，`FLASHVSR_DEC_BACKEND=trt` 可开（16 GB 以上显卡值得一试）。
+- 卡住的原因是显存，不是速度：DiT(MXFP8) 1.5 GB + 推理激活 ~2.4 GB + TRT 会话 3.2 GB + CUDA context 0.6 GB > 8 GB。
+- 2× 路径（latent 48）能装下并跑通，但端到端只有 **1.06×**（33.9 → 32.0 s）——解码在 2× 任务里占比只有 ~8 s，被固定开销摊薄，不值得多装 1.9 GB 依赖。
+
+
 ## 环境要求
 
 - Windows 10/11
