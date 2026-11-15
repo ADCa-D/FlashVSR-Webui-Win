@@ -120,6 +120,31 @@ D:\ComfyUI_windows_portable\python_embeded\python.exe -c "from huggingface_hub i
 > 主模型建议校验 sha256：`bd28180edcf3446c028e32fc6b731a80bf7e4da2ab4caac3186b9499964d37be`。
 > 国内直连 HF 不通时：hf-mirror 只有 ~0.1 MB/s，走本地代理 8 线程分段能到 ~5 MB/s。
 
+#### 可选：自建模型镜像（国内下载更快）
+
+原模型是 **Apache-2.0**，允许再分发。如果想让国内用户少折腾，可以在 ModelScope 建一份镜像：
+
+```bash
+pip install modelscope
+# 拉原版
+modelscope download --model JunhaoZhuang/FlashVSR-v1.1 --local_dir ./FlashVSR-v1.1
+# 传到自己的空间（首次会提示登录）
+modelscope upload <你的空间>/FlashVSR-v1.1 ./FlashVSR-v1.1
+```
+
+或者传到自己的 HuggingFace repo：
+
+```python
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo("FlashVSR-v1.1", repo_type="model", exist_ok=True)
+api.upload_folder(folder_path=r"D:\ComfyUI_windows_portable\ComfyUI\models\FlashVSR-v1.1",
+                  repo_id="<你的账号>/FlashVSR-v1.1", repo_type="model")
+```
+
+之后把上面的 `JunhaoZhuang/FlashVSR-v1.1` 换成你的镜像 id 即可，其余步骤（目录名、校验、文件清单）完全一样。
+**注意**：镜像请保留原仓库的 LICENSE 与出处说明。
+
 ### 5. 启动
 
 ```powershell
