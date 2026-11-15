@@ -353,6 +353,7 @@ def _resolve_params(fields, src_path=None):
     budget = fields.get("budget") or "auto"
     if budget not in ("auto", "fixed"):
         budget = "auto"
+    preview = str(fields.get("preview", "1")).lower() not in ("0", "false", "off", "no")
     try:
         quality = int(float(fields.get("quality") or 15))
     except ValueError:
@@ -362,7 +363,7 @@ def _resolve_params(fields, src_path=None):
     return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
                 attention=attention, encoder=encoder, quality=quality,
                 quant=quant, budget=budget, pre_scale=pre_scale,
-                tile_overlap=tile_overlap, auto_note=auto_note)
+                tile_overlap=tile_overlap, preview=preview, auto_note=auto_note)
 
 
 # ---------------------------------------------------------------- 待确认任务 / 分段缓存
@@ -530,6 +531,7 @@ async def run(request):
     encoder, quality, quant = P["encoder"], P["quality"], P["quant"]
     budget, pre_scale = P["budget"], P["pre_scale"]
     tile_overlap = P["tile_overlap"]
+    preview = P["preview"]
     auto_note = P.get("auto_note")
 
     if resume_action == "restart":
@@ -588,7 +590,7 @@ async def run(request):
                        encoder=encoder, quality=quality,
                        quant=quant, budget=budget, pre_scale=pre_scale,
                        tile_overlap=tile_overlap,
-                       preview_dir=os.path.join(WORK, "preview", jid),
+                       preview_dir=(os.path.join(WORK, "preview", jid) if preview else None),
                        restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))
 
