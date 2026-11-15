@@ -294,6 +294,19 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 
 要点：`stride` 取整会跳变，overlap 16 这种中间值**没有任何收益**（tile 数还是 24）；只有跨过 12 才少一整排 tile。
 
+### 矩形 tile：试过了，负收益
+
+| tile | tile 数 | 峰值显存 | 同机耗时 | 接缝 PSNR |
+|---|---|---|---|---|
+| 128×128（ov12） | 18 | 4886 MiB | 53 s | — |
+| 128×192 | 12 | 5870 MiB | 54 s | 43.53 dB |
+| 128×256 | 9 | 6662 MiB | 59 s | 43.60 dB |
+
+成本取决于**重复覆盖面积** `1 ÷ [(1-ov/th)(1-ov/tw)]`，不是 tile 个数：
+`128×128/ov12 = 1.22×`、`128×192/ov12 = 1.18×`（只省 3%）、`ov24 = 1.51×`。
+矩形只改形状、不改重复率，所以白涨显存。代码保留 `tile_h/tile_w`，默认不用。
+
+
 ### tile 对齐规则（很重要）
 
 节点内部会把**每个 tile 的输出**居中裁到 128 的倍数（`compute_scaled_and_target_dims`）。

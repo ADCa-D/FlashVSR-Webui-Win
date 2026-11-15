@@ -8,6 +8,7 @@
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -118,6 +119,42 @@ def _should_quant(name: str) -> bool:
     """只量化主干（blocks.* / LQ_proj_in.*）。time_embedding / head 等层 token 极少（M 甚至 =1），
     满足不了 fp4/fp8 的行对齐，而且耗时占比接近 0。"""
     return name.startswith("blocks.") or name.startswith("LQ_proj_in.")
+
+
+def _patch_tile_coords(mod):
+    """节点的 calculate_tile_coords 只支持正方形 tile；这里换成支持 (th, tw)。
+
+    只改坐标生成：flashvsr() 后面所有逻辑（裁剪、羽化、画布累加）都由坐标推导，
+    所以替换它是安全的。羽化宽度仍由 tile_overlap 决定。
+    """
+    orig = getattr(mod, "calculate_tile_coords", None)
+    if orig is None or getattr(orig, "_rect", False):
+        return orig
+
+    def coords(height, width, tile_size, overlap):
+        if isinstance(tile_size, (tuple, list)):
+            th, tw = int(tile_size[0]), int(tile_size[1])
+        else:
+            th = tw = int(tile_size)
+        stride_h = max(1, th - overlap)
+        stride_w = max(1, tw - overlap)
+        rows = math.ceil((height - overlap) / stride_h)
+        cols = math.ceil((width - overlap) / stride_w)
+        out = []
+        for r in range(rows):
+            for c in range(cols):
+                y1, x1 = r * stride_h, c * stride_w
+                y2, x2 = min(y1 + th, height), min(x1 + tw, width)
+                if y2 - y1 < th:
+                    y1 = max(0, y2 - th)
+                if x2 - x1 < tw:
+                    x1 = max(0, x2 - tw)
+                out.append((x1, y1, x2, y2))
+        return out
+
+    coords._rect = True
+    mod.calculate_tile_coords = coords
+    return coords
 
 
 def dit_to_cuda(pipe):
@@ -480,6 +517,7 @@ class Engine:
             on_stage("load", 0, 1, f"加载模型（mode={mode}, attn={attention}, quant={quant}）")
         _set_cudnn_benchmark(True)
         self.mod = load_node_module()
+        _patch_tile_coords(self.mod)          # 支持矩形 tile（tile_h × tile_w）
         wan = sys.modules["flashvsr_node.src.models.wan_video_dit"]
 
         if attention == "dense":
@@ -592,6 +630,7 @@ class Engine:
 
     def _run_window(self, frames_u8, scale, tile, kv, on_tile=None, sparse=2.0, local=11,
                     tile_overlap=24):
+        """tile 可以是 int（正方形）或 (th, tw)（矩形）。"""
         """force_offload=False：每 tile 结束把 2.84 GB DiT 卸到 CPU 再搬回要多花 ~2.9 s/tile。"""
         mod = self.mod
         orig = mod.cqdm
@@ -626,7 +665,7 @@ class Engine:
             frames = torch.from_numpy(np.ascontiguousarray(frames_u8)).float().div_(255.0)
             out = mod.flashvsr(
                 self.pipe, frames, int(scale), True, True, True,
-                int(tile), int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
+                tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
             return (out.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
         finally:
             mod.cqdm = orig
@@ -661,7 +700,12 @@ class Engine:
 
         def run_win(win, tile, kv, cb=None):
             sp, lr, kk = budget_for(win, kv)
-            res = self._run_window(win, params["scale"], tile, kk, cb, sparse=sp, local=lr,
+            base_h = tile[0] if isinstance(tile, (tuple, list)) else tile
+            base_w = tile[1] if isinstance(tile, (tuple, list)) else tile
+            th_t = int(params.get("tile_h") or base_h)
+            tw_t = int(params.get("tile_w") or base_w)
+            tshape = (th_t, tw_t) if th_t != tw_t else th_t
+            res = self._run_window(win, params["scale"], tshape, kk, cb, sparse=sp, local=lr,
                                    tile_overlap=int(params.get("tile_overlap") or 24))
             return res, sp, lr, kk
 
