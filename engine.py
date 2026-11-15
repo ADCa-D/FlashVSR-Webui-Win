@@ -403,26 +403,61 @@ def probe(path):
     return dict(w=w, h=h, fps=fps, duration=dur, frames=frames, has_audio=has_audio)
 
 
+def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0):
+    """拼 ffmpeg 命令；start_frame/count 给定时只解这一段（输入侧 -ss + 精确 seek）。"""
+    vf = None
+    if abs(pre_scale - 1.0) > 1e-6:
+        tw = max(2, int(round(w * pre_scale / 2)) * 2)
+        th = max(2, int(round(h * pre_scale / 2)) * 2)
+        vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
+        w, h = tw, th
+    cmd = [FFMPEG, "-v", "error"]
+    if vf:
+        cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+    if start_frame:
+        # -ss 放 -i 前（快速 seek）+ accurate_seek 保证落在指定帧
+        cmd += ["-ss", f"{start_frame / max(fps, 1e-6):.6f}", "-accurate_seek"]
+    cmd += ["-i", path]
+    if vf:
+        cmd += ["-vf", vf]
+    if count:
+        cmd += ["-frames:v", str(int(count))]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    return cmd, w, h
+
+
+def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress=None):
+    """只解 [start, start+count) 这一段，返回 uint8 NHWC（内存只跟段长有关）。"""
+    info = probe(path)
+    if info["w"] <= 0 or info["h"] <= 0:
+        raise RuntimeError("读不到视频尺寸，文件可能不是视频")
+    cmd, w, h = _decode_cmd(path, info["w"], info["h"], pre_scale, start, count, fps)
+    frame_bytes = w * h * 3
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    chunks, n = [], 0
+    while n < count:
+        buf = proc.stdout.read(frame_bytes)
+        if not buf or len(buf) < frame_bytes:
+            break
+        chunks.append(buf)
+        n += 1
+        if on_progress and n % 10 == 0:
+            on_progress(n)
+    proc.wait()
+    if not chunks:
+        return np.zeros((0, h, w, 3), np.uint8)
+    return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3)
+
+
 def decode_frames(path, on_progress=None, pre_scale=1.0):
     """解成 uint8 NHWC。pre_scale<1 用 libplacebo(spline36) 在核显上降采样。"""
     info = probe(path)
     w, h = info["w"], info["h"]
     if w <= 0 or h <= 0:
         raise RuntimeError("读不到视频尺寸，文件可能不是视频")
-    vf = None
+    cmd, w, h = _decode_cmd(path, w, h, pre_scale)
     if abs(pre_scale - 1.0) > 1e-6:
-        tw = max(2, int(round(w * pre_scale / 2)) * 2)
-        th = max(2, int(round(h * pre_scale / 2)) * 2)
-        vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
-        info["w"], info["h"] = tw, th
-        w, h = tw, th
-    cmd = [FFMPEG, "-v", "error"]
-    if vf:
-        cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
-    cmd += ["-i", path]
-    if vf:
-        cmd += ["-vf", vf]
-    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        info["w"], info["h"] = w, h
     frame_bytes = w * h * 3
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     chunks, n = [], 0
@@ -671,17 +706,29 @@ class Engine:
             mod.cqdm = orig
 
     def upscale_video(self, src, dst, params, on_stage):
-        frames, info = decode_frames(
-            src, on_progress=lambda n: on_stage("decode", n, 0, f"解码中 {n} 帧"),
-            pre_scale=float(params.get("pre_scale") or 1.0))
-        total = len(frames)
-        on_stage("decode", total, total, f"共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
+        pre_scale = float(params.get("pre_scale") or 1.0)
+        chunk = max(0, int(params.get("chunk") or 0))
+        overlap = max(0, min(int(params.get("overlap") or 8), max(0, chunk // 4)))
+
+        # 分段时只解当前窗口需要的帧（原来会把整段视频一次解完，30 帧/段也照样吃满内存）
+        info = probe(src)
+        total = int(info.get("frames") or 0) or int(round(info.get("duration", 0) * info.get("fps", 25)))
+        frames = None
+        if chunk <= 0 or total <= chunk or total <= 0:
+            frames, info = decode_frames(
+                src, on_progress=lambda n: on_stage("decode", n, 0, f"解码中 {n} 帧"),
+                pre_scale=pre_scale)
+            total = len(frames)
+            on_stage("decode", total, total, f"共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
+        else:
+            if abs(pre_scale - 1.0) > 1e-6:
+                info["w"] = max(2, int(round(info["w"] * pre_scale / 2)) * 2)
+                info["h"] = max(2, int(round(info["h"] * pre_scale / 2)) * 2)
+            on_stage("decode", 0, total, f"分段解码：共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
+
         self.ensure_loaded(params.get("mode") or "tiny-long", params.get("attention") or "sparse",
                            on_stage, quant=params.get("quant") or "none",
                            prewarm=(max(16, int(params["tile"]) * int(params["scale"]) // 8),) * 2)
-
-        chunk = max(0, int(params.get("chunk") or 0))
-        overlap = max(0, min(int(params.get("overlap") or 8), max(0, chunk // 4)))
         audio = src if info["has_audio"] else None
         quality = int(params.get("quality") or 15)
         backend = resolve_encoder(params.get("encoder"))
@@ -784,7 +831,20 @@ class Engine:
             if str(i) in done:
                 on_stage("seg", i + 1, n_seg, f"段 {i + 1}/{n_seg} 已完成，跳过")
                 continue
-            win = frames[win_start:win_end]
+            if frames is not None:
+                win = frames[win_start:win_end]
+            else:
+                on_stage("decode", win_start, total, f"解码 {win_start}–{win_end} 帧")
+                win = decode_frames_range(src, win_start, win_end - win_start,
+                                          pre_scale=pre_scale, fps=info["fps"],
+                                          on_progress=lambda n, ws=win_start: on_stage(
+                                              "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
+                if len(win) != win_end - win_start:
+                    # VFR/帧数不准：用实际解出的帧修正窗口
+                    win_end = win_start + len(win)
+                    keep = win_end - start
+                    if keep <= 0:
+                        break
             on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg}：{win_start}–{win_end} 帧")
 
             def tile_cb(c, t, i=i):

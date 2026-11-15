@@ -299,10 +299,6 @@ class StageTRTDecoder(TRTDecoder):
     保留代码仅作为「此路不通」的记录。
     """
 
-    语义与原逐帧路径一致：段间状态 = 「上一帧在本层 MemBlock 的输入」；
-    段内顺序不变；TGrow 留在 torch 里（只是一个 1×1 conv + reshape）。
-    """
-
     def _walk(self, h, w, dt):
         """走一遍真实数据流，返回 (层→输入形状, TGrow 索引)。"""
         dec = self.dec.decoder
