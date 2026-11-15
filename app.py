@@ -8,6 +8,7 @@ FlashVSR 独立面板（aiohttp，无 ComfyUI 依赖）
 """
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -109,6 +110,24 @@ async def run(request):
         scale = int(fields.get("scale", 4))
         tile = int(fields.get("tile", 128))
         kv = float(fields.get("kv", 3.0))
+
+    # 节点内部会把每个 tile 的输出裁到 128 的倍数（compute_scaled_and_target_dims），
+    # 若 tile*scale 不是 128 的倍数，裁掉的部分会让拼贴几何错位 → 接缝。这里提前对齐。
+    step = 128 // math.gcd(128, max(1, int(scale)))
+    if tile % step:
+        tile = max(step, (tile // step) * step)
+
+    # 2× 的两种实现：
+    #   pre_scale=1.0 → 原生 scale=2（快，但 LQ 比训练分布清楚一倍，文字易扭）
+    #   pre_scale=0.5 → 源降采样一半再走 4×（模型留在训练分布内，输出仍是 2×）
+    pre_scale = 1.0
+    twox = fields.get("twox") or "downscale"
+    if int(scale) == 2 and twox == "downscale":
+        scale, pre_scale = 4, 0.5
+        tile = max(64, tile // 2)          # 输入减半，tile 相应缩小才是同一块画面
+        step = 128 // math.gcd(128, int(scale))
+        if tile % step:
+            tile = max(step, (tile // step) * step)
     chunk = int(fields.get("chunk", 0) or 0)
     mode = fields.get("mode") or "tiny-long"
     if mode not in ("tiny", "tiny-long"):
@@ -140,7 +159,7 @@ async def run(request):
     JOBS[jid]["params"] = dict(scale=scale, tile=tile, kv=kv, chunk=chunk,
                                mode=mode, attention=attention,
                                encoder=encoder, quality=quality,
-                               quant=quant, budget=budget)
+                               quant=quant, budget=budget, pre_scale=pre_scale)
     waiting = sum(1 for k, j in JOBS.items() if k != jid and not j.get("done"))
     if waiting:
         JOBS[jid]["msg"] = f"排队中（前面还有 {waiting} 个任务）"
@@ -156,7 +175,7 @@ async def run(request):
     base_params = dict(scale=scale, tile=tile, kv=kv, chunk=chunk, overlap=8,
                        mode=mode, attention=attention,
                        encoder=encoder, quality=quality,
-                       quant=quant, budget=budget,
+                       quant=quant, budget=budget, pre_scale=pre_scale,
                        restart=bool(int(fields.get("restart", 0) or 0)),
                        seg_dir=os.path.join(WORK, "segments"))
 

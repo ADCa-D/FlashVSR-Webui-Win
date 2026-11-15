@@ -250,7 +250,7 @@ def quick_hash(path, chunk=1 << 20):
 
 
 def _param_key(params):
-    keys = ("scale", "tile", "kv", "chunk", "overlap", "mode", "attention", "quant")
+    keys = ("scale", "tile", "kv", "chunk", "overlap", "mode", "attention", "quant", "pre_scale")
     return hashlib.sha1(json.dumps({k: params.get(k) for k in keys}, sort_keys=True).encode()).hexdigest()[:8]
 
 
@@ -371,7 +371,7 @@ def decode_frames(path, on_progress=None, pre_scale=1.0):
     if abs(pre_scale - 1.0) > 1e-6:
         tw = max(2, int(round(w * pre_scale / 2)) * 2)
         th = max(2, int(round(h * pre_scale / 2)) * 2)
-        vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=rgb24"
+        vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
         info["w"], info["h"] = tw, th
         w, h = tw, th
     cmd = [FFMPEG, "-v", "error"]
@@ -630,7 +630,7 @@ class Engine:
                       params_kv=params.get("kv"), params_chunk=params.get("chunk"),
                       params_overlap=params.get("overlap"), params_mode=params.get("mode"),
                       params_attention=params.get("attention"), params_quant=params.get("quant"),
-                      total=total)
+                      params_pre_scale=params.get("pre_scale"), total=total)
         same = bool(man) and all(man.get(k) == v for k, v in expect.items())
         if not same:
             shutil.rmtree(seg_dir, ignore_errors=True)

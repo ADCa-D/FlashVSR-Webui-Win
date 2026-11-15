@@ -125,6 +125,15 @@
     </div>
     <div class="hint" id="encHint"></div>
     <div class="row">
+      <span class="lk">2× 实现</span>
+      <select id="twox">
+        <option value="downscale" selected>降采样/2 + 4×（保真）</option>
+        <option value="native">原生 scale=2（快）</option>
+      </select>
+      <span class="hint" style="margin:0">仅当目标是 2× 时生效</span>
+    </div>
+
+    <div class="row">
       <label class="chk"><input type="checkbox" id="budgetAuto" checked /> 运动自适应预算（静止镜头省算力）</label>
     </div>
 
@@ -212,7 +221,8 @@ $('#go').onclick = async () => {
   fd.append('encoder', $('#encoder').value);
   fd.append('quality', $('#quality').value);
   fd.append('quant', $('#quant').value);
-  fd.append('budget', $('#budgetAuto').checked ? 'auto' : 'fixed');  let r, j;
+  fd.append('budget', $('#budgetAuto').checked ? 'auto' : 'fixed');
+  fd.append('twox', $('#twox').value);  let r, j;
   try {
     r = await fetch('/api/run', {method:'POST', body: fd});
     j = await r.json();
