@@ -59,6 +59,13 @@ def _sha(s):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+PBKDF2_ITER = 200_000
+
+
+def _hash_pw(salt, pwd, it=PBKDF2_ITER):
+    return hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt.encode("utf-8"), it).hex()
+
+
 def _load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -97,13 +104,13 @@ def _init_users():
     env_pass = os.environ.get("FLASHVSR_PASS")
     if env_user and env_pass:
         salt = uuid.uuid4().hex[:16]
-        users[env_user] = dict(salt=salt, hash=_sha(salt + env_pass))
+        users[env_user] = dict(salt=salt, iter=PBKDF2_ITER, hash=_hash_pw(salt, env_pass))
         _save_json(AUTH_USERS, users)
         return users
     if not users:
         pwd = uuid.uuid4().hex[:10]
         salt = uuid.uuid4().hex[:16]
-        users["admin"] = dict(salt=salt, hash=_sha(salt + pwd))
+        users["admin"] = dict(salt=salt, iter=PBKDF2_ITER, hash=_hash_pw(salt, pwd))
         _save_json(AUTH_USERS, users)
         print("=" * 56, flush=True)
         print(f"  已创建登录账号   用户名: admin   密码: {pwd}", flush=True)
@@ -201,7 +208,15 @@ async def login_submit(request):
     user = (data.get("username") or "").strip()
     pwd = data.get("password") or ""
     rec = USERS.get(user)
-    ok = bool(rec) and hmac.compare_digest(rec["hash"], _sha(rec["salt"] + pwd))
+    ok = False
+    if rec:
+        if rec.get("iter"):
+            ok = hmac.compare_digest(rec["hash"], _hash_pw(rec["salt"], pwd, rec["iter"]))
+        else:                                   # 旧格式（sha256），验证后自动升级
+            ok = hmac.compare_digest(rec["hash"], _sha(rec["salt"] + pwd))
+            if ok:
+                rec.update(iter=PBKDF2_ITER, hash=_hash_pw(rec["salt"], pwd))
+                _save_json(AUTH_USERS, USERS)
     if not ok:
         await asyncio.sleep(0.6)          # 拖慢暴力尝试
         html = LOGIN_HTML.replace("%ERR%", "用户名或密码不对")
