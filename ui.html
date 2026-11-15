@@ -56,6 +56,14 @@
   .err{color:var(--err);font-size:12.5px;white-space:pre-wrap}
   .foot{grid-column:1/-1;color:#5c6579;font-size:12px;text-align:center}
   a{color:var(--accent)}
+  .cache{color:var(--dim);font-size:11.5px;margin-top:8px}
+  .modal{position:fixed;inset:0;background:rgba(4,6,10,.72);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px}
+  .modal.hidden{display:none}
+  .modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;max-width:540px;width:100%;box-shadow:0 18px 50px #0008}
+  .modal h3{margin:0 0 10px;font-size:15px}
+  .modal .detail{color:var(--dim);font-size:12.5px;line-height:1.7}
+  .modal .detail b{color:var(--ok)}
+  .modal .detail code{background:#0f131b;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:11.5px}
 </style>
 </head>
 <body>
@@ -125,12 +133,13 @@
     </div>
     <div class="hint" id="encHint"></div>
     <div class="row">
-      <span class="lk">2× 实现</span>
-      <select id="twox">
-        <option value="downscale" selected>降采样/2 + 4×（保真）</option>
-        <option value="native">原生 scale=2（快）</option>
+      <span class="lk">输入预缩放</span>
+      <select id="prescale">
+        <option value="auto" selected>自动（目标 2× 时先 /2）</option>
+        <option value="half">强制 /2 + 4× 模型（输出恒 2×）</option>
+        <option value="off">关闭（不预缩放）</option>
       </select>
-      <span class="hint" style="margin:0">仅当目标是 2× 时生效</span>
+      <span class="hint" style="margin:0">/2 走核显 libplacebo(spline36)</span>
     </div>
 
     <div class="row">
@@ -141,7 +150,9 @@
       <button id="go" disabled>开始超分</button>
       <button id="cancelBtn" class="ghost" disabled>取消任务</button>
       <button id="unload" class="ghost">释放显存</button>
+      <button id="clearCache" class="ghost">忘记历史缓存</button>
     </div>
+    <div class="cache" id="cacheInfo"></div>
 
     <div class="bar"><i id="fill"></i></div>
     <div id="stage">等待开始…</div>
@@ -164,6 +175,19 @@
 
   <div class="foot">模型：D:\ComfyUI_windows_portable\ComfyUI\models\FlashVSR-v1.1 · 输出：flashvsr-web\out</div>
 </main>
+
+<div id="modal" class="modal hidden">
+  <div class="box">
+    <h3>检测到未跑完的历史进度</h3>
+    <div class="detail" id="mInfo"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="mResume">继续上次</button>
+      <button id="mRestart" class="ghost">从头开始</button>
+      <button id="mForget" class="ghost">忘记历史缓存</button>
+      <button id="mCancel" class="ghost">取消</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -206,32 +230,118 @@ function presetParams(){
 }
 
 // ---------- 提交
+function collectFields(){
+  const o = {};
+  Object.entries(presetParams()).forEach(([k, v]) => o[k] = v);
+  o.chunk = $('#chunkOn').checked ? $('#chunk').value : '0';
+  o.restart = $('#resume').checked ? '0' : '1';
+  o.mode = $('#mode').value;
+  o.attention = $('#attention').value;
+  o.encoder = $('#encoder').value;
+  o.quality = $('#quality').value;
+  o.quant = $('#quant').value;
+  o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
+  o.prescale = $('#prescale').value;
+  o.twox = $('#prescale').value === 'half' ? 'downscale' : 'native';
+  return o;
+}
+
+async function errText(r){
+  const t = await r.text();
+  try { return JSON.parse(t).message || JSON.parse(t).error || t; } catch(e){ return t; }
+}
+
+async function sendRun(body, isJson){
+  const opt = isJson
+    ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}
+    : {method:'POST', body};
+  const r = await fetch('/api/run', opt);
+  let j = {};
+  try { j = await r.json(); } catch(e){}
+  return {r, j};
+}
+
+function startWatch(jid){
+  jobId = jid;
+  $('#cancelBtn').disabled = false;
+  $('#stage').textContent = '排队中…';
+  loadCache();
+  watch(jid);
+}
+
 $('#go').onclick = async () => {
   if(!file) return;
   $('#go').disabled = true; $('#err').textContent = ''; $('#fill').style.width = '0';
   $('#stage').textContent = '上传中…';
   const fd = new FormData();
   fd.append('file', file);
-  const p = presetParams();
-  Object.entries(p).forEach(([k,v]) => fd.append(k, v));
-  fd.append('chunk', $('#chunkOn').checked ? $('#chunk').value : '0');
-  fd.append('restart', $('#resume').checked ? '0' : '1');
-  fd.append('mode', $('#mode').value);
-  fd.append('attention', $('#attention').value);
-  fd.append('encoder', $('#encoder').value);
-  fd.append('quality', $('#quality').value);
-  fd.append('quant', $('#quant').value);
-  fd.append('budget', $('#budgetAuto').checked ? 'auto' : 'fixed');
-  fd.append('twox', $('#twox').value);  let r, j;
-  try {
-    r = await fetch('/api/run', {method:'POST', body: fd});
-    j = await r.json();
-  } catch(e){ $('#err').textContent = '提交失败：' + e; $('#go').disabled = false; return; }
+  Object.entries(collectFields()).forEach(([k, v]) => fd.append(k, v));
+  let r, j;
+  try { ({r, j} = await sendRun(fd, false)); }
+  catch(e){ $('#err').textContent = '提交失败：' + e; $('#go').disabled = false; return; }
   if(!r.ok){ $('#err').textContent = j?.message || '提交失败'; $('#go').disabled = false; return; }
-  jobId = j.job;
-  $('#cancelBtn').disabled = false;
-  watch(jobId);
+  if(j.need_confirm){ showConfirm(j); return; }
+  startWatch(j.job);
 };
+
+// ---------- 续跑确认弹窗
+let pendingId = null;
+function showConfirm(j){
+  pendingId = j.pending_id;
+  const p = j.params || {};
+  $('#mInfo').innerHTML =
+    `文件 <b>${j.upload}</b> 有未完成的历史分段：<b>${j.done}</b> / ${j.total} 段已完成` +
+    `<br>参数 <code>scale=${p.scale}</code> <code>tile=${p.tile}</code> <code>kv=${p.kv}</code> <code>quant=${p.quant}</code>` +
+    (p.pre_scale && p.pre_scale < 1 ? ` <code>源/2</code>` : '') +
+    `<br><br>「继续上次」只补剩下的段；「从头开始」删掉这些分段重算；` +
+    `<br>「忘记历史缓存」会清空所有任务的缓存，并从零开始这一次。`;
+  $('#modal').classList.remove('hidden');
+}
+
+async function confirmRun(action){
+  const id = pendingId;
+  pendingId = null;
+  $('#modal').classList.add('hidden');
+  $('#go').disabled = true;
+  $('#err').textContent = '';
+  if(action === 'forget'){
+    const c = await fetch('/api/segments/clear', {method:'POST'});
+    if(!c.ok){ $('#err').textContent = await errText(c); $('#go').disabled = false; loadCache(); return; }
+    action = 'restart';
+  }
+  $('#stage').textContent = action === 'resume' ? '续跑中…' : '从头开始…';
+  let r, j;
+  try { ({r, j} = await sendRun({pending_id: id, resume_action: action}, true)); }
+  catch(e){ $('#err').textContent = '提交失败：' + e; $('#go').disabled = false; return; }
+  if(!r.ok){ $('#err').textContent = j?.message || '提交失败'; $('#go').disabled = false; return; }
+  if(j.need_confirm){ showConfirm(j); return; }
+  startWatch(j.job);
+}
+$('#mResume').onclick = () => confirmRun('resume');
+$('#mRestart').onclick = () => confirmRun('restart');
+$('#mForget').onclick = () => confirmRun('forget');
+$('#mCancel').onclick = () => { pendingId = null; $('#modal').classList.add('hidden'); $('#go').disabled = false; $('#stage').textContent = '已取消（未开始）'; };
+
+// ---------- 分段缓存
+async function loadCache(){
+  try {
+    const c = await (await fetch('/api/segments')).json();
+    const n = (c.dirs || []).length;
+    $('#cacheInfo').textContent = n
+      ? `分段缓存：${c.mb} MB · ${n} 个任务（${(c.dirs || []).filter(d => d.done).length} 个有进度）`
+      : '';
+  } catch(e){}
+}
+$('#clearCache').onclick = async () => {
+  if(!confirm('确认删除所有分段缓存？之后同一视频会从头重算。')) return;
+  const r = await fetch('/api/segments/clear', {method:'POST'});
+  if(!r.ok){ $('#err').textContent = await errText(r); return; }
+  const d = await r.json();
+  $('#err').textContent = '';
+  $('#stage').textContent = `已清空分段缓存（释放 ${d.freed_mb} MB）`;
+  loadCache();
+};
+loadCache();
 
 function watch(id){
   if(es) es.close();
@@ -255,10 +365,11 @@ function watch(id){
     }
     $('#stage').innerHTML = `<b>${names[d.stage] || d.stage}</b> · ${d.msg || ''}` +
       (d.elapsed ? ` · 已用 ${Math.round(d.elapsed)}s` : '') + eta +
-      (d.params ? ` · ${d.params.scale}× tile${d.params.tile} kv${d.params.kv}` : '');
+      (d.params ? ` · ${d.params.scale}× tile${d.params.tile} kv${d.params.kv}` +
+        (d.params.pre_scale && d.params.pre_scale < 1 ? ' · 源/2' : '') : '');
     if (d.stage === 'error'){
       $('#err').textContent = d.error || '失败';
-      $('#go').disabled = false; $('#cancelBtn').disabled = true; es.close(); loadHist();
+      $('#go').disabled = false; $('#cancelBtn').disabled = true; es.close(); loadHist(); loadCache();
     }
     if (d.stage === 'done'){
       es.close();
@@ -272,7 +383,7 @@ function watch(id){
         ? `${name}\n${i.in_wh?.[0]}×${i.in_wh?.[1]} → ${i.out_wh?.[0]}×${i.out_wh?.[1]} · ${i.frames} 帧 · ${i.fps.toFixed(2)} fps · 用时 ${d.elapsed}s`
         : '完成';
       const dl = $('#dl'); dl.href = '/api/download/' + id; dl.style.display = 'inline-block';
-      loadHist();
+      loadHist(); loadCache();
     }
   };
   es.onerror = () => { es.close(); $('#go').disabled = false; };

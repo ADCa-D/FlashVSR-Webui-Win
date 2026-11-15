@@ -31,6 +31,7 @@ OUT = os.path.join(APP_DIR, "out")
 WORKER = os.path.join(APP_DIR, "worker.py")
 os.makedirs(WORK, exist_ok=True)
 os.makedirs(OUT, exist_ok=True)
+os.makedirs(os.path.join(WORK, "segments"), exist_ok=True)
 
 JOBS = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
@@ -49,6 +50,156 @@ def new_job(name):
 def safe_name(s):
     s = re.sub(r"[^\w.\-\u4e00-\u9fa5]+", "_", s or "video")
     return s[:120] or "video"
+
+
+# ---------------------------------------------------------------- 参数解析
+def _resolve_params(fields):
+    """把表单字段解析成 worker 认识的一组参数（含 tile 对齐 / 2× 降采样换算）。"""
+    preset = fields.get("preset", "quality")
+    if preset in E.PRESETS:
+        p = dict(E.PRESETS[preset])
+        scale, tile, kv = p["scale"], p["tile"], p["kv"]
+        # 量化后显存省 ~1.26 GB，可以把 tile 提一档（实测 t192/kv2 = 49.5 s vs t160 = 65.4 s）
+        if preset in ("quality", "balance"):
+            tile = 192 if (fields.get("quant") or "none") != "none" else p["tile"]
+    else:
+        scale = int(fields.get("scale", 4))
+        tile = int(fields.get("tile", 128))
+        kv = float(fields.get("kv", 3.0))
+
+    # 节点内部会把每个 tile 的输出裁到 128 的倍数（compute_scaled_and_target_dims），
+    # 若 tile*scale 不是 128 的倍数，裁掉的部分会让拼贴几何错位 → 接缝。这里提前对齐。
+    step = 128 // math.gcd(128, max(1, int(scale)))
+    if tile % step:
+        tile = max(step, (tile // step) * step)
+
+    # 输入预缩放：控制「源先 /2 再 4×」这条路径，自定义档也能用
+    #   auto → 目标是 2× 时自动 /2（模型走 4×）
+    #   half → 强制 源/2 + 4×模型（不管上面填的 scale 是多少，输出恒为 2×）
+    #   off  → 不预缩放（scale=2 就是原生 2×，由模型自己放大）
+    pre_scale = 1.0
+    twox = fields.get("twox") or "downscale"      # 兼容旧字段
+    prescale = (fields.get("prescale") or "").strip()
+    if prescale not in ("auto", "half", "off"):
+        prescale = "auto"
+    if prescale == "auto":
+        prescale = "half" if (int(scale) == 2 and twox == "downscale") else "off"
+    if prescale == "half":
+        scale, pre_scale = 4, 0.5
+        tile = max(64, tile // 2)          # 输入减半，tile 相应缩小才是同一块画面
+        step = 128 // math.gcd(128, int(scale))
+        if tile % step:
+            tile = max(step, (tile // step) * step)
+
+    chunk = int(fields.get("chunk", 0) or 0)
+    mode = fields.get("mode") or "tiny-long"
+    if mode not in ("tiny", "tiny-long"):
+        mode = "tiny-long"
+    attention = fields.get("attention") or "sparse"
+    if attention not in ("sparse", "dense"):
+        attention = "sparse"
+    encoder = fields.get("encoder") or "auto"
+    if encoder not in E.ENCODER_CHOICES:
+        encoder = "auto"
+    quant = fields.get("quant") or "none"
+    if quant not in E.QUANT_CHOICES:
+        quant = "none"
+    budget = fields.get("budget") or "auto"
+    if budget not in ("auto", "fixed"):
+        budget = "auto"
+    try:
+        quality = int(float(fields.get("quality") or 15))
+    except ValueError:
+        quality = 15
+    quality = max(10, min(28, quality))
+
+    return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
+                attention=attention, encoder=encoder, quality=quality,
+                quant=quant, budget=budget, pre_scale=pre_scale)
+
+
+# ---------------------------------------------------------------- 待确认任务 / 分段缓存
+PEND = os.path.join(WORK, "pending")
+
+
+def _gc_pending(max_age=24 * 3600):
+    """清掉超过 24h 没确认的临时上传（崩溃/关页面留下的）。"""
+    if not os.path.isdir(PEND):
+        return
+    now = time.time()
+    for fn in os.listdir(PEND):
+        p = os.path.join(PEND, fn)
+        try:
+            if now - os.path.getmtime(p) > max_age:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+        except OSError:
+            pass
+
+
+def _save_pending(pid, spec):
+    os.makedirs(PEND, exist_ok=True)
+    with open(os.path.join(PEND, f"{pid}.json"), "w", encoding="utf-8") as f:
+        json.dump(spec, f, ensure_ascii=False)
+
+
+def _load_pending(pid):
+    if not re.fullmatch(r"[0-9a-f]{12}", pid or ""):
+        return None
+    try:
+        with open(os.path.join(PEND, f"{pid}.json"), "r", encoding="utf-8") as f:
+            spec = json.load(f)
+    except Exception:
+        return None
+    if not os.path.isfile(spec.get("src", "")):
+        return None
+    return spec
+
+
+def _del_pending(pid):
+    try:
+        os.remove(os.path.join(PEND, f"{pid}.json"))
+    except OSError:
+        pass
+
+
+def _seg_key_dir(src, P, root):
+    """与 engine 完全一致的键：源指纹 + 参数指纹。"""
+    probe = dict(scale=P["scale"], tile=P["tile"], kv=P["kv"], chunk=P["chunk"], overlap=8,
+                 mode=P["mode"], attention=P["attention"], quant=P["quant"],
+                 pre_scale=P["pre_scale"])
+    return os.path.join(root, f"{E.quick_hash(src)}_{E._param_key(probe)}")
+
+
+def _resume_info(src, P, root):
+    """返回 (已完成分段数, 总分段数, 分段目录)。"""
+    d = _seg_key_dir(src, P, root)
+    man = E.load_manifest(d) or {}
+    # 注意：manifest["total"] 是帧数，分段数要数 plans
+    total = len(man.get("plans") or [])
+    done = 0
+    for k in (man.get("done") or {}):
+        try:
+            i = int(k)
+        except (TypeError, ValueError):
+            continue
+        if os.path.exists(os.path.join(d, f"seg_{i:04d}.mp4")):
+            done += 1
+    return done, max(total, done), d
+
+
+def _dir_size(root):
+    n = files = 0
+    for base, _dirs, fs in os.walk(root):
+        for f in fs:
+            try:
+                n += os.path.getsize(os.path.join(base, f))
+                files += 1
+            except OSError:
+                pass
+    return n, files
 
 
 async def index(request):
@@ -99,56 +250,48 @@ async def run(request):
         data = await request.json()
         fields, fname = data, safe_name(data.get("name", "video.mp4"))
 
-    preset = fields.get("preset", "quality")
-    if preset in E.PRESETS:
-        p = dict(E.PRESETS[preset])
-        scale, tile, kv = p["scale"], p["tile"], p["kv"]
-        # 量化后显存省 ~1.26 GB，可以把 tile 提一档（实测 t192/kv2 = 49.5 s vs t160 = 65.4 s）
-        if preset in ("quality", "balance"):
-            tile = 192 if (fields.get("quant") or "none") != "none" else p["tile"]
+    # 续跑确认：前端第二次提交只带 {pending_id, resume_action}，文件已在上一次上传时落盘
+    pending_id = (fields.get("pending_id") or "").strip()
+    resume_action = (fields.get("resume_action") or "").strip()
+    if pending_id:
+        spec = _load_pending(pending_id)
+        if not spec:
+            raise web.HTTPBadRequest(text="待确认的任务已过期（临时文件已清理），请重新选择文件")
+        fields = spec["fields"]
+        fname = spec["name"]
+        tmp_path = spec["src"]
+        _del_pending(pending_id)
+
+    P = _resolve_params(fields)
+    scale, tile, kv = P["scale"], P["tile"], P["kv"]
+    chunk, mode, attention = P["chunk"], P["mode"], P["attention"]
+    encoder, quality, quant = P["encoder"], P["quality"], P["quant"]
+    budget, pre_scale = P["budget"], P["pre_scale"]
+
+    if resume_action == "restart":
+        restart = True
+    elif resume_action == "resume":
+        restart = False                      # 用户明确选了「继续」，优先于表单里的续跑勾选
     else:
-        scale = int(fields.get("scale", 4))
-        tile = int(fields.get("tile", 128))
-        kv = float(fields.get("kv", 3.0))
+        restart = bool(int(fields.get("restart", 0) or 0))
 
-    # 节点内部会把每个 tile 的输出裁到 128 的倍数（compute_scaled_and_target_dims），
-    # 若 tile*scale 不是 128 的倍数，裁掉的部分会让拼贴几何错位 → 接缝。这里提前对齐。
-    step = 128 // math.gcd(128, max(1, int(scale)))
-    if tile % step:
-        tile = max(step, (tile // step) * step)
-
-    # 2× 的两种实现：
-    #   pre_scale=1.0 → 原生 scale=2（快，但 LQ 比训练分布清楚一倍，文字易扭）
-    #   pre_scale=0.5 → 源降采样一半再走 4×（模型留在训练分布内，输出仍是 2×）
-    pre_scale = 1.0
-    twox = fields.get("twox") or "downscale"
-    if int(scale) == 2 and twox == "downscale":
-        scale, pre_scale = 4, 0.5
-        tile = max(64, tile // 2)          # 输入减半，tile 相应缩小才是同一块画面
-        step = 128 // math.gcd(128, int(scale))
-        if tile % step:
-            tile = max(step, (tile // step) * step)
-    chunk = int(fields.get("chunk", 0) or 0)
-    mode = fields.get("mode") or "tiny-long"
-    if mode not in ("tiny", "tiny-long"):
-        mode = "tiny-long"
-    attention = fields.get("attention") or "sparse"
-    if attention not in ("sparse", "dense"):
-        attention = "sparse"
-    encoder = fields.get("encoder") or "auto"
-    if encoder not in E.ENCODER_CHOICES:
-        encoder = "auto"
-    quant = fields.get("quant") or "none"
-    if quant not in E.QUANT_CHOICES:
-        quant = "none"
-    budget = fields.get("budget") or "auto"
-    if budget not in ("auto", "fixed"):
-        budget = "auto"
-    try:
-        quality = int(float(fields.get("quality") or 15))
-    except ValueError:
-        quality = 15
-    quality = max(10, min(28, quality))
+    # ---- 有历史分段先问：继续上次 / 从头开始 / 忘记缓存 ----
+    seg_root = os.path.join(WORK, "segments")
+    if tmp_path and chunk > 0:
+        done, seg_total, key_dir = _resume_info(tmp_path, P, seg_root)
+        if done and not resume_action:
+            pid = uuid.uuid4().hex[:12]
+            os.makedirs(PEND, exist_ok=True)
+            ext = os.path.splitext(fname)[1] or ".mp4"
+            dst = os.path.join(PEND, f"{pid}{ext}")
+            os.replace(tmp_path, dst)
+            _save_pending(pid, dict(src=dst, name=fname, fields=fields))
+            return web.json_response(dict(
+                need_confirm=True, pending_id=pid, upload=fname,
+                done=done, total=seg_total,
+                params=dict(scale=scale, tile=tile, kv=kv, quant=quant, pre_scale=pre_scale)))
+        if restart or fields.get("forget"):
+            shutil.rmtree(key_dir, ignore_errors=True)
 
     jid = new_job(fname)
     # 只保留最近 50 个已完成任务，避免内存字典无限增长
@@ -176,7 +319,7 @@ async def run(request):
                        mode=mode, attention=attention,
                        encoder=encoder, quality=quality,
                        quant=quant, budget=budget, pre_scale=pre_scale,
-                       restart=bool(int(fields.get("restart", 0) or 0)),
+                       restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))
 
     def run_once(params):
@@ -229,7 +372,8 @@ async def run(request):
                 else:
                     params["tile"], params["kv"] = 64, 1.5
             j["params"] = dict(scale=params["scale"], tile=params["tile"], kv=params["kv"],
-                               chunk=params["chunk"], mode=params["mode"], attention=params["attention"])
+                               chunk=params["chunk"], mode=params["mode"], attention=params["attention"],
+                               pre_scale=params.get("pre_scale", 1.0))
             j["attempt"] = attempt
             j["error"] = None          # 每次重试清掉上一次的失败信息，否则成功也会被判失败
             j["info"] = None
@@ -410,6 +554,36 @@ async def clear_history(request):
     return web.json_response({"ok": True, "deleted": n})
 
 
+async def segments(request):
+    """查看分段缓存：总量 + 每个任务目录的进度。"""
+    root = os.path.join(WORK, "segments")
+    size, files = _dir_size(root)
+    dirs = []
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name)
+            if not os.path.isdir(p):
+                continue
+            man = E.load_manifest(p) or {}
+            done = len(man.get("done") or {})
+            total = int(man.get("total") or len(man.get("plans") or []) or 0)
+            b, _ = _dir_size(p)
+            dirs.append(dict(key=name, done=done, total=total, mb=round(b / 1048576, 1)))
+    return web.json_response(dict(bytes=size, mb=round(size / 1048576, 1),
+                                  files=files, dirs=dirs))
+
+
+async def clear_segments(request):
+    """忘记历史缓存：删掉所有分段（下一次同文件同参数会从头算）。"""
+    if any(not j.get("done") for j in JOBS.values()):
+        raise web.HTTPConflict(text="还有任务在跑，等它结束再清（否则正在写的那一段会损坏）")
+    root = os.path.join(WORK, "segments")
+    size, files = _dir_size(root)
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
+    return web.json_response(dict(ok=True, freed_mb=round(size / 1048576, 1), files=files))
+
+
 async def unload(request):
     busy = any(not j.get("done") for j in JOBS.values())
     if busy:
@@ -430,8 +604,10 @@ async def cancel(request):
     if proc is not None:
         try:
             # 用 taskkill 杀进程树（worker 可能还带着 ffmpeg 子进程）
+            # taskkill 在中文 Windows 上输出 GBK，指定 errors=replace 否则读线程会抛
+            # UnicodeDecodeError（管道不再被消费，长输出时还可能卡死）
             r = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                               capture_output=True, text=True, timeout=20)
+                               capture_output=True, text=True, errors="replace", timeout=20)
             killed = r.returncode == 0
         except Exception as e:  # noqa
             print(f"[cancel] taskkill 失败: {e}", flush=True)
@@ -453,6 +629,7 @@ async def status(request):
 
 def main():
     app = web.Application(client_max_size=8 * 1024 ** 3)
+    _gc_pending()
     app.add_routes([
         web.get("/", index),
         web.get("/api/presets", presets),
@@ -465,6 +642,8 @@ def main():
         web.get("/api/out/{name}", old_file),
         web.delete("/api/out/{name}", delete_out),
         web.post("/api/history/clear", clear_history),
+        web.get("/api/segments", segments),
+        web.post("/api/segments/clear", clear_segments),
         web.post("/api/unload", unload),
         web.post("/api/job/cancel/{job}", cancel),
         web.get("/api/status", status),
