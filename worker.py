@@ -30,8 +30,10 @@ def emit(tag, payload):
     print("@@" + tag + " " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def stage(st, cur, total, msg):
-    emit("STAGE", {"stage": st, "cur": cur, "total": total, "msg": msg})
+def stage(st, cur, total, msg, **extra):
+    payload = {"stage": st, "cur": cur, "total": total, "msg": msg}
+    payload.update(extra)
+    emit("STAGE", payload)
 
 
 def main():

@@ -386,6 +386,21 @@ def _gc_pending(max_age=24 * 3600):
             pass
 
 
+def _gc_preview(max_age=7 * 86400):
+    """清掉一周前的分段预览图（work/preview/<jid>/）。"""
+    root = os.path.join(WORK, "preview")
+    if not os.path.isdir(root):
+        return
+    now = time.time()
+    for d in os.listdir(root):
+        p = os.path.join(root, d)
+        try:
+            if os.path.isdir(p) and now - os.path.getmtime(p) > max_age:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def _save_pending(pid, spec):
     os.makedirs(PEND, exist_ok=True)
     with open(os.path.join(PEND, f"{pid}.json"), "w", encoding="utf-8") as f:
@@ -573,6 +588,7 @@ async def run(request):
                        encoder=encoder, quality=quality,
                        quant=quant, budget=budget, pre_scale=pre_scale,
                        tile_overlap=tile_overlap,
+                       preview_dir=os.path.join(WORK, "preview", jid),
                        restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))
 
@@ -596,6 +612,9 @@ async def run(request):
                 d = json.loads(line[8:])
                 j["stage"] = d["stage"]
                 j["cur"], j["total"], j["msg"] = d["cur"], d["total"], d["msg"]
+                if d.get("preview"):
+                    j["preview"] = dict(file=f"{jid}/{os.path.basename(str(d['preview']))}",
+                                        cur=d.get("pv_cur"), total=d.get("pv_total"))
             elif line.startswith("@@DONE "):
                 j["info"] = json.loads(line[7:])
             elif line.startswith("@@ERR "):
@@ -690,7 +709,8 @@ async def progress(request):
                 pass
             break
         payload = {k: j.get(k) for k in
-                   ("stage", "cur", "total", "msg", "done", "error", "elapsed", "info", "params")}
+                   ("stage", "cur", "total", "msg", "done", "error", "elapsed", "info",
+                    "params", "preview")}
         payload["out_name"] = os.path.basename(j["out"]) if j.get("out") else None
         s = json.dumps(payload, ensure_ascii=False)
         if s != last:
@@ -707,6 +727,18 @@ async def progress(request):
     except Exception:
         pass
     return resp
+
+
+async def preview_frame(request):
+    """分段预览帧（每段随机抽一帧）。"""
+    jid = request.match_info["job"]
+    name = os.path.basename(request.match_info["name"])
+    if not re.fullmatch(r"[0-9a-f]{12}", jid or ""):
+        raise web.HTTPNotFound()
+    p = os.path.join(WORK, "preview", jid, name)
+    if not os.path.isfile(p):
+        raise web.HTTPNotFound()
+    return web.FileResponse(p, headers={"Cache-Control": "no-store"})
 
 
 async def result(request):
@@ -884,6 +916,7 @@ async def status(request):
 def main():
     app = web.Application(client_max_size=8 * 1024 ** 3, middlewares=[auth_middleware])
     _gc_pending()
+    _gc_preview()
     app.add_routes([
         web.get("/login", login_page),
         web.post("/login", login_submit),
@@ -895,6 +928,7 @@ def main():
         web.get("/api/capabilities", capabilities),
         web.post("/api/run", run),
         web.get("/api/progress/{job}", progress),
+        web.get("/api/preview/{job}/{name}", preview_frame),
         web.get("/api/result/{job}", result),
         web.get("/api/download/{job}", download),
         web.get("/api/history", history),

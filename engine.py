@@ -10,6 +10,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -478,6 +479,15 @@ def decode_frames(path, on_progress=None, pre_scale=1.0):
     return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3), info
 
 
+def extract_preview(path, idx, fps, out_path, width=640):
+    """从分段文件里抽一帧存成 jpg（预览用，缩到 width 宽）。"""
+    t = max(0.0, float(idx) / max(float(fps), 1e-6))
+    cmd = [FFMPEG, "-y", "-v", "error", "-ss", f"{t:.4f}", "-i", path,
+           "-frames:v", "1", "-vf", f"scale={int(width)}:-2", "-q:v", "4", out_path]
+    subprocess.run(cmd, capture_output=True, timeout=120)
+    return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+
 def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend="cpu"):
     h, w = frames_u8.shape[1], frames_u8.shape[2]
     cmd = [FFMPEG, "-y", "-v", "error",
@@ -863,7 +873,23 @@ class Engine:
             done[str(i)] = dict(frames=keep, bytes=os.path.getsize(seg_path), at=int(time.time()))
             man["done"] = done
             save_manifest(seg_dir, man)
-            on_stage("seg", i + 1, n_seg, f"段 {i + 1}/{n_seg} 完成（sparse={sp} kv={kk} local={lr}）")
+
+            # 预览帧：每段随机抽一帧（分段专属，方便边跑边看效果）
+            pv = None
+            pdir = params.get("preview_dir")
+            if pdir and keep > 0:
+                try:
+                    os.makedirs(pdir, exist_ok=True)
+                    name = f"seg_{i:04d}.jpg"
+                    if extract_preview(seg_path, random.randrange(keep), info["fps"],
+                                       os.path.join(pdir, name)):
+                        pv = name
+                except Exception as e:  # noqa
+                    print(f"[preview] 第 {i + 1} 段抽帧失败: {e}", flush=True)
+
+            on_stage("seg", i + 1, n_seg,
+                     f"段 {i + 1}/{n_seg} 完成（sparse={sp} kv={kk} local={lr}）",
+                     **({"preview": pv, "pv_cur": i + 1, "pv_total": n_seg} if pv else {}))
 
         on_stage("encode", 0, 1, f"拼接 {n_seg} 段 + 混入音轨")
         concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality)
