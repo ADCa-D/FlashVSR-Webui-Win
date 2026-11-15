@@ -7,11 +7,15 @@ FlashVSR 独立面板（aiohttp，无 ComfyUI 依赖）
 然后浏览器打开 http://127.0.0.1:8288
 """
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -36,6 +40,200 @@ os.makedirs(os.path.join(WORK, "segments"), exist_ok=True)
 JOBS = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 ENGINE = E.Engine()  # 仅用于 /api/status 与历史状态，不影响子进程推理
+
+# ---------------------------------------------------------------- 鉴权
+# 规则：本机回环免登录；其他 IP 必须（a）在放行名单里，或（b）持有有效会话 cookie。
+# 登录成功后把该 IP 记入放行名单，下次同 IP 直接进。
+TLS_CERT = os.environ.get(
+    "FLASHVSR_TLS_CERT", r"C:\Users\MECHREVO\Desktop\server\certs\server.crt")
+TLS_KEY = os.environ.get(
+    "FLASHVSR_TLS_KEY", r"C:\Users\MECHREVO\Desktop\server\certs\server.key")
+AUTH_USERS = os.path.join(WORK, "auth_users.json")
+AUTH_IPS = os.path.join(WORK, "auth_ips.json")
+AUTH_SECRET = os.path.join(WORK, "auth_secret.txt")
+COOKIE = "fs_sess"
+COOKIE_AGE = 30 * 86400
+
+
+def _sha(s):
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _secret():
+    if os.path.isfile(AUTH_SECRET):
+        try:
+            with open(AUTH_SECRET, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    s = uuid.uuid4().hex + uuid.uuid4().hex
+    with open(AUTH_SECRET, "w", encoding="utf-8") as f:
+        f.write(s)
+    return s
+
+
+SECRET = _secret()
+
+
+def _init_users():
+    """首次启动：建 admin 账号，密码随机并打印（也可用环境变量指定）。"""
+    users = _load_json(AUTH_USERS, {})
+    env_user = os.environ.get("FLASHVSR_USER")
+    env_pass = os.environ.get("FLASHVSR_PASS")
+    if env_user and env_pass:
+        salt = uuid.uuid4().hex[:16]
+        users[env_user] = dict(salt=salt, hash=_sha(salt + env_pass))
+        _save_json(AUTH_USERS, users)
+        return users
+    if not users:
+        pwd = uuid.uuid4().hex[:10]
+        salt = uuid.uuid4().hex[:16]
+        users["admin"] = dict(salt=salt, hash=_sha(salt + pwd))
+        _save_json(AUTH_USERS, users)
+        print("=" * 56, flush=True)
+        print(f"  已创建登录账号   用户名: admin   密码: {pwd}", flush=True)
+        print(f"  （记录在 {AUTH_USERS}，可用 FLASHVSR_USER/FLASHVSR_PASS 覆盖）", flush=True)
+        print("=" * 56, flush=True)
+    return users
+
+
+USERS = _init_users()
+
+
+def _sign(payload):
+    sig = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _unsign(token):
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        payload, sig = raw.rsplit("|", 1)
+    except Exception:
+        return None
+    want = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, want):
+        return None
+    user, exp = payload.split("|", 1)
+    if time.time() > float(exp):
+        return None
+    return user
+
+
+def _is_local(ip):
+    return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
+def _ip_allowed(ip):
+    return ip in _load_json(AUTH_IPS, {})
+
+
+def _allow_ip(ip, user):
+    data = _load_json(AUTH_IPS, {})
+    data[ip] = dict(user=user, at=int(time.time()))
+    _save_json(AUTH_IPS, data)
+
+
+def _cookie_user(request):
+    tok = request.cookies.get(COOKIE)
+    return _unsign(tok) if tok else None
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    path = request.path
+    if path in ("/login", "/favicon.ico"):
+        return await handler(request)
+    ip = request.remote or ""
+    if _is_local(ip) or _ip_allowed(ip) or _cookie_user(request):
+        return await handler(request)
+    if path.startswith("/api/"):
+        return web.json_response({"error": "未登录"}, status=401)
+    raise web.HTTPFound("/login")
+
+
+LOGIN_HTML = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · FlashVSR</title>
+<style>
+body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+ background:#0f1115;color:#e8ecf3;font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}
+form{background:#171a21;border:1px solid #262b36;border-radius:14px;padding:26px 28px;width:320px}
+h1{font-size:16px;margin:0 0 18px}
+label{display:block;color:#8b93a5;font-size:12.5px;margin:12px 0 4px}
+input{width:100%;box-sizing:border-box;background:#0f131b;border:1px solid #262b36;color:#e8ecf3;
+ border-radius:8px;padding:8px 10px;font-size:14px}
+button{margin-top:18px;width:100%;background:#5b8cff;color:#fff;border:0;border-radius:10px;
+ padding:10px;font-size:14px;font-weight:600;cursor:pointer}
+.err{color:#ff5f5f;font-size:12.5px;margin-top:12px;min-height:18px}
+.note{color:#5c6579;font-size:11.5px;margin-top:14px}
+</style></head><body>
+<form method="post" action="/login">
+  <h1>FlashVSR 面板登录</h1>
+  <label>用户名</label><input name="username" autocomplete="username" autofocus>
+  <label>密码</label><input name="password" type="password" autocomplete="current-password">
+  <button type="submit">登录</button>
+  <div class="err">%ERR%</div>
+  <div class="note">登录成功后本机 IP 会被记入放行名单，下次免密。</div>
+</form></body></html>"""
+
+
+async def login_page(request):
+    return web.Response(text=LOGIN_HTML.replace("%ERR%", ""), content_type="text/html")
+
+
+async def login_submit(request):
+    data = await request.post()
+    user = (data.get("username") or "").strip()
+    pwd = data.get("password") or ""
+    rec = USERS.get(user)
+    ok = bool(rec) and hmac.compare_digest(rec["hash"], _sha(rec["salt"] + pwd))
+    if not ok:
+        await asyncio.sleep(0.6)          # 拖慢暴力尝试
+        html = LOGIN_HTML.replace("%ERR%", "用户名或密码不对")
+        return web.Response(text=html, content_type="text/html", status=401)
+    ip = request.remote or ""
+    _allow_ip(ip, user)                    # 记住这个 IP
+    resp = web.HTTPFound("/")
+    resp.set_cookie(COOKIE, _sign(f"{user}|{int(time.time()) + COOKIE_AGE}"),
+                    max_age=COOKIE_AGE, httponly=True, samesite="Lax",
+                    secure=request.scheme == "https")
+    print(f"[auth] 登录成功 user={user} ip={ip}", flush=True)
+    return resp
+
+
+async def logout(request):
+    resp = web.HTTPFound("/login")
+    resp.del_cookie(COOKIE)
+    return resp
+
+
+async def auth_ips(request):
+    if not _is_local(request.remote or ""):
+        raise web.HTTPForbidden()
+    return web.json_response(_load_json(AUTH_IPS, {}))
+
+
+async def auth_ips_clear(request):
+    if not _is_local(request.remote or ""):
+        raise web.HTTPForbidden()
+    _save_json(AUTH_IPS, {})
+    return web.json_response({"ok": True})
+
 
 
 def new_job(name):
@@ -669,9 +867,14 @@ async def status(request):
 
 
 def main():
-    app = web.Application(client_max_size=8 * 1024 ** 3)
+    app = web.Application(client_max_size=8 * 1024 ** 3, middlewares=[auth_middleware])
     _gc_pending()
     app.add_routes([
+        web.get("/login", login_page),
+        web.post("/login", login_submit),
+        web.get("/logout", logout),
+        web.get("/api/auth/ips", auth_ips),
+        web.delete("/api/auth/ips", auth_ips_clear),
         web.get("/", index),
         web.get("/api/presets", presets),
         web.get("/api/capabilities", capabilities),
@@ -689,8 +892,34 @@ def main():
         web.post("/api/job/cancel/{job}", cancel),
         web.get("/api/status", status),
     ])
-    print("FlashVSR 面板：http://127.0.0.1:8288", flush=True)
-    web.run_app(app, host="127.0.0.1", port=8288, print=None)
+    asyncio.run(serve(app))
+
+
+async def serve(app):
+    """同时监听：127.0.0.1 明文（本机免登录）+ EasyTier IP 上的 HTTPS（要登录）。
+
+    必须让面板自己终结 TLS：字节级代理会把所有客户端都显示成 127.0.0.1，
+    按 IP 放行就形同虚设。
+    """
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    sites = [web.TCPSite(runner, "127.0.0.1", 8288)]
+    print("FlashVSR 面板（本机，免登录）：http://127.0.0.1:8288", flush=True)
+
+    tls_host = os.environ.get("FLASHVSR_TLS_HOST", "66.66.66.67")
+    cert, key = TLS_CERT, TLS_KEY
+    if os.path.isfile(cert) and os.path.isfile(key):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        sites.append(web.TCPSite(runner, tls_host, 8288, ssl_context=ctx))
+        print(f"FlashVSR 面板（网络，需登录）：https://{tls_host}:8288", flush=True)
+    else:
+        print(f"[提示] 没找到证书（{cert}），只开本机明文端口", flush=True)
+
+    for s in sites:
+        await s.start()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":

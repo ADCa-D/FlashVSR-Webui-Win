@@ -257,7 +257,40 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 - 显存不够会自动降档重试，进度里会写「自动降档重试（第 N 次）：tile=… kv=…」
 - `权重`：MXFP8（推荐，−35% 且 PSNR 46 dB）/ bf16（基准）/ NVFP4（实验，小 token 下更慢）
 
-## 输入预缩放（源 /2 + 4× 模型）
+## 登录与访问控制
+
+面板同时监听两个端口：
+
+| 入口 | 协议 | 鉴权 |
+|---|---|---|
+| `http://127.0.0.1:8288` | 明文 | **免登录**（只绑回环，外部摸不到） |
+| `https://<EasyTier IP>:8288` | TLS（复用 `Desktop\server\certs`） | 账号密码 或 IP 已放行 |
+
+规则：
+
+1. 回环地址永远放行；
+2. 其他 IP 访问时先跳 `/login`，登录成功后**把该 IP 记入放行名单**（`work/auth_ips.json`），下次同 IP 免密；
+3. API 未授权直接返回 `401`（不是跳转，方便脚本判断）；
+4. 会话 cookie 用 HMAC 签名，30 天过期，`HttpOnly` + `SameSite=Lax`（TLS 下带 `Secure`）。
+
+首次启动会生成 `admin` 账号并**在控制台打印随机密码**，也可用环境变量指定：
+
+```powershell
+$env:FLASHVSR_USER="admin"; $env:FLASHVSR_PASS="你的密码"
+python app.py
+```
+
+管理命令（仅本机可用）：
+
+```powershell
+curl http://127.0.0.1:8288/api/auth/ips                     # 查看放行名单
+curl -X DELETE http://127.0.0.1:8288/api/auth/ips          # 清空放行名单
+```
+
+> **为什么面板自己终结 TLS**：`Desktop\server\https-proxy.py` 是字节级管道，后端看到的客户端 IP
+> 永远是多出来的 `127.0.0.1`，按 IP 放行会变成"所有人都放行"。所以 8288 不再走那个代理。
+
+
 
 FlashVSR 的权重是按 **4× 退化**训练的（GT 下采样 4 倍当 LQ，再 bicubic 放大回目标分辨率）。所以想做 2× 有两条路：
 
