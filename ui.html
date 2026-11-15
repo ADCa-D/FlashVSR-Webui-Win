@@ -102,8 +102,8 @@
       <input id="tileOv" type="number" min="4" max="64" step="4" value="12" title="tile 重叠；12 比 24 少约 25% 的 tile" />
     </div>
     <div class="row">
-      <label class="chk"><input type="checkbox" id="chunkOn" /> 长视频分段</label>
-      <input id="chunk" type="number" min="16" max="400" step="8" value="48" disabled />
+      <label class="chk"><input type="checkbox" id="chunkOn" checked /> 长视频分段</label>
+      <input id="chunk" type="number" min="8" max="400" step="8" value="48" title="帧/段；填 0 = 按显存自动（太大时会自动下调）" />
       <span style="color:var(--dim);font-size:12px">帧/段</span>
       <label class="chk"><input type="checkbox" id="resume" checked /> 续跑</label>
       <label class="chk" title="每段跑完随机抽一帧推到进度下方"><input type="checkbox" id="previewOn" checked /> 分段预览</label>
@@ -232,8 +232,6 @@ $('#chunkOn').onchange = e => {
   $('#resume').disabled = !e.target.checked;
   $('#previewOn').disabled = !e.target.checked;
 };
-$('#resume').disabled = true;
-$('#previewOn').disabled = true;
 
 function presetParams(){
   if ($('#custom').checked){
