@@ -977,6 +977,9 @@ async def serve(app):
         ctx.load_cert_chain(cert, key)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         sites.append(("网络", web.TCPSite(runner, tls_host, 8288, ssl_context=ctx)))
+        # 手机等装不了自签 CA 的客户端：再开一个明文端口（仍要登录，仅限 EasyTier 内网）
+        plain_port = int(os.environ.get("FLASHVSR_PLAIN_PORT", "8289"))
+        sites.append(("网络(明文)", web.TCPSite(runner, tls_host, plain_port)))
     else:
         print(f"[提示] 没找到证书（{cert}），只开本机明文端口", flush=True)
 
@@ -985,8 +988,11 @@ async def serve(app):
             await s.start()
             if label == "本机":
                 print("FlashVSR 面板（本机，免登录）：http://127.0.0.1:8288", flush=True)
-            else:
+            elif label == "网络":
                 print(f"FlashVSR 面板（网络，需登录）：https://{tls_host}:8288", flush=True)
+            else:
+                print(f"FlashVSR 面板（手机/无证书客户端，明文需登录）："
+                      f"http://{tls_host}:{plain_port}", flush=True)
         except OSError as e:
             # 典型场景：EasyTier 还没连上，66.66.66.67 不存在 → 不能因此拖死本机端口
             print(f"[警告] {label}端口启动失败（{e}）；其它入口继续工作", flush=True)

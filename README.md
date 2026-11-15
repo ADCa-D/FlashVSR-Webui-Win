@@ -277,6 +277,7 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 |---|---|---|
 | `http://127.0.0.1:8288` | 明文 | **免登录**（只绑回环，外部摸不到） |
 | `https://<EasyTier IP>:8288` | TLS（复用 `Desktop\server\certs`） | 账号密码 或 IP 已放行 |
+| `http://<EasyTier IP>:8289` | 明文 | 同上（给**装不了自签 CA 的手机**用；端口可用 `FLASHVSR_PLAIN_PORT` 改） |
 
 规则：
 
