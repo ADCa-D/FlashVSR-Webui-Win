@@ -468,7 +468,8 @@ def _dir_size(root):
 async def index(request):
     # 禁缓存：改完 UI 后刷新就能看到，不会拿到旧页面
     return web.FileResponse(os.path.join(APP_DIR, "ui.html"),
-                            headers={"Cache-Control": "no-store, must-revalidate"})
+                            headers={"Cache-Control": "no-store, must-revalidate",
+                                     "Content-Type": "text/html; charset=utf-8"})
 
 
 async def presets(request):
