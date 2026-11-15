@@ -290,8 +290,14 @@ class _Stage(torch.nn.Module):
 
 
 class StageTRTDecoder(TRTDecoder):
-    """把解码图按 TGrow 切成多段小引擎：单引擎 workspace 从 3 GB 降到几百 MB，
-    好和常驻的 DiT 共存。代价是每帧多次调用（1+1+2+4 = 8 次）。
+    """【实验性，实测失败，勿用】按 TGrow 切成多段小引擎。
+
+    2026-11-16 实测（640×360 / 25 帧 / tile128）：
+    - 耗时 56.5 s vs torch 52.4 s（**更慢**：每帧 8 次调用，调度开销吃掉收益）
+    - 数值不对（PSNR 16 dB / SSIM 0.18，状态链或子帧顺序有 bug 未修）
+    - 4 个引擎常驻 4.2 GB，比整图单引擎的 3.2 GB 还多
+    保留代码仅作为「此路不通」的记录。
+    """
 
     语义与原逐帧路径一致：段间状态 = 「上一帧在本层 MemBlock 的输入」；
     段内顺序不变；TGrow 留在 torch 里（只是一个 1×1 conv + reshape）。
@@ -431,11 +437,12 @@ class StageTRTDecoder(TRTDecoder):
                         y, self.mem[si] = self._run_stage(stages[si], xt, self.mem[si])
                         if si < len(tgs):
                             tg = self.dec.decoder[tgs[si]]
-                            nt = tg(y)
+                            # TGrow 是 torch 模块（bf16 权重），TRT 输出是 fp16 → 过一次 bf16
+                            nt = tg(y.to(torch.bfloat16))
                             _nt, c_, h_, w_ = nt.shape
                             subs = list(nt.view(1, tg.stride * c_, h_, w_).chunk(tg.stride, 1))
                             for s_ in reversed(subs):
-                                queue.insert(0, (s_, si + 1))
+                                queue.insert(0, (s_.half(), si + 1))
                         else:
                             queue.insert(0, (y, si + 1))
                     frames.extend(outs)
