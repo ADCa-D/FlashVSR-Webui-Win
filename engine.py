@@ -355,10 +355,14 @@ def probe(path):
     except Exception:
         fps = 25.0
     dur = float((j.get("format") or {}).get("duration") or 0)
+    try:
+        frames = int(st.get("nb_frames") or 0)
+    except (TypeError, ValueError):
+        frames = 0
     has_audio = bool(json.loads(subprocess.check_output(
         [FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries",
          "stream=index", "-of", "json", path]).decode("utf-8", "ignore")).get("streams"))
-    return dict(w=w, h=h, fps=fps, duration=dur, has_audio=has_audio)
+    return dict(w=w, h=h, fps=fps, duration=dur, frames=frames, has_audio=has_audio)
 
 
 def decode_frames(path, on_progress=None, pre_scale=1.0):

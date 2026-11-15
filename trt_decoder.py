@@ -265,9 +265,193 @@ class TRTDecoder:
         return self._orig(x, parallel=parallel, show_progress_bar=show_progress_bar, cond=cond)
 
 
-class CompiledDecoder:
-    """torch.compile 版：融合 MemBlock 的 cat/conv/add/relu，1.16×，不额外占显存。"""
+class _Stage(torch.nn.Module):
+    """解码器的一段（不含 TGrow）：入 1 张特征 → 出 1 张 + 该段所有 MemBlock 的新 past。"""
 
+    def __init__(self, decoder, start, end, mem_layers):
+        super().__init__()
+        self.decoder = decoder
+        self.start = int(start)
+        self.end = int(end)
+        self.mem_layers = list(mem_layers)
+
+    def forward(self, x, *pasts):
+        mem = {L: p for L, p in zip(self.mem_layers, pasts)}
+        xt = x
+        for i in range(self.start, self.end):
+            b = self.decoder[i]
+            if type(b).__name__ == "MemBlock":
+                xt_new = b(xt, mem[i])
+                mem[i] = xt
+                xt = xt_new
+            else:
+                xt = b(xt)
+        return (xt,) + tuple(mem[L] for L in self.mem_layers)
+
+
+class StageTRTDecoder(TRTDecoder):
+    """把解码图按 TGrow 切成多段小引擎：单引擎 workspace 从 3 GB 降到几百 MB，
+    好和常驻的 DiT 共存。代价是每帧多次调用（1+1+2+4 = 8 次）。
+
+    语义与原逐帧路径一致：段间状态 = 「上一帧在本层 MemBlock 的输入」；
+    段内顺序不变；TGrow 留在 torch 里（只是一个 1×1 conv + reshape）。
+    """
+
+    def _walk(self, h, w, dt):
+        """走一遍真实数据流，返回 (层→输入形状, TGrow 索引)。"""
+        dec = self.dec.decoder
+        in_ch = dec[1].in_channels
+        x = torch.zeros(1, in_ch, h, w, device="cuda", dtype=dt)
+        ins, queue = {}, [(x, 0)]
+        with torch.no_grad():
+            while queue:
+                xt, i = queue.pop(0)
+                if i >= len(dec):
+                    continue
+                b = dec[i]
+                nm = type(b).__name__
+                ins.setdefault(i, tuple(xt.shape))
+                if nm == "MemBlock":
+                    xt = b(xt, torch.zeros_like(xt))
+                    queue.insert(0, (xt, i + 1))
+                elif nm == "TGrow":
+                    xt = b(xt)
+                    _nt, c_, hh, ww = xt.shape
+                    for sub in reversed(xt.view(1, b.stride * c_, hh, ww).chunk(b.stride, 1)):
+                        queue.insert(0, (sub, i + 1))
+                else:
+                    xt = b(xt)
+                    queue.insert(0, (xt, i + 1))
+        tgs = [i for i, b in enumerate(dec) if type(b).__name__ == "TGrow"]
+        return ins, tgs
+
+    def prewarm(self, h, w):
+        self._plan(h, w)
+        return True
+
+    def _plan(self, h, w):
+        key = (h, w)
+        if key in self.sessions:
+            return self.sessions[key]
+
+        import onnxruntime as ort
+        freed = self.before_build() if self.before_build else False
+        try:
+            dt = torch.float16
+            was = next(self.dec.parameters()).dtype
+            if next(self.dec.parameters()).device.type != "cuda":
+                self.dec.to("cuda")
+            ins, tgs = self._walk(h, w, was)
+
+            starts, s = [], 0
+            for t in tgs:
+                starts.append((s, t))
+                s = t + 1
+            starts.append((s, len(self.dec.decoder)))
+
+            self.dec.to(dt)
+            stages = []
+            for (a, b) in starts:
+                mems = [i for i in range(a, b)
+                        if type(self.dec.decoder[i]).__name__ == "MemBlock"]
+                in_shape = ins[a]
+                past_shapes = [ins[L] for L in mems]
+                onnx_path = os.path.join(self.cache,
+                                         f"stage_{a}_{b}_{in_shape[2]}x{in_shape[3]}.onnx")
+                if not os.path.isfile(onnx_path):
+                    mod = _Stage(self.dec.decoder, a, b, mems).eval()
+                    xx = torch.zeros(in_shape, device="cuda", dtype=dt)
+                    zeros = [torch.zeros(ps, device="cuda", dtype=dt) for ps in past_shapes]
+                    with torch.no_grad():
+                        torch.onnx.export(mod, (xx, *zeros), onnx_path,
+                                          input_names=["x"] + [f"past{i}" for i in range(len(mems))],
+                                          output_names=["y"] + [f"p{i}" for i in range(len(mems))],
+                                          opset_version=17, do_constant_folding=True, dynamo=False)
+                    del mod, zeros, xx
+                    torch.cuda.empty_cache()
+                so = ort.SessionOptions()
+                so.log_severity_level = 3
+                ws = int(os.environ.get("FLASHVSR_TRT_WS_STAGE", "1024")) << 20
+                sess = ort.InferenceSession(onnx_path, so, providers=[("TensorrtExecutionProvider", {
+                    "trt_fp16_enable": True,
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": os.path.join(self.cache, "engines_stage"),
+                    "trt_max_workspace_size": ws,
+                    "trt_builder_optimization_level": 3,
+                })])
+                stages.append(dict(sess=sess, mems=mems, past_shapes=past_shapes,
+                                   out_shape=tuple(sess.get_outputs()[0].shape)))
+                self.log(f"段引擎 {a}..{b} 就绪（{in_shape[2]}x{in_shape[3]}，{len(mems)} past）")
+            if was != dt:
+                self.dec.to(was)
+            self.sessions[key] = (stages, tgs)
+            return self.sessions[key]
+        finally:
+            if self.after_build:
+                self.after_build(freed)
+
+    def _run_stage(self, st, x, mem):
+        b = st["sess"].io_binding()
+        xin = x.half().contiguous()
+        b.bind_input("x", "cuda", 0, "float16", tuple(xin.shape), xin.data_ptr())
+        for i, m in enumerate(mem):
+            b.bind_input(f"past{i}", "cuda", 0, "float16", tuple(m.shape), m.data_ptr())
+        y = torch.empty(st["out_shape"], device="cuda", dtype=torch.float16)
+        b.bind_output("y", "cuda", 0, "float16", st["out_shape"], y.data_ptr())
+        new_mem = []
+        for i, ps in enumerate(st["past_shapes"]):
+            buf = torch.empty(ps, device="cuda", dtype=torch.float16)
+            b.bind_output(f"p{i}", "cuda", 0, "float16", ps, buf.data_ptr())
+            new_mem.append(buf)
+        st["sess"].run_with_iobinding(b)
+        return y, new_mem
+
+    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None):
+        if self.off or parallel or cond is None:
+            return self._fallback(x, parallel, show_progress_bar, cond)
+        n, t, c, hh, ww = x.shape
+        first = self.mem is None
+        try:
+            stages, tgs = self._plan(hh, ww)
+            if first:
+                self.mem = [[torch.zeros(ps, device="cuda", dtype=torch.float16)
+                             for ps in st["past_shapes"]] for st in stages]
+            with torch.no_grad():
+                cnd = self.dec.pixel_shuffle(cond).half()
+                lat = x.half()
+                frames = []
+                for k in range(t):
+                    cur = torch.cat([cnd[:, k], lat[:, k]], dim=1).contiguous()
+                    queue, outs = [(cur, 0)], []
+                    while queue:
+                        xt, si = queue.pop(0)
+                        if si == len(stages):
+                            outs.append(xt)
+                            continue
+                        y, self.mem[si] = self._run_stage(stages[si], xt, self.mem[si])
+                        if si < len(tgs):
+                            tg = self.dec.decoder[tgs[si]]
+                            nt = tg(y)
+                            _nt, c_, h_, w_ = nt.shape
+                            subs = list(nt.view(1, tg.stride * c_, h_, w_).chunk(tg.stride, 1))
+                            for s_ in reversed(subs):
+                                queue.insert(0, (s_, si + 1))
+                        else:
+                            queue.insert(0, (y, si + 1))
+                    frames.extend(outs)
+                out = torch.stack(frames, dim=1).to(torch.bfloat16)
+        except Exception as e:  # noqa
+            free, total = torch.cuda.mem_get_info()
+            self.log(f"分段 TRT 失败，回退 torch（空闲 {free/2**30:.1f}/{total/2**30:.1f} GB）："
+                     f"{type(e).__name__}: {str(e)[:260]}")
+            self.off = True
+            return self._fallback(x, parallel, show_progress_bar, cond)
+        if first:
+            return out[:, self.dec.frames_to_trim:]
+        return out
+
+
+class CompiledDecoder:
     def __init__(self, taehv, log=print, mode="default"):
         self.dec = taehv
         self.log = log
@@ -367,11 +551,11 @@ def maybe_enable(taehv, cache_dir, log=print):
     if backend in ("0", "off", "false", "torch", ""):
         return None
     try:
-        if backend == "trt":
+        if backend in ("trt", "stage"):
             if not trt_available():
                 log("TRT 不可用（缺 onnxruntime-gpu / TensorRT 库），回退 torch")
                 return None
-            dec = TRTDecoder(taehv, cache_dir, log=log)
+            dec = (StageTRTDecoder if backend == "stage" else TRTDecoder)(taehv, cache_dir, log=log)
         else:
             dec = CompiledDecoder(taehv, log=log)
         dec.wrap(taehv)

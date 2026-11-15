@@ -92,7 +92,8 @@
       <label class="chk"><input type="checkbox" id="custom" /> 自定义</label>
       <span style="color:var(--dim);font-size:12.5px">scale</span><input id="scale" type="number" min="2" max="4" step="1" value="4" disabled />
       <span style="color:var(--dim);font-size:12.5px">tile</span><input id="tile" type="number" min="64" max="512" step="32" value="128" disabled />
-      <span style="color:var(--dim);font-size:12.5px">kv</span><input id="kv" type="number" min="1" max="3" step="0.5" value="3" disabled />
+      <span style="color:var(--dim);font-size:12.5px">kv</span><input id="kv" type="number" min="1" max="4" step="0.5" value="3" disabled />
+      <label class="chk" title="量化后 tile192 更快，但 8 GB 上容易 OOM"><input type="checkbox" id="tileUp" /> tile 提到 192</label>
     </div>
     <div class="row">
       <label class="chk"><input type="checkbox" id="chunkOn" /> 长视频分段</label>
@@ -243,6 +244,7 @@ function collectFields(){
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
   o.twox = $('#prescale').value === 'half' ? 'downscale' : 'native';
+  if ($('#tileUp').checked) o.tile_up = '1';
   return o;
 }
 
@@ -406,16 +408,18 @@ function updateEncHint(){
   $('#qLabel').textContent = q;
 }
 function updatePresetLabels(){
+  const up = $('#tileUp').checked;
   const quant = $('#quant').value;
   document.querySelectorAll('.preset').forEach(el => {
     const base = el.dataset.p;
     const d = {quality:[4,128,3], balance:[4,160,2], fast:[2,256,3]}[base] || [4,128,3];
-    const tile = (quant !== 'none' && base !== 'fast') ? 192 : d[1];
+    const tile = (up && quant !== 'none' && base !== 'fast') ? 192 : d[1];
     const label = el.querySelector('span');
     if (label) label.textContent = `${d[0]}× · tile${tile} · kv${d[2]}`;
   });
 }
 $('#quant').onchange = updatePresetLabels;
+$('#tileUp').onchange = updatePresetLabels;
 updatePresetLabels();
 (async () => {
   try {

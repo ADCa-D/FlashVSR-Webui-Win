@@ -53,14 +53,15 @@ def safe_name(s):
 
 
 # ---------------------------------------------------------------- 参数解析
-def _resolve_params(fields):
+def _resolve_params(fields, src_path=None):
     """把表单字段解析成 worker 认识的一组参数（含 tile 对齐 / 2× 降采样换算）。"""
     preset = fields.get("preset", "quality")
     if preset in E.PRESETS:
         p = dict(E.PRESETS[preset])
         scale, tile, kv = p["scale"], p["tile"], p["kv"]
-        # 量化后显存省 ~1.26 GB，可以把 tile 提一档（实测 t192/kv2 = 49.5 s vs t160 = 65.4 s）
-        if preset in ("quality", "balance"):
+        # 量化后理论上能上 tile192（更快），但 8 GB 实测会 OOM（2026-11-15）。
+        # 除非显式要求（fields["tile_up"]），否则按预设的保守值走。
+        if preset in ("quality", "balance") and str(fields.get("tile_up") or "") in ("1", "true", "on"):
             tile = 192 if (fields.get("quant") or "none") != "none" else p["tile"]
     else:
         scale = int(fields.get("scale", 4))
@@ -92,6 +93,25 @@ def _resolve_params(fields):
             tile = max(step, (tile // step) * step)
 
     chunk = int(fields.get("chunk", 0) or 0)
+
+    # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），
+    # 8 GB 上这是 OOM 的主因（640×360/100 帧就已 2.2 GB，960×544 直接 5 GB）。
+    auto_note = None
+    if chunk <= 0 and src_path:
+        try:
+            info = E.probe(src_path)
+            ow = max(2, int(round(info["w"] * pre_scale))) * int(scale)
+            oh = max(2, int(round(info["h"] * pre_scale))) * int(scale)
+            frames = int(info.get("frames") or round(info["duration"] * info["fps"]))
+            if frames > 0 and ow > 0 and oh > 0:
+                per = ow * oh * 3 * 2                     # bf16 的 LQ 缓冲，每帧字节数
+                budget = 3.2 * 1024 ** 3                  # 留给它的上限（8 GB 卡）
+                if frames * per > budget:
+                    chunk = max(8, min(400, int(budget / per)))
+                    auto_note = (f"已自动分段 {chunk} 帧/段：{frames} 帧 × {ow}×{oh} "
+                                 f"整段要 {frames * per / 2 ** 30:.1f} GB，超出 8 GB 预算")
+        except Exception:
+            pass
     mode = fields.get("mode") or "tiny-long"
     if mode not in ("tiny", "tiny-long"):
         mode = "tiny-long"
@@ -115,7 +135,7 @@ def _resolve_params(fields):
 
     return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
                 attention=attention, encoder=encoder, quality=quality,
-                quant=quant, budget=budget, pre_scale=pre_scale)
+                quant=quant, budget=budget, pre_scale=pre_scale, auto_note=auto_note)
 
 
 # ---------------------------------------------------------------- 待确认任务 / 分段缓存
@@ -262,11 +282,12 @@ async def run(request):
         tmp_path = spec["src"]
         _del_pending(pending_id)
 
-    P = _resolve_params(fields)
+    P = _resolve_params(fields, tmp_path)
     scale, tile, kv = P["scale"], P["tile"], P["kv"]
     chunk, mode, attention = P["chunk"], P["mode"], P["attention"]
     encoder, quality, quant = P["encoder"], P["quality"], P["quant"]
     budget, pre_scale = P["budget"], P["pre_scale"]
+    auto_note = P.get("auto_note")
 
     if resume_action == "restart":
         restart = True
@@ -306,6 +327,9 @@ async def run(request):
     waiting = sum(1 for k, j in JOBS.items() if k != jid and not j.get("done"))
     if waiting:
         JOBS[jid]["msg"] = f"排队中（前面还有 {waiting} 个任务）"
+    if auto_note:
+        JOBS[jid]["auto_note"] = auto_note
+        JOBS[jid]["msg"] = auto_note
 
     base, ext = os.path.splitext(fname)
     src = os.path.join(WORK, f"{jid}_{fname}")
