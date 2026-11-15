@@ -267,7 +267,7 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 
 
 - 显存不够会自动降档重试，进度里会写「自动降档重试（第 N 次）：tile=… kv=…」
-- `权重`：MXFP8（推荐，−35% 且 PSNR 46 dB）/ bf16（基准）/ NVFP4（4bit，**未必更快**：小 token 下比 MXFP8 慢 27%，只省 ~0.7 GiB 显存）
+- `权重`：MXFP8（推荐，−35% 且 PSNR 46 dB）/ bf16（基准）/ NVFP4（4bit，**未必更快**，常驻反而更大）/ 混合（FFN 用 NVFP4、其余 MXFP8：显存再省 0.16 GiB，画质 44.07 dB，速度待测）
 
 ## 登录与访问控制
 

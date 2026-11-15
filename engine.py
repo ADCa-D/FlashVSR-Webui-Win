@@ -41,7 +41,7 @@ ENCODER_LABEL = {
     "nvenc": "GPU · NVENC（NVIDIA 独显）",
     "amf": "GPU · AMF（AMD 核显）",
 }
-QUANT_CHOICES = ("none", "nvfp4", "mxfp8")
+QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed")
 
 
 def encoder_args(backend, quality):
@@ -232,6 +232,70 @@ def quantize_dit_nvfp4(pipe, log=None):
     if log:
         log(f"NVFP4(pad16): {n} 个 Linear 已量化，跳过 {skipped}")
     return n
+
+
+def quantize_dit_mixed(pipe, log=None):
+    """混合精度：FFN 用 NVFP4（权重最省、M 最大），注意力/投影保 MXFP8，
+    形状不兼容（列数不是 16/32 的倍数）的层自动退回 bf16。
+
+    动机：纯 NVFP4 在小 M 下比 MXFP8 慢 27%，且常驻多 1.35 GiB；
+    但 FFN 是最大的矩阵（8960×1536），也是 M 最大的地方，值得单独用 4bit。
+    """
+    import comfy_kitchen as ck
+
+    def _ts(t):
+        return (t.abs().amax() / (6.0 * 448.0)).clamp(min=1e-8).float().reshape(1)
+
+    def _call_fp4(x, wq, wb, tw, bias):
+        shp = x.shape
+        x2 = x.reshape(-1, shp[-1]).contiguous()
+        tx = _ts(x2)
+        xq, xb = ck.quantize_nvfp4(x2, tx, pad_16x=True)
+        y = ck.scaled_mm_nvfp4(xq, wq, tx, tw, xb, wb, bias=bias, out_dtype=x.dtype)
+        return y[:x2.shape[0]].reshape(*shp[:-1], y.shape[-1])
+
+    def _call_fp8(x, wq, wb, bias):
+        shp = x.shape
+        x2 = x.reshape(-1, shp[-1]).contiguous()
+        xq, xb = ck.quantize_mxfp8(x2)
+        y = ck.scaled_mm_mxfp8(xq, wq, xb, wb, bias=bias, out_dtype=x.dtype)
+        return y.reshape(*shp[:-1], y.shape[-1])
+
+    n_fp4 = n_fp8 = skipped = 0
+    for name, m in _iter_linears(pipe.dit):
+        if not _should_quant(name):
+            skipped += 1
+            continue
+        w = _take_weight(m)
+        if w is None:
+            skipped += 1
+            continue
+        bias = None if m.bias is None else m.bias.detach()
+        want_fp4 = ".ffn." in name and w.shape[1] % 16 == 0
+        try:
+            if want_fp4:
+                tw = _ts(w)
+                wq, wb = ck.quantize_nvfp4(w, tw, pad_16x=True)
+                m.forward = (lambda x, _q=wq, _s=wb, _t=tw, _b=bias: _call_fp4(x, _q, _s, _t, _b))
+                n_fp4 += 1
+            elif w.shape[1] % 32 == 0:
+                wq, wb = ck.quantize_mxfp8(w)
+                m.forward = (lambda x, _q=wq, _s=wb, _b=bias: _call_fp8(x, _q, _s, _b))
+                n_fp8 += 1
+            else:
+                skipped += 1
+                continue
+            _drop_weight(m)
+        except Exception as e:  # noqa
+            skipped += 1
+            if log:
+                log(f"mixed 量化失败 {name}: {e}")
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    if log:
+        log(f"混合精度：FFN {n_fp4} 层 NVFP4 + {n_fp8} 层 MXFP8，跳过 {skipped}")
+    return n_fp4 + n_fp8
 
 
 def quantize_dit_mxfp8(pipe, log=None):
@@ -661,11 +725,12 @@ class Engine:
                 print(f"[TRT] 预热失败（会在首次解码时重试）：{type(e).__name__}: {str(e)[:200]}",
                       flush=True)
 
-        if quant in ("nvfp4", "mxfp8"):
+        if quant in ("nvfp4", "mxfp8", "mixed"):
             dit_to_cuda(self.pipe)
             if on_stage:
                 on_stage("load", 0, 1, f"量化 DiT 权重（{quant.upper()}）…")
-            fn = quantize_dit_nvfp4 if quant == "nvfp4" else quantize_dit_mxfp8
+            fn = {"nvfp4": quantize_dit_nvfp4, "mxfp8": quantize_dit_mxfp8,
+                  "mixed": quantize_dit_mixed}[quant]
             print(f"[FlashVSR] {fn(self.pipe, log=print)} 个 Linear 已量化", flush=True)
 
         self.loaded_key = key
