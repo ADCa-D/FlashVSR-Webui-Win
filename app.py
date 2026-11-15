@@ -110,7 +110,9 @@ def _resolve_params(fields, src_path=None):
             frames = int(info.get("frames") or round(info["duration"] * info["fps"]))
             if frames > 0 and ow > 0 and oh > 0:
                 per = ow * oh * 3 * 2                     # bf16 的 LQ 缓冲，每帧字节数
-                budget = 3.2 * 1024 ** 3                  # 留给它的上限（8 GB 卡）
+                # 预算随 tile 变：tile192 的 per-tile 工作集比 tile128 多 ~2.4 GB
+                # （实测 960×544：tile192 chunk40 峰值 7450 OOM；chunk20 才 6672 稳）
+                budget = (1.0 if tile >= 192 else 3.2) * 1024 ** 3
                 limit = max(8, min(400, int(budget / per)))
                 if chunk <= 0 and frames * per > budget:
                     chunk = limit
@@ -299,6 +301,7 @@ async def run(request):
     chunk, mode, attention = P["chunk"], P["mode"], P["attention"]
     encoder, quality, quant = P["encoder"], P["quality"], P["quant"]
     budget, pre_scale = P["budget"], P["pre_scale"]
+    tile_overlap = P["tile_overlap"]
     auto_note = P.get("auto_note")
 
     if resume_action == "restart":
