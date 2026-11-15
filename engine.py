@@ -250,7 +250,8 @@ def quick_hash(path, chunk=1 << 20):
 
 
 def _param_key(params):
-    keys = ("scale", "tile", "kv", "chunk", "overlap", "mode", "attention", "quant", "pre_scale")
+    keys = ("scale", "tile", "kv", "chunk", "overlap", "mode", "attention", "quant",
+            "pre_scale", "tile_overlap")
     return hashlib.sha1(json.dumps({k: params.get(k) for k in keys}, sort_keys=True).encode()).hexdigest()[:8]
 
 
@@ -589,7 +590,8 @@ class Engine:
         if on_stage:
             on_stage("load", 1, 1, "模型就绪")
 
-    def _run_window(self, frames_u8, scale, tile, kv, on_tile=None, sparse=2.0, local=11):
+    def _run_window(self, frames_u8, scale, tile, kv, on_tile=None, sparse=2.0, local=11,
+                    tile_overlap=24):
         """force_offload=False：每 tile 结束把 2.84 GB DiT 卸到 CPU 再搬回要多花 ~2.9 s/tile。"""
         mod = self.mod
         orig = mod.cqdm
@@ -624,7 +626,7 @@ class Engine:
             frames = torch.from_numpy(np.ascontiguousarray(frames_u8)).float().div_(255.0)
             out = mod.flashvsr(
                 self.pipe, frames, int(scale), True, True, True,
-                int(tile), 24, False, float(sparse), float(kv), int(local), 0, False)
+                int(tile), int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
             return (out.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
         finally:
             mod.cqdm = orig
@@ -659,7 +661,8 @@ class Engine:
 
         def run_win(win, tile, kv, cb=None):
             sp, lr, kk = budget_for(win, kv)
-            res = self._run_window(win, params["scale"], tile, kk, cb, sparse=sp, local=lr)
+            res = self._run_window(win, params["scale"], tile, kk, cb, sparse=sp, local=lr,
+                                   tile_overlap=int(params.get("tile_overlap") or 24))
             return res, sp, lr, kk
 
         if not chunk or total <= chunk:

@@ -279,6 +279,21 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 成功跑完的任务会自动删掉自己的分段（结果已经在 `out/`），所以只有中断/取消/报错的才有缓存。运行中的按钮区还常驻一个「忘记历史缓存」，并显示当前缓存占了多少 MB。
 
 
+### DiT 分块（tile / 重叠）
+
+节点内部：`stride = tile_size - tile_overlap`，羽化带宽度 = `tile_overlap × scale`。
+
+| tile / overlap | tile 数（640×360） | 与 24 的 PSNR | SSIM |
+|---|---|---|---|
+| 128 / 24（旧） | 24 | — | — |
+| 128 / 16 | 24 | 43.15 dB | 0.9989 |
+| **128 / 12（默认）** | **18（−25%）** | **41.64 dB** | 0.9985 |
+| 128 / 8 | 18 | 41.06 dB | 0.9982 |
+
+同机耗时（低噪音模式，仅作相对参考）：65 s → **52 s（−20%）**。
+
+要点：`stride` 取整会跳变，overlap 16 这种中间值**没有任何收益**（tile 数还是 24）；只有跨过 12 才少一整排 tile。
+
 ### tile 对齐规则（很重要）
 
 节点内部会把**每个 tile 的输出**居中裁到 128 的倍数（`compute_scaled_and_target_dims`）。

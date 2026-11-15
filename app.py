@@ -93,11 +93,16 @@ def _resolve_params(fields, src_path=None):
             tile = max(step, (tile // step) * step)
 
     chunk = int(fields.get("chunk", 0) or 0)
+    try:
+        tile_overlap = int(fields.get("tile_overlap") or 12)
+    except ValueError:
+        tile_overlap = 12
+    tile_overlap = max(4, min(tile_overlap, max(8, tile // 4)))
 
     # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），
     # 8 GB 上这是 OOM 的主因（640×360/100 帧就已 2.2 GB，960×544 直接 5 GB）。
     auto_note = None
-    if chunk <= 0 and src_path:
+    if src_path:
         try:
             info = E.probe(src_path)
             ow = max(2, int(round(info["w"] * pre_scale))) * int(scale)
@@ -106,10 +111,16 @@ def _resolve_params(fields, src_path=None):
             if frames > 0 and ow > 0 and oh > 0:
                 per = ow * oh * 3 * 2                     # bf16 的 LQ 缓冲，每帧字节数
                 budget = 3.2 * 1024 ** 3                  # 留给它的上限（8 GB 卡）
-                if frames * per > budget:
-                    chunk = max(8, min(400, int(budget / per)))
+                limit = max(8, min(400, int(budget / per)))
+                if chunk <= 0 and frames * per > budget:
+                    chunk = limit
                     auto_note = (f"已自动分段 {chunk} 帧/段：{frames} 帧 × {ow}×{oh} "
                                  f"整段要 {frames * per / 2 ** 30:.1f} GB，超出 8 GB 预算")
+                elif chunk > limit:
+                    was = chunk
+                    chunk = limit
+                    auto_note = (f"分段已从 {was} 下调到 {chunk} 帧/段："
+                                 f"{ow}×{oh} 下每帧 LQ 占 {per / 2 ** 20:.0f} MB")
         except Exception:
             pass
     mode = fields.get("mode") or "tiny-long"
@@ -135,7 +146,8 @@ def _resolve_params(fields, src_path=None):
 
     return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
                 attention=attention, encoder=encoder, quality=quality,
-                quant=quant, budget=budget, pre_scale=pre_scale, auto_note=auto_note)
+                quant=quant, budget=budget, pre_scale=pre_scale,
+                tile_overlap=tile_overlap, auto_note=auto_note)
 
 
 # ---------------------------------------------------------------- 待确认任务 / 分段缓存
@@ -323,7 +335,8 @@ async def run(request):
     JOBS[jid]["params"] = dict(scale=scale, tile=tile, kv=kv, chunk=chunk,
                                mode=mode, attention=attention,
                                encoder=encoder, quality=quality,
-                               quant=quant, budget=budget, pre_scale=pre_scale)
+                               quant=quant, budget=budget, pre_scale=pre_scale,
+                               tile_overlap=tile_overlap)
     waiting = sum(1 for k, j in JOBS.items() if k != jid and not j.get("done"))
     if waiting:
         JOBS[jid]["msg"] = f"排队中（前面还有 {waiting} 个任务）"
@@ -343,6 +356,7 @@ async def run(request):
                        mode=mode, attention=attention,
                        encoder=encoder, quality=quality,
                        quant=quant, budget=budget, pre_scale=pre_scale,
+                       tile_overlap=tile_overlap,
                        restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))
 
