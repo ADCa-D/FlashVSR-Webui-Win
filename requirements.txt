@@ -1,0 +1,13 @@
+# FlashVSR WebUI 依赖
+#
+# 注意：torch / torchvision / numpy / safetensors / huggingface_hub / einops 通常已随
+# ComfyUI 便携包提供，无需重复安装。这里只列额外需要的东西。
+
+aiohttp>=3.9          # HTTP 服务（ComfyUI 环境里通常已有）
+
+# triton-windows：FlashVSR 节点的稀疏注意力（Sparse-Sage）需要它
+# 装之前必须先把 Python 头文件/导入库补进 python_embeded（见 README 第 3 步）
+triton-windows>=3.3; platform_system == "Windows"
+
+# comfy_kitchen：MXFP8 / NVFP4 量化内核（ComfyUI 0.3.60+ 自带，单独跑时可 pip 安装）
+# comfy_kitchen>=0.2

@@ -1,0 +1,19 @@
+# 运行时产物
+out/
+work/
+*.mp4
+*.mkv
+*.npy
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FlashVSR 超分面板</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e8ecf3; --dim:#8b93a5;
+    --accent:#5b8cff; --ok:#39c07a; --err:#ff5f5f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  header{padding:22px 28px 6px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  h1{font-size:19px;margin:0;letter-spacing:.5px}
+  header .sub{color:var(--dim);font-size:12.5px}
+  main{max-width:1180px;margin:0 auto;padding:10px 24px 60px;display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .card h2{font-size:13px;color:var(--dim);font-weight:600;margin:0 0 12px;letter-spacing:.6px;text-transform:uppercase}
+  #drop{border:1.5px dashed #333a48;border-radius:12px;padding:26px 16px;text-align:center;cursor:pointer;transition:.15s}
+  #drop:hover,#drop.over{border-color:var(--accent);background:#151a24}
+  #drop .big{font-size:15px;margin-bottom:4px}
+  #drop .hint{color:var(--dim);font-size:12.5px}
+  #fileName{color:var(--ok);font-size:12.5px;margin-top:8px;word-break:break-all}
+  .presets{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:4px}
+  .preset{border:1px solid var(--line);border-radius:10px;padding:10px;cursor:pointer;background:#141821;transition:.12s}
+  .preset:hover{border-color:#3a4358}
+  .preset.sel{border-color:var(--accent);background:#18223a}
+  .preset b{display:block;font-size:13px}
+  .preset span{color:var(--dim);font-size:11.5px}
+  .row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+  label.chk{color:var(--dim);font-size:12.5px;display:flex;gap:6px;align-items:center}
+  input[type=number]{background:#0f131b;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:5px 8px;width:76px}
+  select{background:#0f131b;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:6px 8px;font-size:12.5px;max-width:190px}
+  .row{gap:8px 10px}
+  .hint{display:block;color:var(--dim);font-size:11.5px;margin-top:6px;line-height:1.5}
+  .lk{color:var(--dim);font-size:12.5px}
+  .hist .del{color:#7a8399;padding:0 6px;flex:none;border-radius:6px;background:none;font-size:14px;cursor:pointer}
+  .hist .del:hover{color:var(--err);background:#2a1d22}
+  button{border:0;border-radius:10px;padding:10px 18px;font-size:14px;cursor:pointer;font-weight:600}
+  #go{background:var(--accent);color:#fff}
+  #go:disabled{background:#2b3245;color:#77809a;cursor:not-allowed}
+  .ghost{background:#222937;color:#c9d1e2}
+  .bar{height:8px;background:#0b0e14;border-radius:6px;overflow:hidden;margin:12px 0 6px}
+  .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3f6bff,#69e0ff);transition:width .3s}
+  #stage{color:var(--dim);font-size:12.5px;min-height:20px}
+  #stage b{color:var(--text);font-weight:600}
+  video{width:100%;border-radius:10px;background:#000;display:block}
+  .info{color:var(--dim);font-size:12.5px;margin-top:8px;white-space:pre-wrap}
+  .hist{max-height:260px;overflow:auto;margin-top:6px}
+  .hist div{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:8px;cursor:pointer;font-size:12.5px}
+  .hist div:hover{background:#1c2230}
+  .hist .n{color:#cfd6e6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hist .s{color:var(--dim);flex:none}
+  .err{color:var(--err);font-size:12.5px;white-space:pre-wrap}
+  .foot{grid-column:1/-1;color:#5c6579;font-size:12px;text-align:center}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>FlashVSR 超分面板</h1>
+  <div class="sub">FlashVSR v1.1 · one-step · 本地 GPU · 端口 8288</div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1 · 选视频</h2>
+    <div id="drop">
+      <div class="big">把视频拖到这里，或点击选择</div>
+      <div class="hint">mp4 / mkv / mov / webm；音轨会自动保留</div>
+      <div id="fileName"></div>
+    </div>
+    <input id="file" type="file" accept="video/*" hidden />
+
+    <h2 style="margin-top:18px">2 · 档位</h2>
+    <div class="presets" id="presets">
+      <div class="preset sel" data-p="quality"><b>画质优先</b><span>4× · tile128 · kv3</span></div>
+      <div class="preset" data-p="balance"><b>平衡</b><span>4× · tile160 · kv2</span></div>
+      <div class="preset" data-p="fast"><b>快速</b><span>2× · tile256 · kv3</span></div>
+    </div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="custom" /> 自定义</label>
+      <span style="color:var(--dim);font-size:12.5px">scale</span><input id="scale" type="number" min="2" max="4" step="1" value="4" disabled />
+      <span style="color:var(--dim);font-size:12.5px">tile</span><input id="tile" type="number" min="64" max="512" step="32" value="128" disabled />
+      <span style="color:var(--dim);font-size:12.5px">kv</span><input id="kv" type="number" min="1" max="3" step="0.5" value="3" disabled />
+    </div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="chunkOn" /> 长视频分段</label>
+      <input id="chunk" type="number" min="16" max="400" step="8" value="48" disabled />
+      <span style="color:var(--dim);font-size:12px">帧/段</span>
+      <label class="chk"><input type="checkbox" id="resume" checked /> 续跑</label>
+    </div>
+
+    <div class="row">
+      <span class="lk">模式</span>
+      <select id="mode">
+        <option value="tiny-long" selected>tiny-long（默认，省显存）</option>
+        <option value="tiny">tiny（略快）</option>
+      </select>
+      <span class="lk">注意力</span>
+      <select id="attention">
+        <option value="sparse">稀疏 Sparse-Sage</option>
+        <option value="dense">稠密 SDPA</option>
+      </select>
+    </div>
+    <div class="hint">
+      稠密 SDPA 只在 2× / tile≤128 时省显存；8 GB 卡长片段用稀疏。显存不够面板会自动降档重试。
+    </div>
+
+    <div class="row">
+      <span class="lk">导出编码</span>
+      <select id="encoder">
+        <option value="auto">自动</option>
+      </select>
+      <span class="lk">质量<span id="qLabel" style="font-size:11px">（CRF）</span></span>
+      <input id="quality" type="number" min="10" max="28" step="1" value="15" />
+      <span class="lk">权重</span>
+      <select id="quant">
+        <option value="mxfp8" selected>MXFP8（推荐）</option>
+        <option value="none">bf16（基准）</option>
+        <option value="nvfp4">NVFP4（实验）</option>
+      </select>
+    </div>
+    <div class="hint" id="encHint"></div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="budgetAuto" checked /> 运动自适应预算（静止镜头省算力）</label>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <button id="go" disabled>开始超分</button>
+      <button id="cancelBtn" class="ghost" disabled>取消任务</button>
+      <button id="unload" class="ghost">释放显存</button>
+    </div>
+
+    <div class="bar"><i id="fill"></i></div>
+    <div id="stage">等待开始…</div>
+    <div id="err" class="err"></div>
+  </section>
+
+  <section class="card">
+    <h2>结果</h2>
+    <video id="player" controls playsinline></video>
+    <div class="info" id="rinfo">还没有结果</div>
+    <div class="row">
+      <a id="dl" style="display:none"><button class="ghost">下载 mp4</button></a>
+    </div>
+
+    <h2 style="margin-top:18px">历史输出
+      <button id="clearHist" class="ghost" style="float:right;padding:3px 10px;font-size:11.5px">清空</button>
+    </h2>
+    <div class="hist" id="hist"></div>
+  </section>
+
+  <div class="foot">模型：D:\ComfyUI_windows_portable\ComfyUI\models\FlashVSR-v1.1 · 输出：flashvsr-web\out</div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let file = null, jobId = null, es = null;
+
+// ---------- 选择文件
+const drop = $('#drop');
+drop.onclick = () => $('#file').click();
+$('#file').onchange = e => setFile(e.target.files[0]);
+['dragenter','dragover'].forEach(t => drop.addEventListener(t, e => {e.preventDefault(); drop.classList.add('over')}));
+['dragleave','drop'].forEach(t => drop.addEventListener(t, e => {e.preventDefault(); drop.classList.remove('over')}));
+drop.addEventListener('drop', e => { if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
+function setFile(f){
+  if(!f) return;
+  file = f;
+  $('#fileName').textContent = `${f.name}  ·  ${(f.size/1048576).toFixed(1)} MB`;
+  $('#go').disabled = false;
+}
+
+// ---------- 档位选择
+document.querySelectorAll('.preset').forEach(el => el.onclick = () => {
+  document.querySelectorAll('.preset').forEach(x => x.classList.remove('sel'));
+  el.classList.add('sel');
+});
+$('#custom').onchange = e => {
+  ['#scale','#tile','#kv'].forEach(s => $(s).disabled = !e.target.checked);
+};
+$('#chunkOn').onchange = e => {
+  $('#chunk').disabled = !e.target.checked;
+  $('#resume').disabled = !e.target.checked;
+};
+$('#resume').disabled = true;
+
+function presetParams(){
+  if ($('#custom').checked){
+    return {preset:'custom', scale:+$('#scale').value, tile:+$('#tile').value, kv:+$('#kv').value};
+  }
+  const p = document.querySelector('.preset.sel')?.dataset.p || 'quality';
+  return {preset:p};
+}
+
+// ---------- 提交
+$('#go').onclick = async () => {
+  if(!file) return;
+  $('#go').disabled = true; $('#err').textContent = ''; $('#fill').style.width = '0';
+  $('#stage').textContent = '上传中…';
+  const fd = new FormData();
+  fd.append('file', file);
+  const p = presetParams();
+  Object.entries(p).forEach(([k,v]) => fd.append(k, v));
+  fd.append('chunk', $('#chunkOn').checked ? $('#chunk').value : '0');
+  fd.append('restart', $('#resume').checked ? '0' : '1');
+  fd.append('mode', $('#mode').value);
+  fd.append('attention', $('#attention').value);
+  fd.append('encoder', $('#encoder').value);
+  fd.append('quality', $('#quality').value);
+  fd.append('quant', $('#quant').value);
+  fd.append('budget', $('#budgetAuto').checked ? 'auto' : 'fixed');  let r, j;
+  try {
+    r = await fetch('/api/run', {method:'POST', body: fd});
+    j = await r.json();
+  } catch(e){ $('#err').textContent = '提交失败：' + e; $('#go').disabled = false; return; }
+  if(!r.ok){ $('#err').textContent = j?.message || '提交失败'; $('#go').disabled = false; return; }
+  jobId = j.job;
+  $('#cancelBtn').disabled = false;
+  watch(jobId);
+};
+
+function watch(id){
+  if(es) es.close();
+  es = new EventSource('/api/progress/' + id);
+  es.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    const names = {queued:'排队中', load:'加载模型', decode:'解码', infer:'推理', seg:'分段', encode:'编码/拼接', done:'完成', error:'失败'};
+    let pct = 0;
+    if (d.stage === 'seg' && d.total > 0) pct = 6 + 84 * d.cur / d.total;
+    else if (d.stage === 'infer' && d.total > 0) pct = 5 + 88 * d.cur / d.total;
+    else if (d.stage === 'decode') pct = 4;
+    else if (d.stage === 'load') pct = 3;
+    else if (d.stage === 'encode') pct = d.cur ? 97 : 94;
+    else if (d.stage === 'done') pct = 100;
+    $('#fill').style.width = pct + '%';
+    let eta = '';
+    if (d.elapsed && pct > 5 && pct < 100) {
+      const remain = d.elapsed * (100 - pct) / pct;
+      const fmt = s => s >= 60 ? `${Math.round(s / 60)} 分钟` : `${Math.round(s)} 秒`;
+      eta = ` · 预计剩余 ${fmt(remain)}`;
+    }
+    $('#stage').innerHTML = `<b>${names[d.stage] || d.stage}</b> · ${d.msg || ''}` +
+      (d.elapsed ? ` · 已用 ${Math.round(d.elapsed)}s` : '') + eta +
+      (d.params ? ` · ${d.params.scale}× tile${d.params.tile} kv${d.params.kv}` : '');
+    if (d.stage === 'error'){
+      $('#err').textContent = d.error || '失败';
+      $('#go').disabled = false; $('#cancelBtn').disabled = true; es.close(); loadHist();
+    }
+    if (d.stage === 'done'){
+      es.close();
+      $('#go').disabled = false;
+      $('#cancelBtn').disabled = true;
+      const name = d.out_name;
+      const url = '/api/result/' + id;
+      $('#player').src = url; $('#player').play().catch(()=>{});
+      const i = d.info || {};
+      $('#rinfo').textContent = name
+        ? `${name}\n${i.in_wh?.[0]}×${i.in_wh?.[1]} → ${i.out_wh?.[0]}×${i.out_wh?.[1]} · ${i.frames} 帧 · ${i.fps.toFixed(2)} fps · 用时 ${d.elapsed}s`
+        : '完成';
+      const dl = $('#dl'); dl.href = '/api/download/' + id; dl.style.display = 'inline-block';
+      loadHist();
+    }
+  };
+  es.onerror = () => { es.close(); $('#go').disabled = false; };
+}
+
+// ---------- 编码器能力
+let CAPS = null;
+function updateEncHint(){
+  const be = $('#encoder').value;
+  const info = (CAPS && CAPS.encoders && CAPS.encoders[be]) || {};
+  const parts = [];
+  if (!info.ok && info.detail) parts.push('不可用：' + info.detail);
+  else if (be === 'amf') parts.push('核显 610M 只有 2 CU，1440p 以上通常比 CPU 慢');
+  else if (be === 'nvenc') parts.push('与推理共用独显，会占一点显存');
+  else parts.push('CPU 编码与 GPU 推理天然并行，通常最快');
+  $('#encHint').textContent = parts.join(' · ');
+  const q = be === 'nvenc' ? '（CQ，越小越好）'
+          : be === 'amf' ? '（QVBR，越小越好）'
+          : '（CRF，越小越好）';
+  $('#qLabel').textContent = q;
+}
+function updatePresetLabels(){
+  const quant = $('#quant').value;
+  document.querySelectorAll('.preset').forEach(el => {
+    const base = el.dataset.p;
+    const d = {quality:[4,128,3], balance:[4,160,2], fast:[2,256,3]}[base] || [4,128,3];
+    const tile = (quant !== 'none' && base !== 'fast') ? 192 : d[1];
+    const label = el.querySelector('span');
+    if (label) label.textContent = `${d[0]}× · tile${tile} · kv${d[2]}`;
+  });
+}
+$('#quant').onchange = updatePresetLabels;
+updatePresetLabels();
+(async () => {
+  try {
+    CAPS = await (await fetch('/api/capabilities')).json();
+    const short = {auto:'自动', cpu:'CPU · x264', nvenc:'NVENC', amf:'AMF'};
+    const sel = $('#encoder');
+    sel.innerHTML = '';
+    (CAPS.choices || ['auto']).forEach(be => {
+      const info = (CAPS.encoders && CAPS.encoders[be]) || {ok:false, detail:''};
+      const o = document.createElement('option');
+      o.value = be;
+      o.textContent = (short[be] || be) + (info.ok ? '' : ' · 不可用');
+      o.title = (CAPS.labels && CAPS.labels[be]) ? CAPS.labels[be] : be;
+      if (!info.ok) o.disabled = true;
+      sel.appendChild(o);
+    });
+    sel.value = 'auto';
+    sel.onchange = updateEncHint;
+    updateEncHint();
+  } catch(e) {}
+})();
+
+// ---------- 释放显存
+$('#cancelBtn').onclick = async () => {
+  if (!jobId) return;
+  $('#cancelBtn').disabled = true;
+  await fetch('/api/job/cancel/' + jobId, {method:'POST'});
+};
+
+$('#unload').onclick = async () => {
+  const r = await fetch('/api/unload', {method:'POST'});
+  const j = await r.json().catch(()=>({}));
+  $('#stage').textContent = j.note || '显存由任务子进程持有，任务结束后自动释放';
+};
+
+// ---------- 历史
+async function loadHist(){
+  try{
+    const items = await (await fetch('/api/history')).json();
+    const box = $('#hist'); box.innerHTML = '';
+    if (!items.length){ box.innerHTML = '<div style="color:#5c6579">还没有输出</div>'; return; }
+    items.forEach(it => {
+      const d = document.createElement('div');
+      d.innerHTML = `<span class="n">${it.name}</span><span class="s">${(it.size/1048576).toFixed(2)} MB</span><button class="del" title="删除">×</button>`;
+      d.querySelector('.n').onclick = () => {
+        $('#player').src = '/api/out/' + encodeURIComponent(it.name);
+        $('#player').play().catch(()=>{});
+        $('#rinfo').textContent = it.name;
+        const dl = $('#dl'); dl.href = '/api/out/' + encodeURIComponent(it.name);
+        dl.setAttribute('download', it.name); dl.style.display = 'inline-block';
+      };
+      d.querySelector('.del').onclick = async ev => {
+        ev.stopPropagation();
+        if (!confirm('删除 ' + it.name + ' ?')) return;
+        const r = await fetch('/api/out/' + encodeURIComponent(it.name), {method:'DELETE'});
+        if (!r.ok) { $('#err').textContent = '删除失败：' + (await r.text()).slice(0,200); }
+        loadHist();
+      };
+      box.appendChild(d);
+    });
+  }catch(e){}
+}
+
+$('#clearHist').onclick = async () => {
+  if (!confirm('清空全部历史输出，并清掉上传缓存/残留分段？')) return;
+  const r = await fetch('/api/history/clear', {method:'POST'});
+  if (!r.ok) { $('#err').textContent = '清空失败：' + (await r.text()).slice(0,200); return; }
+  const j = await r.json();
+  $('#stage').textContent = `已清空 ${j.deleted} 个输出`;
+  $('#player').removeAttribute('src'); $('#player').load();
+  $('#rinfo').textContent = '还没有结果'; $('#dl').style.display = 'none';
+  loadHist();
+};
+loadHist();
+</script>
+</body>
+</html>
