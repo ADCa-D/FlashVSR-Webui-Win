@@ -59,6 +59,16 @@ def main():
     cmd2, _, _ = E._decode_cmd("x.mp4", 960, 544, 0.5, 0, 10, 25.0, False, "bogus")
     checks.append(("非法缩放器回落默认", "downscaler=" + E.DEFAULT_SCALER in " ".join(cmd2)))
 
+    cmd3, _, _ = E._decode_cmd("x.mp4", 960, 544, 0.5, 0, 10, 25.0, False, "spline36",
+                               deband=True, deband_grain=0, dither="ordered")
+    vf3 = " ".join(cmd3)
+    checks.append(("去色带进滤镜", "deband=1" in vf3))
+    checks.append(("去色带颗粒可关", "deband_grain=0" in vf3))
+    checks.append(("抖动进滤镜", "dithering=ordered" in vf3))
+    cmd4, _, _ = E._decode_cmd("x.mp4", 960, 544, 0.5, 0, 10, 25.0, False, "spline36",
+                               dither="error_diffusion")
+    checks.append(("非法抖动被忽略", "dithering" not in " ".join(cmd4)))
+
     fails = [tag for tag, ok in checks if not ok]
     if fails:
         print(FAIL)

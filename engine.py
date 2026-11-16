@@ -64,6 +64,8 @@ SVT_TUNE_NUM = {"vq": 0, "psnr": 1, "ssim": 2, "ms_ssim": 4, "vmaf": 5}
 SCALERS = ("ewa_lanczos4sharpest", "ewa_lanczos", "lanczos", "spline36", "sinc",
            "bicubic", "bilinear", "nearest")
 DEFAULT_SCALER = "ewa_lanczos4sharpest"
+# libplacebo 的抖动方式（本机枚举，没有 error_diffusion）
+DITHERS = ("", "blue", "ordered", "ordered_fixed", "white")
 
 TUNE_ALL = ("", "ssim", "psnr", "vq", "vmaf", "ms_ssim", "film", "animation",
             "grain", "stillimage", "fastdecode", "zerolatency")
@@ -759,6 +761,9 @@ def _param_key(params):
     d["extra_args"] = str(params.get("extra_args") or "").strip()
     d["enc_rev"] = ENCODER_ARGS_REV
     d["prescale_scaler"] = str(params.get("prescale_scaler") or DEFAULT_SCALER)
+    d["prescale_deband"] = bool(params.get("prescale_deband"))
+    d["deband_grain"] = params.get("deband_grain")
+    d["prescale_dither"] = str(params.get("prescale_dither") or "")
     return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 
 
@@ -874,7 +879,7 @@ def probe(path):
 
 
 def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, fp32=False,
-                scaler=None):
+                scaler=None, deband=False, deband_grain=None, dither=""):
     """拼 ffmpeg 命令；start_frame/count 给定时只解这一段（输入侧 -ss + 精确 seek）。
 
     fp32=True 时走 libplacebo 的 gbrpf32le 输出：源精度一路保留到模型输入，
@@ -883,15 +888,23 @@ def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, f
     vf = None
     tw, th = w, h
     scaler = scaler if scaler in SCALERS else DEFAULT_SCALER
+    extra = ""                      # 附加的 libplacebo 选项（去色带 / 抖动）
+    if deband:
+        extra += ":deband=1"
+        if deband_grain is not None:
+            extra += f":deband_grain={float(deband_grain):g}"
+    if dither and dither in DITHERS:
+        extra += f":dithering={dither}"
     if abs(pre_scale - 1.0) > 1e-6:
         tw = max(2, int(round(w * pre_scale / 2)) * 2)
         th = max(2, int(round(h * pre_scale / 2)) * 2)
     if fp32:
-        vf = (f"libplacebo=w={tw}:h={th}:downscaler={scaler}:format=gbrpf32le,"
+        vf = (f"libplacebo=w={tw}:h={th}:downscaler={scaler}{extra}:format=gbrpf32le,"
               f"hwdownload,format=gbrpf32le")
         w, h = tw, th
-    elif abs(pre_scale - 1.0) > 1e-6:
-        vf = f"libplacebo=w={tw}:h={th}:downscaler={scaler},hwdownload,format=yuv420p"
+    elif abs(pre_scale - 1.0) > 1e-6 or extra:
+        vf = (f"libplacebo=w={tw}:h={th}:downscaler={scaler}{extra},"
+              f"hwdownload,format=yuv420p")
         w, h = tw, th
     cmd = [FFMPEG, "-v", "error"]
     if vf:
@@ -911,13 +924,14 @@ def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, f
 
 
 def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress=None,
-                        fp32=False, scaler=None):
+                        fp32=False, scaler=None, deband=False, deband_grain=None,
+                        dither=""):
     """只解 [start, start+count) 这一段，返回 NHWC（uint8 或 float32，内存只跟段长有关）。"""
     info = probe(path)
     if info["w"] <= 0 or info["h"] <= 0:
         raise RuntimeError("读不到视频尺寸，文件可能不是视频")
     cmd, w, h = _decode_cmd(path, info["w"], info["h"], pre_scale, start, count, fps, fp32,
-                            scaler)
+                            scaler, deband, deband_grain, dither)
     frame_bytes = w * h * 3 * (4 if fp32 else 1)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     chunks, n = [], 0
@@ -940,13 +954,15 @@ def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress
     return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3)
 
 
-def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None):
+def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None,
+                  deband=False, deband_grain=None, dither=""):
     """解成 NHWC（uint8 或 float32）。pre_scale<1 用 libplacebo(spline36) 在核显上降采样。"""
     info = probe(path)
     w, h = info["w"], info["h"]
     if w <= 0 or h <= 0:
         raise RuntimeError("读不到视频尺寸，文件可能不是视频")
-    cmd, w, h = _decode_cmd(path, w, h, pre_scale, fp32=fp32, scaler=scaler)
+    cmd, w, h = _decode_cmd(path, w, h, pre_scale, fp32=fp32, scaler=scaler,
+                            deband=deband, deband_grain=deband_grain, dither=dither)
     if abs(pre_scale - 1.0) > 1e-6:
         info["w"], info["h"] = w, h
     frame_bytes = w * h * 3 * (4 if fp32 else 1)
@@ -1164,6 +1180,15 @@ def resolve_params(fields, src_path=None):
         scaler = os.environ.get("FLASHVSR_PRESCALE_SCALER", DEFAULT_SCALER)
         if scaler not in SCALERS:
             scaler = DEFAULT_SCALER
+    prescale_deband = str(fields.get("prescale_deband") or "0").strip() in ("1", "true", "on", "yes")
+    deband_grain = fields.get("deband_grain")
+    try:
+        deband_grain = None if deband_grain in (None, "") else float(deband_grain)
+    except (TypeError, ValueError):
+        deband_grain = None
+    prescale_dither = str(fields.get("prescale_dither") or "").strip()
+    if prescale_dither not in DITHERS:
+        prescale_dither = ""
     tune = str(fields.get("tune") or "").strip().lower()
     if tune not in TUNE_ALL:
         tune = ""
@@ -1182,7 +1207,8 @@ def resolve_params(fields, src_path=None):
                 tile_overlap=tile_overlap, bitdepth=bitdepth,
                 hi_precision=hi_precision, color_fix=color_fix, seam_fix=seam_fix,
                 max_frames=max_frames, tune=tune, extra_args=extra_args,
-                prescale_scaler=scaler,
+                prescale_scaler=scaler, prescale_deband=prescale_deband,
+                deband_grain=deband_grain, prescale_dither=prescale_dither,
                 preview=preview, auto_note=auto_note)
 
 
@@ -1401,6 +1427,9 @@ class Engine:
                 frames = decode_frames_range(
                     src, 0, total, pre_scale=pre_scale, fps=info["fps"], fp32=fp32,
                     scaler=params.get("prescale_scaler"),
+                    deband=bool(params.get("prescale_deband")),
+                    deband_grain=params.get("deband_grain"),
+                    dither=str(params.get("prescale_dither") or ""),
                     on_progress=lambda n: on_stage("decode", n, total, f"解码中 {n}/{total} 帧"))
                 if abs(pre_scale - 1.0) > 1e-6:
                     info["w"] = max(2, int(round(info["w"] * pre_scale / 2)) * 2)
@@ -1408,7 +1437,10 @@ class Engine:
             else:
                 frames, info = decode_frames(
                     src, on_progress=lambda n: on_stage("decode", n, 0, f"解码中 {n} 帧"),
-                    pre_scale=pre_scale, fp32=fp32, scaler=params.get("prescale_scaler"))
+                    pre_scale=pre_scale, fp32=fp32, scaler=params.get("prescale_scaler"),
+                    deband=bool(params.get("prescale_deband")),
+                    deband_grain=params.get("deband_grain"),
+                    dither=str(params.get("prescale_dither") or ""))
             total = len(frames)
             on_stage("decode", total, total, f"共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
         else:
@@ -1594,6 +1626,9 @@ class Engine:
                 win = decode_frames_range(src, win_start, win_end - win_start,
                                           pre_scale=pre_scale, fps=info["fps"], fp32=fp32,
                                           scaler=params.get("prescale_scaler"),
+                                          deband=bool(params.get("prescale_deband")),
+                                          deband_grain=params.get("deband_grain"),
+                                          dither=str(params.get("prescale_dither") or ""),
                                           on_progress=lambda n, ws=win_start: on_stage(
                                               "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
                 if len(win) != win_end - win_start:

@@ -148,16 +148,39 @@ python inference.py -s in.mp4 -o out.mp4 --hi-precision --bitdepth 10 --encoder 
 
 - 默认换成 **`ewa_lanczos4sharpest`**：比 spline36 高 0.5 dB，代价 50 帧多 2.9 s
   （1000 帧也就多 1 分钟，相对几小时的推理可忽略）。
-- **`extra_opts=preset=high_quality` 不要用**：一是它会把 `downscaler` **覆盖掉**
+- **`extra_opts=preset=high_quality` 不建议用**：它会把 `downscaler` **覆盖掉**
   （实测 `downscaler=ewa_lanczos4sharpest:extra_opts=preset=high_quality` 与
   `downscaler=spline36:extra_opts=preset=high_quality` 输出**字节完全相同**），
-  二是保真度反而更低（32.69 dB）。
+  所以"HQ 预设 + 自选缩放器"在这个 ffmpeg 封装里做不到。
+  （注意：它开启的**去色带 / 抖动 / 色度还原**本身是有价值的——只是别通过预设拿，
+  用下面两个独立选项即可，还能保留自选缩放器。）
 - 可用缩放器（本机 ffmpeg 9.0.1 / libplacebo 实测）：
   `ewa_lanczos4sharpest`、`ewa_lanczossharp`、`ewa_lanczos`、`ewa_hanning`、`lanczos`、
   `spline64`、`spline36`、`sinc`、`ginseng`、`bicubic`、`mitchell`、`catmull_rom`、
   `bilinear`、`nearest`。**没有 `jinc`**（会报 `No such scaler preset 'jinc'`）。
 - 参数：面板「开发模式 → 预缩放算法」，或 `--scaler ewa_lanczos4sharpest`、
   环境变量 `FLASHVSR_PRESCALE_SCALER`。换算法会改分段缓存键（画面不同）。
+
+### 去色带 / 抖动（独立开关，不依赖 preset）
+
+libplacebo 把这两项做成了独立选项，可以和我们自选的缩放器组合：
+
+```text
+downscaler=ewa_lanczos4sharpest:deband=1:deband_grain=0:dithering=blue
+```
+
+实测（刻意色带化的渐变，540p）：
+
+| 处理 | 最长同值平台 | 不同亮度值 | 50 帧耗时 |
+|---|---|---|---|
+| 只有 scaler | 40 px | 26 | 2.2 s |
+| `+ deband=1` | **26 px** | 30 | 2.4 s |
+
+- **去色带**：默认阈值下把平台从 40px 打碎到 26px、层级从 26 增到 30，代价 50 帧 +0.2 s；
+  它会给平坦区加细颗粒（`deband_grain` 默认 6，设 0 可关）。
+- **抖动**：本机枚举只有 `none / blue / ordered / ordered_fixed / white`，
+  **没有 `error_diffusion`**（传了会被忽略）。默认 `blue`，一般不用改。
+- 开关位置：面板「开发模式 → 去色带 / 抖动」；CLI `--deband --deband-grain 0 --dither blue`。
 
 ## 用 Vulkan 跑？分两件事说清
 

@@ -28,6 +28,8 @@ def build_params(args, src):
                   bitdepth=args.bitdepth, hi_precision=1 if args.hi_precision else 0,
                   color_fix=0 if args.no_color_fix else 1, seam_fix=args.seam_fix,
                   tune=args.tune, extra_args=args.extra, prescale_scaler=args.scaler,
+                  prescale_deband=1 if args.deband else 0,
+                  deband_grain=args.deband_grain, prescale_dither=args.dither,
                   quality=args.crf, prescale=args.prescale,
                   tile_overlap=args.overlap, mode=args.mode,
                   attention=args.attention, budget=args.budget)
@@ -90,6 +92,11 @@ def main():
     ap.add_argument("--extra", default="", help="附加编码参数（开发模式，整串透传）")
     ap.add_argument("--scaler", default="", choices=[""] + list(E.SCALERS),
                     help="预缩放所用的 libplacebo 缩放器（默认 ewa_lanczos4sharpest）")
+    ap.add_argument("--deband", action="store_true", help="libplacebo 去色带（代价 ~0.2 s/50 帧）")
+    ap.add_argument("--deband-grain", type=float, default=None,
+                    help="去色带时加的颗粒量（默认由 libplacebo 决定，0=不加）")
+    ap.add_argument("--dither", default="", choices=[""] + list(E.DITHERS),
+                    help="8bit 输出抖动方式（blue/ordered/ordered_fixed/white）")
     ap.add_argument("--seam-fix", default="smooth", choices=["smooth", "align", "off"],
                     help="tile 拼接方式：smooth=平滑羽化（默认）/ align=加 DC 对齐（实验）/ off=线性")
     ap.add_argument("--no-color-fix", action="store_true",
