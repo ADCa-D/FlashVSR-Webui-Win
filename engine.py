@@ -66,8 +66,11 @@ def encoder_args(backend, quality):
         return ["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
                 "-svtav1-params", "lp=4", "-g", "240", "-pix_fmt", "yuv420p"]
     if backend == "x265":
-        return ["-c:v", "libx265", "-preset", "medium", "-crf", q, "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "slow", "-crf", q, "-pix_fmt", "yuv420p"]
+        # 共享功耗墙：CPU 编码线程开太多会抢走 GPU 的 boost 预算，而编码本身不是瓶颈
+        return ["-c:v", "libx265", "-preset", "medium", "-crf", q,
+                "-threads", "4", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "slow", "-crf", q,
+            "-threads", "4", "-pix_fmt", "yuv420p"]
 
 
 def probe_encoders():
@@ -531,6 +534,8 @@ def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0):
     cmd = [FFMPEG, "-v", "error"]
     if vf:
         cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+    # 解码线程同样限 4：共享功耗墙下，解码多开线程只会抢 GPU 的 boost 预算
+    cmd += ["-threads", str(int(os.environ.get("FLASHVSR_DEC_THREADS", "4")))]
     if start_frame:
         # -ss 放 -i 前（快速 seek）+ accurate_seek 保证落在指定帧
         cmd += ["-ss", f"{start_frame / max(fps, 1e-6):.6f}", "-accurate_seek"]
