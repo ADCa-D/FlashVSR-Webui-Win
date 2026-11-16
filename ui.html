@@ -70,6 +70,7 @@
   .modal .detail code{background:#0f131b;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:11.5px}
 .dev{margin-top:14px;border-top:1px dashed var(--line,#262b36);padding-top:12px}
 .devBody{margin-top:8px;padding:10px 12px;border:1px dashed var(--line,#262b36);border-radius:10px}
+.bar.orphan > i{width:100%!important;background:repeating-linear-gradient(90deg,#5b8cff55 0 10px,#5b8cff18 10px 20px)}
 </style>
 </head>
 <body>
@@ -409,13 +410,16 @@ async function loadCache(){
   try {
     const c = await (await fetch('/api/segments')).json();
     const n = (c.dirs || []).length;
-    $('#cacheInfo').textContent = n
-      ? `分段缓存：${c.mb} MB · ${n} 个任务（${(c.dirs || []).filter(d => d.done).length} 个有进度）`
-      : '';
+    if (!n) { $('#cacheInfo').textContent = ''; return; }
+    const r = c.resumable || {n: 0, mb: 0}, st = c.stale || {n: 0, mb: 0}, cp = c.complete || {n: 0, mb: 0};
+    const parts = [`可续跑 ${r.n} 个（${r.mb} MB）`];
+    if (st.n) parts.push(`废弃碎段 ${st.n} 个（${st.mb} MB）`);
+    if (cp.n) parts.push(`已完成残留 ${cp.n} 个（${cp.mb} MB）`);
+    $('#cacheInfo').textContent = `分段缓存共 ${c.mb} MB · ` + parts.join(' · ');
   } catch(e){}
 }
 $('#clearCache').onclick = async () => {
-  if(!confirm('确认删除所有分段缓存？之后同一视频会从头重算。')) return;
+  if(!confirm('确认删除所有分段缓存？\n注意：包括「可续跑」的进度，之后同一视频会从头重算。')) return;
   const r = await fetch('/api/segments/clear', {method:'POST'});
   if(!r.ok){ $('#err').textContent = await errText(r); return; }
   const d = await r.json();
@@ -449,14 +453,25 @@ function watch(id){
     else if (d.stage === 'load') pct = 3;
     else if (d.stage === 'encode') pct = d.cur ? 97 : 94;
     else if (d.stage === 'done') pct = 100;
-    $('#fill').style.width = pct + '%';
+    const bar = $('#fill').parentElement;
+    if (d.orphan && d.stage !== 'done') {
+      // 面板重启前启动的 worker：拿不到进度，别装成 0%
+      bar.classList.add('orphan');
+      $('#fill').style.width = '100%';
+      pct = 0;
+      var orphanNote = ' · 进度不可见（面板重启前启动的任务，跑完会进历史）';
+    } else {
+      bar.classList.remove('orphan');
+      $('#fill').style.width = pct + '%';
+      var orphanNote = '';
+    }
     let eta = '';
     if (d.elapsed && pct > 5 && pct < 100) {
       const remain = d.elapsed * (100 - pct) / pct;
       const fmt = s => s >= 60 ? `${Math.round(s / 60)} 分钟` : `${Math.round(s)} 秒`;
       eta = ` · 预计剩余 ${fmt(remain)}`;
     }
-    $('#stage').innerHTML = `<b>${names[d.stage] || d.stage}</b> · ${d.msg || ''}` +
+    $('#stage').innerHTML = `<b>${names[d.stage] || d.stage}</b> · ${d.msg || ''}` + (orphanNote || '') +
       (d.elapsed ? ` · 已用 ${Math.round(d.elapsed)}s` : '') + eta +
       (d.params ? ` · ${d.params.scale}× tile${d.params.tile} kv${d.params.kv}` +
         (d.params.pre_scale && d.params.pre_scale < 1 ? ' · 源/2' : '') : '');

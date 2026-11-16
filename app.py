@@ -704,7 +704,7 @@ async def progress(request):
             break
         payload = {k: j.get(k) for k in
                    ("stage", "cur", "total", "msg", "done", "error", "elapsed", "info",
-                    "params", "preview")}
+                    "params", "preview", "orphan")}
         payload["out_name"] = os.path.basename(j["out"]) if j.get("out") else None
         s = json.dumps(payload, ensure_ascii=False)
         if s != last:
@@ -839,10 +839,17 @@ async def clear_history(request):
 
 
 async def segments(request):
-    """查看分段缓存：总量 + 每个任务目录的进度。"""
+    """查看分段缓存：总量 + 每个任务目录的进度 + **能否真的续跑**。
+
+    state 的含义（别再让"总量"误导人）：
+      resumable  0 < done < total  → 下次同参数能接着跑
+      complete   done >= total>0   → 已完成却没删（keep_seg / 上次中断在拼接），重跑会从头
+      stale      done == 0 或没有 plans → 取消/失败留下的碎段，纯占盘
+    """
     root = os.path.join(WORK, "segments")
     size, files = _dir_size(root)
     dirs = []
+    agg = {"resumable": [0, 0.0], "complete": [0, 0.0], "stale": [0, 0.0]}
     if os.path.isdir(root):
         for name in sorted(os.listdir(root)):
             p = os.path.join(root, name)
@@ -850,11 +857,23 @@ async def segments(request):
                 continue
             man = E.load_manifest(p) or {}
             done = len(man.get("done") or {})
-            total = len(man.get("plans") or []) or int(man.get("total") or 0)
+            total = len(man.get("plans") or [])
             b, _ = _dir_size(p)
-            dirs.append(dict(key=name, done=done, total=total, mb=round(b / 1048576, 1)))
-    return web.json_response(dict(bytes=size, mb=round(size / 1048576, 1),
-                                  files=files, dirs=dirs))
+            mb = round(b / 1048576, 1)
+            if total == 0 or done == 0:
+                state = "stale"
+            elif done >= total:
+                state = "complete"
+            else:
+                state = "resumable"
+            agg[state][0] += 1
+            agg[state][1] += mb
+            dirs.append(dict(key=name, done=done, total=total, mb=mb, state=state))
+    return web.json_response(dict(
+        bytes=size, mb=round(size / 1048576, 1), files=files, dirs=dirs,
+        resumable=dict(n=agg["resumable"][0], mb=round(agg["resumable"][1], 1)),
+        complete=dict(n=agg["complete"][0], mb=round(agg["complete"][1], 1)),
+        stale=dict(n=agg["stale"][0], mb=round(agg["stale"][1], 1))))
 
 
 async def clear_segments(request):
