@@ -907,31 +907,55 @@ def _qcache_dir():
     return d
 
 
-def _qcache_path(pipe, quant):
-    """缓存键：DiT 前 8 个 Linear 的形状 + 权重切片哈希 + 量化档 + 格式版本。
-
-    刻意不 hash 5.4 GB（那本身就慢）；8×256 个数足以区分不同 checkpoint，
-    换模型/换量化实现都会变。
-    """
+def _dit_checkpoint():
+    """定位 DiT 的 safetensors（缓存键要用它的大小/时间，必须加载前就能拿到）。"""
     try:
-        import hashlib
-        h = hashlib.sha1()
-        cnt = 0
-        for name, m in _iter_linears(pipe.dit):
-            w = getattr(m, "weight", None)
-            if w is None:
-                continue
-            h.update(f"{name}{tuple(w.shape)}".encode())
-            h.update(w.detach().flatten()[:256].float().cpu().numpy().tobytes())
-            cnt += 1
-            if cnt >= 8:
-                break
-        if cnt == 0:
-            return None
-        key = f"dit_{h.hexdigest()[:16]}_{quant}_v{QCACHE_REV}"
-        return os.path.join(_qcache_dir(), key + ".safetensors")
+        import config as C
+        base = getattr(C, "MODEL_PATH", None)
+        files = list(getattr(C, "MODEL_FILES", []) or [])
+        if base:
+            cand = [f for f in files if "streaming_dmd" in f or f.endswith(".safetensors")]
+            for f in cand:
+                p = os.path.join(base, f)
+                if os.path.isfile(p):
+                    return p
+            for f in sorted(os.listdir(base)):
+                if f.endswith(".safetensors"):
+                    return os.path.join(base, f)
     except Exception:
+        pass
+    return os.environ.get("FLASHVSR_DIT_PATH") or None
+
+
+def _qcache_path_static(quant):
+    path = _dit_checkpoint()
+    if not path:
         return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = f"dit_{st.st_size}_{int(st.st_mtime)}_{quant}_v{QCACHE_REV}"
+    return os.path.join(_qcache_dir(), key + ".safetensors")
+
+
+def _qcache_keys(path):
+    """只读 safetensors 头，拿到缓存里有哪些层（不加载张量）。"""
+    if not path or not os.path.exists(path):
+        return set()
+    try:
+        import json
+        import struct
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            hdr = json.loads(f.read(n))
+        return {k[:-2] for k in hdr if k.endswith("|q")}
+    except Exception:
+        return set()
+
+
+def _qcache_path(pipe, quant):
+    return _qcache_path_static(quant)
 
 
 def _qcache_load(path, log=None):
