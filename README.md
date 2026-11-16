@@ -149,7 +149,9 @@ D:\ComfyUI_windows_portable\python_embeded\python.exe -c "from huggingface_hub i
 ```
 
 > 主模型建议校验 sha256：`bd28180edcf3446c028e32fc6b731a80bf7e4da2ab4caac3186b9499964d37be`。
-> 国内直连 HF 不通时：hf-mirror 只有 ~0.1 MB/s，走本地代理 8 线程分段能到 ~5 MB/s。
+> 国内直连 HF 不通时：hf-mirror 只有 ~0.1 MB/s，走本地代理分段能到 ~5 MB/s；**并发 4 路就够**（再多吞吐不变，只是徒增功耗和温度）。
+>
+> 加载权重同理：safetensors 默认按逻辑核数并行读盘，本项目在 `config.py` 里把 `RAYON_NUM_THREADS`/`OMP_NUM_THREADS` 限到 **4**——32 核全开只会更热，不会更快。
 
 #### 可选：自建模型镜像（国内下载更快）
 

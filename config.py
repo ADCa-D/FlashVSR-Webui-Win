@@ -12,6 +12,11 @@ import os
 import shutil
 import sys
 
+# safetensors 用 rayon 按“逻辑核数”并行读盘/解压，32 核同时上只会拉高功耗和温度，
+# 吞吐早被磁盘/PCIe 卡住。统一限到 4 线程（可在外部覆盖）。
+os.environ.setdefault("RAYON_NUM_THREADS", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- ComfyUI 便携包根目录
