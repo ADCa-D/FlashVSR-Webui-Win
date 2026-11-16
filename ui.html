@@ -138,6 +138,7 @@
         <option value="none">bf16（基准）</option>
         <option value="nvfp4" title="4bit，省显存但小 token 下更慢，未必更快">NVFP4（未必更快）</option>
         <option value="mixed" title="FFN 用 NVFP4，注意力/投影保 MXFP8；显存略省，速度待测">混合（FFN 4bit）</option>
+        <option value="w8" title="权重存 fp8、前向反量化回 bf16：30/40 系等无 fp8 张量核的卡也能用">W8A16（通用 fp8 权重）</option>
       </select>
     </div>
     <div class="hint" id="encHint"></div>

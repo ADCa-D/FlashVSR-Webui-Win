@@ -41,7 +41,7 @@ ENCODER_LABEL = {
     "nvenc": "GPU · NVENC（NVIDIA 独显）",
     "amf": "GPU · AMF（AMD 核显）",
 }
-QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed")
+QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed", "w8")
 
 
 def encoder_args(backend, quality):
@@ -296,6 +296,43 @@ def quantize_dit_mixed(pipe, log=None):
     if log:
         log(f"混合精度：FFN {n_fp4} 层 NVFP4 + {n_fp8} 层 MXFP8，跳过 {skipped}")
     return n_fp4 + n_fp8
+
+
+def quantize_dit_w8a16(pipe, log=None):
+    """通用 weight-only FP8：权重存 E4M3（按输出通道缩放），前向反量化回 bf16 再乘。
+
+    不依赖 fp8 张量核（sm89+），任何能跑 bf16 的卡都行（30/40 系、甚至 CPU 后端）。
+    显存：权重减半（2.84 GB → ~1.4 GB）；速度约等于 bf16（多一次 cast）。
+    """
+    n = skipped = 0
+    maxv = 448.0                       # e4m3 最大值
+    for name, m in _iter_linears(pipe.dit):
+        if not _should_quant(name):
+            skipped += 1
+            continue
+        w = _take_weight(m)
+        if w is None:
+            skipped += 1
+            continue
+        try:
+            scale = (w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / maxv).float()
+            wq = (w.float() / scale).clamp(-maxv, maxv).to(torch.float8_e4m3fn)
+        except Exception as e:  # noqa
+            skipped += 1
+            if log:
+                log(f"w8 量化失败 {name}: {e}")
+            continue
+        bias = None if m.bias is None else m.bias.detach()
+        m.forward = (lambda x, _q=wq, _s=scale, _b=bias:
+                     torch.nn.functional.linear(x, _q.to(x.dtype) * _s.to(x.dtype), _b))
+        _drop_weight(m)
+        n += 1
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    if log:
+        log(f"W8A16（权重 fp8 + bf16 激活）: {n} 层，跳过 {skipped}")
+    return n
 
 
 def quantize_dit_mxfp8(pipe, log=None):
@@ -725,12 +762,12 @@ class Engine:
                 print(f"[TRT] 预热失败（会在首次解码时重试）：{type(e).__name__}: {str(e)[:200]}",
                       flush=True)
 
-        if quant in ("nvfp4", "mxfp8", "mixed"):
+        if quant in ("nvfp4", "mxfp8", "mixed", "w8"):
             dit_to_cuda(self.pipe)
             if on_stage:
                 on_stage("load", 0, 1, f"量化 DiT 权重（{quant.upper()}）…")
             fn = {"nvfp4": quantize_dit_nvfp4, "mxfp8": quantize_dit_mxfp8,
-                  "mixed": quantize_dit_mixed}[quant]
+                  "mixed": quantize_dit_mixed, "w8": quantize_dit_w8a16}[quant]
             print(f"[FlashVSR] {fn(self.pipe, log=print)} 个 Linear 已量化", flush=True)
 
         self.loaded_key = key
