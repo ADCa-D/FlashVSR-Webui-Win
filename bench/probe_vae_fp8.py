@@ -59,8 +59,8 @@ def run(tag):
     return out, total, stats["t"]
 
 
-base, tot0, dt0 = run("bf16")
 dec.decode_video = timed
+base, tot0, dt0 = run("bf16")
 
 n_patch = fp8_conv.patch_module(dec, verbose=True)
 if n_patch == 0:
