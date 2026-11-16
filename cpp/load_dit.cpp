@@ -10,7 +10,7 @@
 #include <torch/torch.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 
-#include <immintrin.h>
+#include "simd/simd_bf16.h"
 
 #define NOMINMAX
 #include <windows.h>
@@ -131,33 +131,9 @@ struct JParser {
     }
 };
 
-// f32 -> bf16 with round-to-nearest-even (same rule as torch's .to(bfloat16))
-inline void f32_to_bf16_rne(const float* in, uint16_t* out, int64_t n) {
-#if defined(__AVX2__)
-    const __m256i bias = _mm256_set1_epi32(0x7FFF);
-    const __m256i one = _mm256_set1_epi32(1);
-    int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 f = _mm256_loadu_ps(in + i);
-        __m256i u = _mm256_castps_si256(f);
-        __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), one);
-        u = _mm256_add_epi32(u, _mm256_add_epi32(bias, lsb));
-        u = _mm256_srli_epi32(u, 16);
-        __m128i lo = _mm256_castsi256_si128(u);
-        __m128i hi = _mm256_extracti128_si256(u, 1);
-        _mm_storeu_si128((__m128i*)(out + i), _mm_packus_epi32(lo, hi));
-    }
-#else
-    int64_t i = 0;
-#endif
-    for (; i < n; ++i) {
-        uint32_t u;
-        std::memcpy(&u, in + i, 4);
-        u = (u + 0x7FFF + ((u >> 16) & 1)) >> 16;
-        out[i] = (uint16_t)u;
-    }
-}
-
+// f32 -> bf16 with round-to-nearest-even (same rule as torch's .to(bfloat16)).
+// The actual kernel is chosen at runtime: base / AVX2 / AVX-512, each in its own
+// translation unit (MSVC has no per-function target attributes on x86).
 size_t working_set_mib() {
     PROCESS_MEMORY_COUNTERS_EX pmc{};
     if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)))
@@ -223,14 +199,16 @@ int main(int argc, char** argv) {
     for (auto& e : entries) data_begin = (data_begin < 0) ? e.info.begin : std::min(data_begin, e.info.begin);
     if (data_begin != 0) std::printf("warning: first tensor starts at %lld\n", (long long)data_begin);
 
-    std::printf("file   : %.0f MiB, header %.0f KiB, %zu tensors  (commit %.0f MiB)\n",
-                (double)hlen, hlen / 1024.0, entries.size(), (double)private_mib(false));
+    std::printf("file   : %zu MiB, header %.0f KiB, %zu tensors  (commit %.0f MiB)\n",
+                (size_t)(hlen + 8 + infos.rbegin()->second.end) / 1048576, hlen / 1024.0,
+                entries.size(), (double)private_mib(false));
 
     // ---- one sequential pass, one reusable staging buffer -------------------
     constexpr int64_t CHUNK = 16ll * 1024 * 1024;   // floats per step (64 MB in, 32 MB out)
     auto opt_gpu_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
     std::vector<float> stage_f32((size_t)CHUNK);
     std::vector<uint16_t> stage_bf16((size_t)CHUNK);
+    const simd::ConvertFn to_bf16 = simd::f32_to_bf16();
 
     std::map<std::string, torch::Tensor> weights;
     int64_t total_elems = 0;
@@ -261,7 +239,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (ti.dtype == "F32") {
-                f32_to_bf16_rne(stage_f32.data(), stage_bf16.data(), cnt);
+                to_bf16(stage_f32.data(), stage_bf16.data(), cnt);
                 if (!no_gpu)
                     cudaMemcpy(gp + off * 2, stage_bf16.data(), (size_t)cnt * 2, cudaMemcpyHostToDevice);
             } else if (ti.dtype == "BF16") {

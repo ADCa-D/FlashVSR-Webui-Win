@@ -1,7 +1,10 @@
 @echo off
 rem Build a C++ app against the libtorch bundled with ComfyUI (no extra download).
 rem Usage: build.bat [name]   -> compiles cpp\<name>.cpp into cpp\<name>.exe
-rem CUDA headers come from pip packages (cuda_runtime + cuda_nvcc crt headers).
+rem
+rem The simd\ kernels are compiled one ISA level per translation unit (MSVC has no
+rem per-function target attributes on x86), so the main program stays baseline and
+rem the dispatcher picks the kernel at runtime.
 setlocal
 set SRC=%1
 if "%SRC%"=="" set SRC=spike
@@ -15,13 +18,24 @@ if not exist "%TORCH%\include\torch\extension.h" (
   exit /b 1
 )
 pushd cpp
-cl /nologo /std:c++20 /utf-8 /EHsc /MD /O2 /arch:AVX2 ^
-   /I"%TORCH%\include" /I"%TORCH%\include\torch\csrc\api\include" ^
-   /I"%CUDART%\include" /I"%CUDACRT%\include" ^
-   %SRC%.cpp /Fe:%SRC%.exe ^
-   /link /LIBPATH:"%TORCH%\lib" /LIBPATH:"." ^
-   torch.lib torch_cuda.lib torch_cpu.lib c10.lib c10_cuda.lib cudart64_13.lib
-del /q *.obj >nul 2>nul
-del /q *.exp >nul 2>nul
-del /q %SRC%.lib >nul 2>nul
+if not exist build mkdir build
+
+set CF=/nologo /c /std:c++20 /utf-8 /EHsc /MD /O2 /I"%TORCH%\include" /I"%TORCH%\include\torch\csrc\api\include" /I"%CUDART%\include" /I"%CUDACRT%\include"
+
+rem main program: baseline x64 only, it must run on any CPU
+cl %CF% %SRC%.cpp /Fo:build\main.obj || goto :fail
+rem kernels: each with its own ISA
+cl %CF% simd\bf16_base.cpp  /Fo:build\bf16_base.obj  || goto :fail
+cl %CF% simd\dispatch.cpp   /Fo:build\dispatch.obj   || goto :fail
+cl %CF% /arch:AVX2   simd\bf16_avx2.cpp   /Fo:build\bf16_avx2.obj   || goto :fail
+cl %CF% /arch:AVX512 simd\bf16_avx512.cpp /Fo:build\bf16_avx512.obj || goto :fail
+
+link /nologo /LIBPATH:"%TORCH%\lib" /LIBPATH:"." /OUT:%SRC%.exe ^
+   build\main.obj build\bf16_base.obj build\bf16_avx2.obj build\bf16_avx512.obj build\dispatch.obj ^
+   torch.lib torch_cuda.lib torch_cpu.lib c10.lib c10_cuda.lib cudart64_13.lib || goto :fail
 popd
+exit /b 0
+
+:fail
+popd
+exit /b 1
