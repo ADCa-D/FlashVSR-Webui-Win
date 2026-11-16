@@ -595,7 +595,9 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
            "-r", f"{fps:.6f}", "-i", "-"]
     if audio_src:
-        cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy", "-shortest"]
+        # 音轨和字幕流都无损 copy（字幕没有就静默跳过）
+        cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
+                "-c:a", "copy", "-c:s", "copy", "-shortest"]
     cmd += encoder_args(backend, quality) + ["-fps_mode", "cfr", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     for i in range(0, len(frames_u8), 8):
@@ -629,8 +631,15 @@ def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=
     if audio_src:
         r = subprocess.run(
             [FFMPEG, "-y", "-v", "error", "-i", silent, "-i", audio_src,
-             "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-shortest", out_path],
+             "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
+             "-c", "copy", "-shortest", out_path],
             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            # 字幕/音轨封装失败时退回只带音轨（很多 mp4 没有字幕流，-map 1:s? 本身不会报错）
+            r = subprocess.run(
+                [FFMPEG, "-y", "-v", "error", "-i", silent, "-i", audio_src,
+                 "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-shortest", out_path],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0:
             shutil.move(silent, out_path)
         else:
@@ -645,6 +654,107 @@ PRESETS = {
     "balance": dict(scale=4, tile=160, kv=2.0, label="平衡"),
     "fast": dict(scale=2, tile=256, kv=3.0, label="快速"),
 }
+
+
+# ---------------------------------------------------------------- 参数解析
+def resolve_params(fields, src_path=None):
+    """把表单字段解析成 worker 认识的一组参数（含 tile 对齐 / 2× 降采样换算）。"""
+    preset = fields.get("preset", "quality")
+    if preset in PRESETS:
+        p = dict(PRESETS[preset])
+        scale, tile, kv = p["scale"], p["tile"], p["kv"]
+        # 量化后理论上能上 tile192（更快），但 8 GB 实测会 OOM（2026-11-15）。
+        # 除非显式要求（fields["tile_up"]），否则按预设的保守值走。
+        if preset in ("quality", "balance") and str(fields.get("tile_up") or "") in ("1", "true", "on"):
+            tile = 192 if (fields.get("quant") or "none") != "none" else p["tile"]
+    else:
+        scale = int(fields.get("scale", 4))
+        tile = int(fields.get("tile", 128))
+        kv = float(fields.get("kv", 3.0))
+
+    # 节点内部会把每个 tile 的输出裁到 128 的倍数（compute_scaled_and_target_dims），
+    # 若 tile*scale 不是 128 的倍数，裁掉的部分会让拼贴几何错位 → 接缝。这里提前对齐。
+    step = 128 // math.gcd(128, max(1, int(scale)))
+    if tile % step:
+        tile = max(step, (tile // step) * step)
+
+    # 输入预缩放：控制「源先 /2 再 4×」这条路径，自定义档也能用
+    #   auto → 目标是 2× 时自动 /2（模型走 4×）
+    #   half → 强制 源/2 + 4×模型（不管上面填的 scale 是多少，输出恒为 2×）
+    #   off  → 不预缩放（scale=2 就是原生 2×，由模型自己放大）
+    pre_scale = 1.0
+    prescale = (fields.get("prescale") or "").strip()
+    if prescale not in ("auto", "half", "off"):
+        prescale = "auto"
+    if prescale == "auto":
+        # 目标 2× 就先 /2（模型走 4×，留在训练分布内）；其它倍率不缩放
+        prescale = "half" if int(scale) == 2 else "off"
+    if prescale == "half":
+        scale, pre_scale = 4, 0.5
+        tile = max(64, tile // 2)          # 输入减半，tile 相应缩小才是同一块画面
+        step = 128 // math.gcd(128, int(scale))
+        if tile % step:
+            tile = max(step, (tile // step) * step)
+
+    chunk = int(fields.get("chunk", 0) or 0)
+    try:
+        tile_overlap = int(fields.get("tile_overlap") or 12)
+    except ValueError:
+        tile_overlap = 12
+    tile_overlap = max(4, min(tile_overlap, max(8, tile // 4)))
+
+    # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），
+    # 8 GB 上这是 OOM 的主因（640×360/100 帧就已 2.2 GB，960×544 直接 5 GB）。
+    auto_note = None
+    if src_path:
+        try:
+            info = probe(src_path)
+            ow = max(2, int(round(info["w"] * pre_scale))) * int(scale)
+            oh = max(2, int(round(info["h"] * pre_scale))) * int(scale)
+            frames = int(info.get("frames") or round(info["duration"] * info["fps"]))
+            if frames > 0 and ow > 0 and oh > 0:
+                per = ow * oh * 3 * 2                     # bf16 的 LQ 缓冲，每帧字节数
+                # 预算随 tile 变：tile192 的 per-tile 工作集比 tile128 多 ~2.4 GB
+                # （实测 960×544：tile192 chunk40 峰值 7450 OOM；chunk20 才 6672 稳）
+                budget = (1.0 if tile >= 192 else 3.2) * 1024 ** 3
+                limit = max(8, min(400, int(budget / per)))
+                if chunk <= 0 and frames * per > budget:
+                    chunk = limit
+                    auto_note = (f"已自动分段 {chunk} 帧/段：{frames} 帧 × {ow}×{oh} "
+                                 f"整段要 {frames * per / 2 ** 30:.1f} GB，超出 8 GB 预算")
+                elif chunk > limit:
+                    was = chunk
+                    chunk = limit
+                    auto_note = (f"分段已从 {was} 下调到 {chunk} 帧/段："
+                                 f"{ow}×{oh} 下每帧 LQ 占 {per / 2 ** 20:.0f} MB")
+        except Exception:
+            pass
+    mode = fields.get("mode") or "tiny-long"
+    if mode not in ("tiny", "tiny-long"):
+        mode = "tiny-long"
+    attention = fields.get("attention") or "sparse"
+    if attention not in ("sparse", "dense"):
+        attention = "sparse"
+    encoder = fields.get("encoder") or "auto"
+    if encoder not in ENCODER_CHOICES:
+        encoder = "auto"
+    quant = fields.get("quant") or "none"
+    if quant not in QUANT_CHOICES:
+        quant = "none"
+    budget = fields.get("budget") or "auto"
+    if budget not in ("auto", "fixed"):
+        budget = "auto"
+    preview = str(fields.get("preview", "1")).lower() not in ("0", "false", "off", "no")
+    try:
+        quality = int(float(fields.get("quality") or 15))
+    except ValueError:
+        quality = 15
+    quality = max(10, min(28, quality))
+
+    return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
+                attention=attention, encoder=encoder, quality=quality,
+                quant=quant, budget=budget, pre_scale=pre_scale,
+                tile_overlap=tile_overlap, preview=preview, auto_note=auto_note)
 
 
 class Engine:

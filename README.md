@@ -397,6 +397,28 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 
 面板提交时会自动把 tile 对齐到安全步长，并在任务参数里显示实际使用值。
 
+## 命令行（CLI）
+
+面板不是唯一入口，`inference.py` 直接调引擎，参数语义与面板完全一致（共用 `engine.resolve_params`）：
+
+```powershell
+# 单个文件
+python inference.py -s in.mp4 -o out.mp4 --preset quality
+
+# 快速档 + 强制先 /2（模型走 4×）
+python inference.py -s in.mp4 -o out.mp4 --preset fast --prescale half --quant mxfp8
+
+# 手调参数
+python inference.py -s in.mp4 -o out.mp4 --scale 4 --tile 128 --kv 3 --chunk 0 \
+                    --quant mxfp8 --encoder nvenc --crf 18
+
+# 批量目录（跳过已存在的成品，可挂机）
+python inference.py -s D:\素材 -o D:\成品 --batch --preset quality
+```
+
+参数速查：`--quant none|nvfp4|mxfp8|mixed|w8`、`--prescale auto|half|off`、
+`--encoder auto|cpu|nvenc|amf`、`--chunk 0=不分段`、`--overlap`（tile 羽化带）。
+
 ## 目录结构
 
 ```

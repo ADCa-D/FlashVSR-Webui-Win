@@ -1,0 +1,101 @@
+# -*- coding: utf-8 -*-
+"""FlashVSR 命令行入口（与面板共用 engine.resolve_params，参数语义一致）。
+
+示例：
+  python inference.py -s in.mp4 -o out.mp4 --preset quality
+  python inference.py -s in.mp4 -o out.mp4 --preset fast --prescale half --quant mxfp8
+  python inference.py -s in.mp4 -o out.mp4 --tile 128 --kv 3 --chunk 0 --encoder nvenc --crf 18
+  python inference.py -s D:\\素材 -o D:\\成品 --batch          # 批量目录（跳过已存在）
+"""
+import argparse
+import glob
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engine as E  # noqa: E402
+
+VIDEO_EXT = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts")
+
+
+def build_params(args, src):
+    fields = dict(preset=args.preset)
+    if args.preset == "custom":
+        fields.update(scale=args.scale, tile=args.tile, kv=args.kv)
+    fields.update(chunk=args.chunk, quant=args.quant, encoder=args.encoder,
+                  quality=args.crf, prescale=args.prescale,
+                  tile_overlap=args.overlap, mode=args.mode,
+                  attention=args.attention, budget=args.budget)
+    p = E.resolve_params(fields, src)
+    p.pop("auto_note", None)
+    p.update(restart=False, seg_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                 "work", "segments"))
+    return p
+
+
+def run_one(eng, src, dst, args):
+    params = build_params(args, src)
+    note = params.pop("auto_note", None)
+    print(f"\n=== {os.path.basename(src)} ===")
+    if note:
+        print(f"  {note}")
+    print(f"  scale={params['scale']} tile={params['tile']} kv={params['kv']} "
+          f"pre={params['pre_scale']} chunk={params['chunk']} quant={params['quant']}")
+    t0 = time.time()
+    info = eng.upscale_video(src, dst, params, lambda *a: None)
+    print(f"  完成：{info['frames']} 帧 {info['out_wh'][0]}×{info['out_wh'][1]} "
+          f"用时 {time.time() - t0:.1f}s → {dst}")
+    return info
+
+
+def main():
+    ap = argparse.ArgumentParser(description="FlashVSR 命令行超分")
+    ap.add_argument("-s", "--src", required=True, help="输入视频或目录（配 --batch）")
+    ap.add_argument("-o", "--dst", required=True, help="输出文件或目录（配 --batch）")
+    ap.add_argument("--batch", action="store_true", help="把 src 当目录，批量处理并跳过已存在输出")
+    ap.add_argument("--preset", default="quality", choices=list(E.PRESETS) + ["custom"])
+    ap.add_argument("--scale", type=int, default=4)
+    ap.add_argument("--tile", type=int, default=128)
+    ap.add_argument("--kv", type=float, default=3.0)
+    ap.add_argument("--overlap", type=int, default=12, help="tile 重叠（羽化带）")
+    ap.add_argument("--chunk", type=int, default=48, help="帧/段，0=不分段")
+    ap.add_argument("--quant", default="mxfp8", choices=list(E.QUANT_CHOICES))
+    ap.add_argument("--prescale", default="auto", choices=["auto", "half", "off"],
+                    help="源预缩放：auto=目标 2× 时先 /2")
+    ap.add_argument("--encoder", default="auto", choices=list(E.ENCODER_CHOICES))
+    ap.add_argument("--crf", type=int, default=15)
+    ap.add_argument("--mode", default="tiny-long", choices=["tiny", "tiny-long"])
+    ap.add_argument("--attention", default="sparse", choices=["sparse", "dense"])
+    ap.add_argument("--budget", default="auto", choices=["auto", "fixed"])
+    args = ap.parse_args()
+
+    eng = E.Engine()
+    if not args.batch:
+        run_one(eng, args.src, args.dst, args)
+        return 0
+
+    os.makedirs(args.dst, exist_ok=True)
+    files = [f for f in sorted(glob.glob(os.path.join(args.src, "*")))
+             if f.lower().endswith(VIDEO_EXT)]
+    if not files:
+        print(f"[错误] {args.src} 下没有视频文件")
+        return 1
+    done, skip = 0, 0
+    for i, f in enumerate(files, 1):
+        out = os.path.join(args.dst, os.path.splitext(os.path.basename(f))[0] + "_x.mp4")
+        if os.path.exists(out) and os.path.getsize(out) > 1024:
+            print(f"[{i}/{len(files)}] 跳过（已存在）{os.path.basename(out)}")
+            skip += 1
+            continue
+        try:
+            run_one(eng, f, out, args)
+            done += 1
+        except Exception as e:  # noqa
+            print(f"[{i}/{len(files)}] 失败 {os.path.basename(f)}: {type(e).__name__}: {e}")
+    print(f"\n批量结束：完成 {done}，跳过 {skip}，共 {len(files)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
