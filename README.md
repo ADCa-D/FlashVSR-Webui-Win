@@ -626,9 +626,13 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 | 浮点解码（`hi_precision`） | 实验：内存 4×，端到端 PSNR 42.36 dB 的差异，收益未定 |
 | tile 提到 192 | 更快，但高分辨率素材更容易 OOM |
 | 接缝修正 `seam_fix` | `align` 实测无收益（0.54→0.59），只作对照；默认 `smooth` |
+| **实验权重**（`nvfp4` / `mixed`） | NVFP4 只在超大 token 下更快（小 token 反而慢）；混合档画质 44.65 dB、只省 0.16 GiB |
 | 附加编码参数（`extra_args`） | GPU 编码器的速率控制/调优没有统一入口，需要自己传 |
 
-**关闭开发模式时，上面四项一律按稳定默认值下发**（`hi_precision=0`、`seam_fix=smooth`、
+固定量化档只剩三个（主面板「权重」）：**MXFP8（推荐，实测 50.75 dB）**、bf16（基准）、
+W8A16（兼容 30/40 系，尚未实测显存/速度）。
+
+**关闭开发模式时，上面几项一律按稳定默认值下发**（`hi_precision=0`、`seam_fix=smooth`、`quant` 取主面板值、
 不加 extra、不用 tile192），避免"上次在开发模式里试过的东西"悄悄带进正式任务。
 
 

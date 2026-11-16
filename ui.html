@@ -160,9 +160,7 @@
       <select id="quant">
         <option value="mxfp8" selected>MXFP8（推荐）</option>
         <option value="none">bf16（基准）</option>
-        <option value="nvfp4" title="4bit，省显存但小 token 下更慢，未必更快">NVFP4（未必更快）</option>
-        <option value="mixed" title="FFN 用 NVFP4，注意力/投影保 MXFP8；显存略省，速度待测">混合（FFN 4bit）</option>
-        <option value="w8" title="权重存 fp8、前向反量化回 bf16：30/40 系等无 fp8 张量核的卡也能用">W8A16（通用 fp8 权重）</option>
+        <option value="w8" title="权重存 fp8、前向反量化回 bf16：30/40 系等无 fp8 张量核的卡也能用（尚未实测显存/速度）">W8A16（通用 fp8，未实测）</option>
       </select>
     </div>
     <div class="hint" id="encHint"></div>
@@ -192,6 +190,12 @@
           <label class="chk" title="量化后 tile192 更快，但高分辨率素材容易 OOM">
             <input type="checkbox" id="tileUp" /> tile 提到 192
           </label>
+          <span class="lk" title="这些量化档实测都有明显代价：NVFP4 只在超大 token 下更快（小 token 反而慢），混合档画质 44.65 dB、只省 0.16 GiB">实验权重</span>
+          <select id="quantDev">
+            <option value="" selected>跟随主面板</option>
+            <option value="nvfp4">NVFP4（小 token 下更慢）</option>
+            <option value="mixed">混合 FFN 4bit（−6 dB，省 0.16 GiB）</option>
+          </select>
           <span class="lk" title="tile 拼接方式：smooth=平滑羽化（默认，4K 实测无接缝）；align=逐块 DC 对齐（实测无收益）；off=线性羽化（对照用）">接缝修正</span>
           <select id="seamFix">
             <option value="smooth" selected>平滑羽化（默认）</option>
@@ -312,7 +316,8 @@ function collectFields(){
   o.tune = $('#tune').value;
   o.seam_fix = dev ? $('#seamFix').value : 'smooth';
   if (dev) o.extra_args = $('#extraArgs').value;
-  o.quant = $('#quant').value;
+  const qDev = dev && $('#quantDev') ? $('#quantDev').value : '';
+  o.quant = qDev || $('#quant').value;
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
   o.tile_overlap = $('#tileOv').value;
@@ -526,11 +531,20 @@ $('#bitdepth').addEventListener('change', updateEncHint);
   const apply = () => { body.style.display = dev.checked ? '' : 'none'; };
   dev.checked = localStorage.getItem('fs_dev') === '1';
   apply();
-  dev.onchange = () => { localStorage.setItem('fs_dev', dev.checked ? '1' : '0'); apply(); };
+  dev.onchange = () => {
+    localStorage.setItem('fs_dev', dev.checked ? '1' : '0');
+    apply();
+    if (typeof updatePresetLabels === 'function') updatePresetLabels();
+  };
 })();
+function effectiveQuant(){
+  const dev = $('#devMode') && $('#devMode').checked;
+  const qDev = dev && $('#quantDev') ? $('#quantDev').value : '';
+  return qDev || $('#quant').value;
+}
 function updatePresetLabels(){
   const up = $('#tileUp').checked;
-  const quant = $('#quant').value;
+  const quant = effectiveQuant();
   document.querySelectorAll('.preset').forEach(el => {
     const base = el.dataset.p;
     const d = {quality:[4,128,3], balance:[4,160,2], fast:[2,256,3]}[base] || [4,128,3];
@@ -540,6 +554,8 @@ function updatePresetLabels(){
   });
 }
 $('#quant').onchange = updatePresetLabels;
+if ($('#quantDev')) $('#quantDev').onchange = updatePresetLabels;
+if ($('#devMode')) $('#devMode').addEventListener('change', updatePresetLabels);
 $('#tileUp').onchange = updatePresetLabels;
 updatePresetLabels();
 (async () => {
