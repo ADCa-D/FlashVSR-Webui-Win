@@ -116,6 +116,22 @@ python inference.py -s in.mp4 -o out.mp4 --hi-precision --bitdepth 10 --encoder 
 
 只开 `--bitdepth 10` 而不开 `--hi-precision` 意义有限：源在解码阶段就已经被量化到 8 bit 了。
 
+## 编码器：NVENC 需要驱动 ≥ 610
+
+本机 `ffmpeg 9.0.1` 按 **NVENC API 13.1** 编译，而驱动 `591.86` 只提供 13.0，于是 `h264_nvenc` / `hevc_nvenc` / `av1_nvenc` **三个全部**初始化失败：
+
+```
+Driver does not support the required nvenc API version. Required: 13.1 Found: 13.0
+The minimum required Nvidia driver for nvenc is 610.00 or newer
+```
+
+所以这不是参数问题，是驱动版本不够，别在原地调 profile/cq。两个选择：
+
+- 升级到 **610+** 驱动，NVENC 才能用；
+- 继续用 CPU 编码：`x265`（唯一支持 10 bit）／`svtav1`（同画质体积最小）／`cpu`（x264）。
+
+面板启动时会跑一次能力探测（`probe_encoders()`），不可用的编码器会在下拉框里标出原因；`auto` 的选择顺序是 **CPU → NVENC → AMF**，所以本机会稳定落到 `cpu`，不会因为驱动问题把任务卡死。
+
 ## 环境要求
 
 - Windows 10/11
