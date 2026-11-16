@@ -451,9 +451,10 @@ async def presets(request):
 async def capabilities(request):
     caps = await asyncio.get_running_loop().run_in_executor(EXECUTOR, E.get_caps)
     tunes = await asyncio.get_running_loop().run_in_executor(EXECUTOR, E.svt_tune_caps)
+    gpu = await asyncio.get_running_loop().run_in_executor(EXECUTOR, E.gpu_info)
     return web.json_response({"encoders": caps, "labels": E.ENCODER_LABEL,
                               "choices": list(E.ENCODER_CHOICES),
-                              "svt_tunes": tunes})
+                              "svt_tunes": tunes, "gpu": gpu})
 
 
 async def run(request):

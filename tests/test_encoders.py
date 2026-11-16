@@ -38,6 +38,11 @@ def main():
          "yuv420p" in args("amf", 10) and "10le" not in args("amf", 10)),
         ("硬件编码器都在回退名单里",
          all(b in E.HW_ENCODERS for b in ("qsv", "qsv_h264", "nvenc", "av1_nvenc", "amf"))),
+        ("vulkan 用 hevc_vulkan + hwupload",
+         "hevc_vulkan" in args("vulkan", 8) and "hwupload" in args("vulkan", 8)),
+        ("vulkan 需要建 hw device",
+         E.encoder_global_args("vulkan")[:2] == ["-init_hw_device", "vulkan=vk:0"]),
+        ("其它后端不带 hw device 参数", E.encoder_global_args("x265") == []),
         ("全部编码器都在 choices 里",
          all(b in E.ENCODER_CHOICES for b in ("qsv", "qsv_h264", "x265", "svtav1"))),
         # 每个命令都必须带 -c:v，避免拼出裸 -vf

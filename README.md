@@ -133,6 +133,34 @@ python inference.py -s in.mp4 -o out.mp4 --hi-precision --bitdepth 10 --encoder 
 
 只开 `--bitdepth 10` 而不开 `--hi-precision` 意义有限：源在解码阶段就已经被量化到 8 bit 了。
 
+## 用 Vulkan 跑？分两件事说清
+
+**模型推理：不行。** PyTorch 2.13（cu130）没有 Vulkan 后端（`torch.backends.vulkan` 不存在），
+而这条链路依赖 CUDA 专有算子：fp8/NF4 量化 matmul（comfy_kitchen / cutlass）、
+triton 写的稀疏注意力、TCDecoder 的自定义卷积。想走 Vulkan 等于换运行时（IREE / vknn / ncnn）
+重写模型，而且会丢掉张量核——8 GB 独显上不划算，核显上更没戏。
+
+**视频编码：可以，已接。** ffmpeg 9.0.1 带 `hevc_vulkan` / `h264_vulkan` / `av1_vulkan`，
+本项目做成了 `vulkan` 编码器：
+
+```
+-init_hw_device vulkan=vk:0 -filter_hw_device vk            # 必须在 -i 之前
+-vf format=nv12,hwupload=extra_hw_frames=16                 # Vulkan 编码器只吃 hwframe
+-c:v hevc_vulkan -rc_mode cqp -qp <quality> -tune hq -usage record
+```
+
+限制：设备必须支持 **`VK_KHR_video_encode_queue`**。本机 AMD Radeon 610M 明确报：
+
+```
+[hevc_vulkan] Device does not support the VK_KHR_video_encode_queue extension!
+```
+
+所以探测会把它标成不可用，任务自动降级到 x265。换成支持该扩展的卡（Intel Arc、
+较新的 AMD/NVIDIA 独显）即可直接使用。
+
+**另外：Vulkan 其实已经在用**——`libplacebo`（输入预缩放、浮点解码）就跑在 Vulkan 上，
+只是那属于"缩放/格式转换"，不是模型推理。
+
 ## Intel QSV（核显编码）：通用可行方案
 
 手头没有 Intel 机器实测，所以按"最可能一次跑通"的方式写，并把失败后果限制住：

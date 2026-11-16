@@ -34,14 +34,15 @@ FFPROBE = _cfg.FFPROBE
 
 MAX_PIXELS = 700_000_000
 
-ENCODER_CHOICES = ("auto", "cpu", "nvenc", "qsv", "qsv_h264", "amf", "svtav1",
-                    "av1_nvenc", "x265")
+ENCODER_CHOICES = ("auto", "cpu", "nvenc", "qsv", "qsv_h264", "amf", "vulkan",
+                    "svtav1", "av1_nvenc", "x265")
 ENCODER_LABEL = {
     "auto": "自动（CPU 优先，GPU 不可用则回退）",
     "cpu": "CPU · libx264（H.264）",
     "nvenc": "GPU · NVENC H.264",
     "qsv": "GPU · Intel QSV · HEVC 8bit（4K，6 代+ 核显）",
     "qsv_h264": "GPU · Intel QSV · H.264 8bit（4K，兼容最老，4 代+）",
+    "vulkan": "GPU · Vulkan Video encode（HEVC，需驱动支持 VK_KHR_video_encode_queue）",
     "amf": "GPU · AMF（AMD 核显）",
     "svtav1": "CPU · SVT-AV1（同画质体积最小，慢）",
     "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
@@ -63,6 +64,13 @@ TUNE_ALL = ("", "ssim", "psnr", "vq", "vmaf", "ms_ssim", "film", "animation",
             "grain", "stillimage", "fastdecode", "zerolatency")
 
 
+def encoder_global_args(backend):
+    """某些后端需要**输入前**的全局参数（Vulkan 要建 hw device）。"""
+    if backend == "vulkan":
+        return ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
+    return []
+
+
 def _encoder_base(backend, quality, bitdepth=8, svt_preset=None, tune=None):
     q = str(int(quality))
     # 10-bit：只有 x265 在本机验证可用（x264 是 8bit 构建、SVT-AV1 在 4K 下 10bit 会 OOM）
@@ -73,6 +81,12 @@ def _encoder_base(backend, quality, bitdepth=8, svt_preset=None, tune=None):
     if backend == "av1_nvenc":
         return ["-c:v", "av1_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if backend == "vulkan":
+        # Vulkan Video encode：只吃 vulkan hwframe，所以必须 hwupload。
+        # 质量用 cqp（常数 QP，语义接近 CRF）；老驱动/老卡没有 VK_KHR_video_encode_queue 会直接失败。
+        return ["-c:v", "hevc_vulkan", "-rc_mode", "cqp", "-qp", q,
+                "-tune", "hq", "-usage", "record",
+                "-vf", "format=nv12,hwupload=extra_hw_frames=16"]
     if backend in ("qsv", "qsv_h264"):
         # Intel Quick Sync 的"通用可行"写法：**系统内存 + nv12 + ICQ**。
         # 不用 hwupload/hwframes —— 那套依赖 D3D11 纹理池，老驱动/老核显经常初始化失败；
@@ -168,7 +182,7 @@ def svt_tune_caps(force=False):
 
 
 # 走 GPU 编码的引擎：初始化失败（驱动/核显不支持该 codec，或撑不住目标分辨率）时自动降级
-HW_ENCODERS = ("nvenc", "av1_nvenc", "qsv", "qsv_h264", "amf")
+HW_ENCODERS = ("nvenc", "av1_nvenc", "qsv", "qsv_h264", "amf", "vulkan")
 
 # 降级阶梯：先同族（HEVC→H.264），再 CPU 高质量（x265），最后最兼容（x264）
 FALLBACK_CHAIN = {
@@ -177,6 +191,7 @@ FALLBACK_CHAIN = {
     "nvenc": ("x265", "cpu"),
     "av1_nvenc": ("x265", "cpu"),
     "amf": ("x265", "cpu"),
+    "vulkan": ("x265", "cpu"),
     "svtav1": ("x265", "cpu"),
     "x265": ("cpu",),
     "cpu": (),
@@ -219,6 +234,18 @@ def _caps_file():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "work", "encoder_caps.json")
 
 
+def gpu_info():
+    """给 UI 判断架构用：返回 {name, cap}（如 {'RTX 5060 Laptop GPU', '12.0'}）。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return dict(name=torch.cuda.get_device_name(0),
+                        cap=".".join(str(x) for x in torch.cuda.get_device_capability(0)))
+    except Exception:  # noqa
+        pass
+    return dict(name="", cap="")
+
+
 def _gpu_tag():
     try:
         import torch
@@ -258,10 +285,12 @@ def probe_encoders(w=256, h=256):
     h = max(64, int(h) // 2 * 2)
     src = ["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=5:d=0.2", "-frames:v", "1"]
     out = {}
-    for be in ("cpu", "nvenc", "qsv", "qsv_h264", "amf", "svtav1", "av1_nvenc", "x265"):
+    for be in ("cpu", "nvenc", "qsv", "qsv_h264", "amf", "vulkan", "svtav1",
+               "av1_nvenc", "x265"):
         try:
             r = subprocess.run(
-                [FFMPEG, "-hide_banner", "-v", "error"] + src + encoder_args(be, 18) + ["-f", "null", "-"],
+                [FFMPEG, "-hide_banner", "-v", "error"] + encoder_global_args(be) + src
+                + encoder_args(be, 18) + ["-f", "null", "-"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             if r.returncode == 0:
                 out[be] = dict(ok=True, detail="")
@@ -314,7 +343,7 @@ def resolve_encoder(requested, caps=None, w=256, h=256):
         return be
     # auto / 不可用的显式选择 → CPU 优先（实测：GPU 编码会抢推理的显存与功耗预算，
     # AMF 画质还明显更差，所以硬件编码器只排在后面当兜底）
-    for alt in ("cpu", "x265", "nvenc", "qsv", "qsv_h264", "amf"):
+    for alt in ("cpu", "x265", "nvenc", "qsv", "qsv_h264", "amf", "vulkan"):
         if caps.get(alt, {}).get("ok"):
             return alt
     return "cpu"
@@ -947,9 +976,9 @@ def extract_preview(path, idx, fps, out_path, width=640):
 def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend="cpu",
                   bitdepth=8, svt_preset=None, tune=None, extra=None):
     h, w = frames_u8.shape[1], frames_u8.shape[2]
-    cmd = [FFMPEG, "-y", "-v", "error",
-           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
-           "-r", f"{fps:.6f}", "-i", "-"]
+    cmd = ([FFMPEG, "-y", "-v", "error"] + encoder_global_args(backend)
+           + ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+              "-r", f"{fps:.6f}", "-i", "-"])
     if audio_src:
         # 音轨和字幕流都无损 copy（字幕没有就静默跳过）
         cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
@@ -976,8 +1005,8 @@ def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=
             f.write("file '%s'\n" % p.replace("\\", "/").replace("'", "'\\''"))
 
     silent = os.path.join(tmp_dir, "concat_video.mp4")
-    base = [FFMPEG, "-y", "-v", "error", "-fflags", "+genpts",
-            "-f", "concat", "-safe", "0", "-i", list_path]
+    base = ([FFMPEG, "-y", "-v", "error"] + encoder_global_args(backend)
+            + ["-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", list_path])
     r = subprocess.run(base + ["-c", "copy", silent],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not os.path.exists(silent) or os.path.getsize(silent) < 1024:
@@ -1022,10 +1051,15 @@ def resolve_params(fields, src_path=None):
     if preset in PRESETS:
         p = dict(PRESETS[preset])
         scale, tile, kv = p["scale"], p["tile"], p["kv"]
-        # 量化后理论上能上 tile192（更快），但 8 GB 实测会 OOM（2026-11-15）。
-        # 除非显式要求（fields["tile_up"]），否则按预设的保守值走。
-        if preset in ("quality", "balance") and str(fields.get("tile_up") or "") in ("1", "true", "on"):
-            tile = 192 if (fields.get("quant") or "none") != "none" else p["tile"]
+        # 预设只是"默认值"：表单里显式给了 tile/kv 就以表单为准
+        # （面板上 tile/kv 常驻可编辑；CLI 只有 --preset custom 时才带这两个字段）
+        try:
+            if fields.get("tile"):
+                tile = int(fields["tile"])
+            if fields.get("kv"):
+                kv = float(fields["kv"])
+        except (TypeError, ValueError):
+            pass
     else:
         scale = int(fields.get("scale", 4))
         tile = int(fields.get("tile", 128))
