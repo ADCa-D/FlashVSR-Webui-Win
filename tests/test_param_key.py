@@ -46,7 +46,7 @@ def keys(src, **over):
                   bitdepth=P["bitdepth"], hi_precision=P["hi_precision"],
                   max_frames=P["max_frames"], color_fix=P["color_fix"],
                   seam_fix=P["seam_fix"], tune=P["tune"], extra_args=P["extra_args"],
-                  restart=False, seg_dir=ROOT_SEG)
+                  tile_h=0, tile_w=0, restart=False, seg_dir=ROOT_SEG)
     eng = os.path.basename(os.path.join(ROOT_SEG, f"{E.quick_hash(src)}_{E._param_key(params)}"))
     app = os.path.basename(A._seg_key_dir(src, P, ROOT_SEG))
     return eng, app
@@ -80,6 +80,25 @@ def main():
             fails.append(f"{tag} 必须换目录，却复用了旧缓存")
         if e != a:
             fails.append(f"{tag}：面板与引擎键不一致（{a} vs {e}）")
+
+    # 矩形 tile 会改接缝位置；dither 是环境变量但会改像素 —— 都必须进键
+    raw0 = dict(scale=2, tile=256, kv=3, chunk=16, overlap=8, mode="tiny-long",
+                attention="sparse", encoder="x265", quality=18, quant="mxfp8",
+                budget="auto", pre_scale=0.0, tile_overlap=24, bitdepth=8,
+                hi_precision=0, max_frames=0, color_fix=1, seam_fix="off", tune="",
+                extra_args="", tile_h=0, tile_w=0, restart=False, seg_dir=ROOT_SEG)
+    k0 = E._param_key(dict(raw0))
+    for tag, over in (("tile_h=64", {"tile_h": 64}), ("tile_w=96", {"tile_w": 96}),
+                      ("budget=motion", {"budget": "motion"})):
+        if E._param_key(dict(raw0, **over)) == k0:
+            fails.append(f"{tag} 必须换目录，却复用了旧缓存（参数键漏字段）")
+
+    os.environ["FLASHVSR_DITHER"] = "bayer"
+    try:
+        if E._param_key(dict(raw0)) == k0:
+            fails.append("FLASHVSR_DITHER 必须进键（改了抖动却复用旧分段）")
+    finally:
+        os.environ.pop("FLASHVSR_DITHER", None)
 
     if fails:
         print("FAIL")

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """FlashVSR 推理引擎（独立运行，不经 ComfyUI 前端/服务端）
 
 把 ComfyUI 节点包当库用：桩掉 folder_paths / comfy.utils，以合成包名导入 nodes.py，
@@ -14,6 +14,7 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -383,7 +384,9 @@ def _feather_mask(size, overlap, smooth=True):
     """生成羽化权重 (1,1,H,W)；smooth=True 用 smoothstep（C1 连续），否则线性。"""
     H, W = size
     n = max(2, int(overlap))
-    t = torch.linspace(0.0, 1.0, n)
+    # 用 (i+0.5)/n 而不是 linspace(0,1)：ramp 首尾不再是 0。
+    # 画布最外圈像素只被"这一块"覆盖，权重若为 0 就是除以 1e-6 → 一条黑边。
+    t = (torch.arange(n, dtype=torch.float32) + 0.5) / n
     ramp = t * t * (3.0 - 2.0 * t) if smooth else t
     mask = torch.ones(1, 1, H, W)
     mask[:, :, :, :n] = torch.minimum(mask[:, :, :, :n], ramp.view(1, 1, 1, -1))
@@ -427,6 +430,96 @@ def _gpu_canvas_fits(n_frames, h, w, scale, limit_gb=0.8):
     return need < min(limit_gb * 2 ** 30, free * 0.5)
 
 
+# ---------------------------------------------------------------- 逐 tile 搬运优化
+# 节点自带的 prepare_input_tensor（nodes.py:75-100）每帧要走一次
+# CPU → GPU 上采样 → **D2H 回 CPU** → CPU 上 stack → 再被 engine 搬回 GPU。
+# 220 个 tile × 9 帧 ≈ 1980 次设备同步/窗，且整条链路上多搬 2 倍字节。
+# 这里换成全程留在 GPU 的等价实现（数值一致：同一 bicubic、同一 dtype 转换顺序）。
+_PI_CROP_KEY = "_fs_pi_crop"          # 记录中心裁剪偏移 (top, left)，拼接时补回来
+_FEATHER_CACHE = {}
+_TILE_HK = [0]
+
+
+def _feather_mask_nhwc(size, overlap, dtype, device, smooth=True):
+    """羽化权重按 (h, w, band, dtype, device) 缓存：每 tile 现建+转置+dtype 转换是纯开销。"""
+    key = (int(size[0]), int(size[1]), int(overlap), str(dtype), str(device), bool(smooth))
+    m = _FEATHER_CACHE.get(key)
+    if m is None:
+        m = _feather_mask(size, overlap, smooth=smooth)
+        m = m.permute(0, 2, 3, 1).to(dtype=dtype, device=device).contiguous()
+        if len(_FEATHER_CACHE) > 24:
+            _FEATHER_CACHE.clear()
+        _FEATHER_CACHE[key] = m
+    return m
+
+
+def _tile_housekeeping(every=10):
+    """每 tile 都 gc+empty_cache 实测慢 7%（HANDOFF §4）；这里只每 N 个 tile 清一次缓存。"""
+    _TILE_HK[0] += 1
+    if every and _TILE_HK[0] % every == 0:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa
+            pass
+
+
+def _prepare_input_gpu(mod, image_tensor, device, scale=4, dtype=torch.bfloat16):
+    """prepare_input_tensor 的 GPU 版：输入可以是 uint8 NHWC 或 float NHWC（[0,1]）。
+
+    与节点版逐位一致的部分：F = largest_8n1_leq(N0+4)、bicubic(align_corners=False)、
+    居中裁剪到 128 的倍数、先 to(dtype) 再 *2-1、输出 (1,3,F,tH,tW)。
+    不同处：不做 D2H、不在 CPU 上 stack、不在末尾 clean_vram（由 canvas 每 N 个 tile 清一次）。
+    """
+    N0, h0, w0, _ = image_tensor.shape
+    sW, sH, tW, tH = mod.compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
+    F = mod.largest_8n1_leq(N0 + 4)
+    if F == 0:
+        raise RuntimeError(f"Not enough frames after padding. Got {N0 + 4}.")
+
+    if image_tensor.dtype == torch.uint8:
+        # 必须**在 CPU 上**做 /255：GPU 的 float32 除法与 CPU 有 1 ULP 差异
+        # （实测一半元素差 5.96e-8），经 fp8 量化放大后整段输出 PSNR 只有 ~37 dB。
+        # 只对"当前 tile 的切片"做，512 KB 级别，代价可忽略；整窗仍保持 uint8。
+        src = image_tensor.float().div_(255.0).to(device=device, non_blocking=True)
+    else:
+        src = image_tensor.to(device=device, non_blocking=True)
+        if src.dtype != torch.float32:
+            src = src.float()
+
+    idx = torch.arange(F, device=src.device).clamp_(max=max(N0 - 1, 0))
+    x = src.index_select(0, idx).permute(0, 3, 1, 2)          # (F,3,h0,w0)
+    x = torch.nn.functional.interpolate(x, size=(sH, sW), mode="bicubic", align_corners=False)
+    left, top = max(0, (sW - tW) // 2), max(0, (sH - tH) // 2)
+    x = x[:, :, top:top + tH, left:left + tW]
+    vid = (x.to(dtype) * 2.0 - 1.0).permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+    setattr(mod, _PI_CROP_KEY, (top, left))
+    return vid, tH, tW, F
+
+
+def _install_gpu_prepare(mod):
+    """幂等替换 prepare_input_tensor。FLASHVSR_GPU_PREPARE=0 可关。"""
+    if getattr(mod.prepare_input_tensor, "_fs_gpu", False):
+        return True
+    orig = getattr(mod, "prepare_input_tensor", None)
+    if orig is None:
+        return False
+
+    def prepare_input_tensor(image_tensor, device, scale=4, dtype=torch.bfloat16):
+        return _prepare_input_gpu(mod, image_tensor, device, scale=scale, dtype=dtype)
+
+    prepare_input_tensor._fs_gpu = True
+    mod.prepare_input_tensor = prepare_input_tensor
+    mod._fs_pi_orig = orig
+    return True
+
+
+def _uninstall_gpu_prepare(mod):
+    orig = getattr(mod, "_fs_pi_orig", None)
+    if orig is not None and getattr(mod.prepare_input_tensor, "_fs_gpu", False):
+        mod.prepare_input_tensor = orig
+        del mod._fs_pi_orig
+
+
 def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
                         sparse, kv, local, seed=0):
     """和节点的 tiled_dit 分支等价，但**画布与混合都在 GPU 上**。
@@ -444,8 +537,14 @@ def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
     N, H, W, C = frames.shape
     canvas = torch.zeros((N, H * scale, W * scale, C), dtype=torch.float16, device=device)
     wsum = torch.zeros((N, H * scale, W * scale, 1), dtype=torch.float16, device=device)
+    # 节点的 prepare_input_tensor 会把 tile 居中裁剪到 128 的倍数（nodes.py:53-71）。
+    # tile*scale 不是 128 的倍数时，每块输出比自己的覆盖范围小 → 画布必然有空洞。
+    if (int(tile) * int(scale)) % 128 != 0:
+        print(f"[canvas] 警告：tile={tile}×scale={scale}={int(tile)*int(scale)} 不是 128 的倍数，"
+              f"接缝处会有 %128 的错位/空洞（建议 tile 取 {128//int(scale)} 的倍数）", flush=True)
     coords = mod.calculate_tile_coords(H, W, tile, tile_overlap)
     pipe_cls = getattr(mod, "FlashVSRTinyLongPipeline", None)
+    _TILE_HK[0] = 0
 
     for x1, y1, x2, y2 in mod.cqdm(coords, desc="Processing Tiles"):
         input_tile = frames[:, y1:y2, x1:x2, :]
@@ -464,16 +563,26 @@ def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
         # 换取混合在显存里做（省掉 CPU 上的 float16 乘加）。
         if tile_gpu.device.type == "cpu":
             tile_gpu = tile_gpu.to(device, non_blocking=True)
-        mask = _feather_mask((tile_gpu.shape[1], tile_gpu.shape[2]),
-                             int(tile_overlap) * scale, smooth=True).to(tile_gpu.device)
-        mask = mask.permute(0, 2, 3, 1).to(tile_gpu.dtype)
-        ox1, oy1 = x1 * scale, y1 * scale
-        ox2, oy2 = ox1 + tile_gpu.shape[2], oy1 + tile_gpu.shape[1]
-        canvas[:, oy1:oy2, ox1:ox2, :] += (tile_gpu * mask).to(torch.float16)
-        wsum[:, oy1:oy2, ox1:ox2, :] += mask.to(torch.float16)
-        del LQ_tile, out_gpu, tile_gpu
-        mod.clean_vram()
+        if tile_gpu.shape[0] != canvas.shape[0]:
+            # pipe 内部还能再补帧（8n+1 对齐），多出来的尾帧不属于本窗
+            tile_gpu = tile_gpu[:canvas.shape[0]]
+        th_o, tw_o = int(tile_gpu.shape[1]), int(tile_gpu.shape[2])
+        mask_hw = _feather_mask_nhwc((th_o, tw_o), int(tile_overlap) * scale,
+                                     tile_gpu.dtype, tile_gpu.device)
+        # prepare_input_tensor 会把 tile 居中裁剪到 128 的倍数，裁掉的偏移必须补回来，
+        # 否则 tile 尺寸不是 128/scale 的倍数时每块都会整体偏移 + 右/下留黑边。
+        ct, cl = getattr(mod, _PI_CROP_KEY, (0, 0))
+        ox1, oy1 = x1 * scale + int(cl), y1 * scale + int(ct)
+        ox2, oy2 = ox1 + tw_o, oy1 + th_o
+        canvas[:, oy1:oy2, ox1:ox2, :] += (tile_gpu * mask_hw).to(torch.float16)
+        wsum[:, oy1:oy2, ox1:ox2, :] += mask_hw.to(torch.float16)
+        del LQ_tile, out_gpu, tile_gpu, mask_hw
+        _tile_housekeeping()
 
+    if float(wsum.min()) <= 1e-6:
+        # 以前这里是静默的：没覆盖到的像素除完就是黑边，只有肉眼能发现
+        print("[canvas] 警告：有像素未被任何 tile 覆盖（会是黑边），检查 tile/overlap/裁剪偏移",
+              flush=True)
     out = canvas / wsum.clamp_min_(1e-6)
     return out[:n0]
 
@@ -599,6 +708,24 @@ def install_stream_loader():
         return False
 
 
+_BAYER8 = {}
+
+
+def _bayer8(device):
+    """8×8 Bayer 矩阵：以前每窗都重建一次（tensor + repeat + view），提成常量。"""
+    key = str(device)
+    m = _BAYER8.get(key)
+    if m is None:
+        m = torch.tensor(
+            [[0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+             [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+             [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+             [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21]],
+            dtype=torch.float32, device=device) / 64.0 - 0.5
+        _BAYER8[key] = m
+    return m
+
+
 def _quant8(out):
     """float [0,1] → uint8。**这里是整条链路唯一的 8bit 量化点**。
 
@@ -614,12 +741,7 @@ def _quant8(out):
     mode = (os.environ.get("FLASHVSR_DITHER") or "off").lower()
     x = out.clamp(0, 1) * 255.0
     if mode == "ordered":
-        bayer = torch.tensor(
-            [[0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
-             [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
-             [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
-             [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21]],
-            dtype=torch.float32, device=x.device) / 64.0 - 0.5
+        bayer = _bayer8(x.device)
         h, w = x.shape[-3], x.shape[-2]
         tile = bayer.repeat((h // 8) + 1, (w // 8) + 1)[:h, :w]
         x = x + tile.view(1, h, w, 1)
@@ -1122,6 +1244,14 @@ def _param_key(params):
     d["prescale_deband"] = bool(params.get("prescale_deband"))
     d["deband_grain"] = params.get("deband_grain")
     d["prescale_dither"] = str(params.get("prescale_dither") or "")
+    # 矩形 tile 会改接缝位置；budget=auto 会按运动量改 sparse/local/kv ——
+    # 这两样历史上都漏在键外，切档后续跑会混用旧分段。
+    d["tile_h"] = int(params.get("tile_h") or 0)
+    d["tile_w"] = int(params.get("tile_w") or 0)
+    d["budget"] = str(params.get("budget") or "auto")
+    # 抖动和抽帧是**环境变量**，但都会改画面/分段边界 → 必须进键，否则改完还命中旧缓存
+    d["dither"] = (os.environ.get("FLASHVSR_DITHER") or "off").lower()
+    d["drop"] = os.environ.get("FLASHVSR_FRAME_DROP", "0") == "1"
     return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 
 
@@ -1292,24 +1422,29 @@ def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress
                             scaler, deband, deband_grain, dither)
     frame_bytes = w * h * 3 * (4 if fp32 else 1)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    chunks, n = [], 0
+    # 预分配一次而不是 chunks + b"".join()：整窗多一次全量 memcpy（4K 下 100+ MB/窗）
+    raw = bytearray(frame_bytes * count)
+    mv = memoryview(raw)
+    n = 0
     while n < count:
-        buf = proc.stdout.read(frame_bytes)
-        if not buf or len(buf) < frame_bytes:
+        b = proc.stdout.read(frame_bytes)
+        if not b or len(b) < frame_bytes:
             break
-        chunks.append(buf)
+        mv[n * frame_bytes:(n + 1) * frame_bytes] = b
         n += 1
         if on_progress and n % 10 == 0:
             on_progress(n)
     proc.wait()
-    if not chunks:
+    del mv
+    if n == 0:
         return np.zeros((0, h, w, 3), np.float32 if fp32 else np.uint8)
+    buf = raw[:n * frame_bytes]
     if fp32:
         # gbrpf32le = 平面 G/B/R，转成 HWC 的 R/G/B 并夹到 [0,1]（spline36 会有过冲）
-        a = np.frombuffer(b"".join(chunks), np.float32).reshape(-1, 3, h, w)
+        a = np.frombuffer(buf, np.float32).reshape(-1, 3, h, w)
         a = a[:, [2, 0, 1]].transpose(0, 2, 3, 1)
         return np.clip(a, 0.0, 1.0, out=a)
-    return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3)
+    return np.frombuffer(buf, np.uint8).reshape(-1, h, w, 3)
 
 
 def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None,
@@ -1426,7 +1561,11 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         ["-fps_mode", "cfr", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     for i in range(0, len(frames_u8), 8):
-        proc.stdin.write(frames_u8[i:i + 8].tobytes())
+        # 直接写 buffer：.tobytes() 每 8 帧多拷 400 MB（4K），这里零拷贝
+        chunk = np.ascontiguousarray(frames_u8[i:i + 8])
+        if chunk.dtype != np.uint8:
+            chunk = chunk.astype(np.uint8)
+        proc.stdin.write(memoryview(chunk).cast("B"))
     proc.stdin.close()
     err = proc.stderr.read().decode("utf-8", "ignore")
     if proc.wait() != 0:
@@ -1708,6 +1847,71 @@ def resolve_params(fields, src_path=None):
                 prescale_scaler=scaler, prescale_deband=prescale_deband,
                 deband_grain=deband_grain, prescale_dither=prescale_dither,
                 reuse=reuse, preview=preview, auto_note=auto_note)
+
+
+class _SegEncoder(object):
+    """单线程异步写盘：GPU 在跑下一窗时，上一段在 CPU 上编码。
+
+    编码（x265 / AV1）占整条流水线的 10–15%，而这 10–15% 以前是**串行**的，
+    GPU 在 ffmpeg 编码期间纯空转。现在只把 encode_win 挪到后台线程：
+    提交点=每段推理完；join 点=①每段开头 drain（校验/预览/manifest）
+    ②concat_segments 之前。内存上限=队列 2 段。
+    FLASHVSR_ASYNC_ENCODE=0 可关。
+    """
+
+    def __init__(self, fn, max_pending=2):
+        self._fn = fn                    # encode_win：定义在 upscale_video 内部，必须显式传入
+        self._max = int(max_pending)
+        self._cv = threading.Condition()
+        self._q = []
+        self._res = []
+        self._inflight = False
+        self._closed = False
+        self._th = threading.Thread(target=self._run, name="seg-encode", daemon=True)
+        self._th.start()
+
+    def submit(self, idx, frames, path, meta):
+        with self._cv:
+            while len(self._q) >= self._max and not self._closed:
+                self._cv.wait(0.5)          # 背压：别把整条成片都堆在内存里
+            self._q.append((idx, frames, path, meta))
+            self._cv.notify_all()
+
+    def _push(self, row):
+        with self._cv:
+            self._res.append(row)
+            self._cv.notify_all()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._q and not self._closed:
+                    self._cv.wait(0.5)
+                if not self._q:
+                    return
+                idx, frames, path, meta = self._q.pop(0)
+                self._inflight = True
+                self._cv.notify_all()
+            try:
+                self._fn(frames, path, None)
+                self._push((idx, path, meta, None))
+            except BaseException as e:      # noqa: BLE001 - 原样抛回主线程
+                self._push((idx, path, meta, e))
+            finally:
+                with self._cv:
+                    self._inflight = False
+                    self._cv.notify_all()
+
+    def poll(self):
+        with self._cv:
+            rows, self._res = self._res, []
+            return rows
+
+    def close(self):
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        self._th.join()
 
 
 class Engine:
@@ -2006,13 +2210,24 @@ class Engine:
         mod.cqdm = Hook
         try:
             _f = torch.from_numpy(np.ascontiguousarray(frames_u8))
-            # uint8 → [0,1] 需要缩放；float32 已是 [0,1]（不能原地除，否则会把 numpy 缓冲改坏）
-            frames = _f.float().div_(255.0) if _f.dtype == torch.uint8 else _f.float()
+            n_f, h_f, w_f = int(_f.shape[0]), int(_f.shape[1]), int(_f.shape[2])
             use_gpu_canvas = (os.environ.get("FLASHVSR_GPU_CANVAS", "1") != "0")
-            if use_gpu_canvas:
-                n_f, h_f, w_f = frames.shape[0], frames.shape[1], frames.shape[2]
-                if not _gpu_canvas_fits(n_f, h_f, w_f, int(scale)):
-                    use_gpu_canvas = False
+            if use_gpu_canvas and not _gpu_canvas_fits(n_f, h_f, w_f, int(scale)):
+                use_gpu_canvas = False
+            want_gpu_prep = use_gpu_canvas and os.environ.get("FLASHVSR_GPU_PREPARE", "1") != "0"
+            if want_gpu_prep:
+                patched = _install_gpu_prepare(mod)
+            else:
+                # 关掉时必须还原：否则上一次窗口留下的 GPU 版 prepare 会一直生效
+                _uninstall_gpu_prepare(mod)
+                patched = False
+            if patched and _f.dtype == torch.uint8:
+                # 整窗保持 uint8：每个 tile 只把用到的切片搬上卡再转 float。
+                # 以前是整窗先 float32（1080p/8 帧 ≈ 199 MB + 全量 CPU 遍历），而下游只用切片。
+                frames = _f
+            else:
+                # uint8 → [0,1] 需要缩放；float32 已是 [0,1]（不能原地除，否则会把 numpy 缓冲改坏）
+                frames = _f.float().div_(255.0) if _f.dtype == torch.uint8 else _f.float()
             if use_gpu_canvas:
                 out = flashvsr_gpu_canvas(
                     mod, self.pipe, frames, int(scale), bool(color_fix), tile,
@@ -2275,7 +2490,46 @@ class Engine:
 
         out_wh = None
         seg_paths = []
+        async_encode = os.environ.get("FLASHVSR_ASYNC_ENCODE", "1") != "0"
+        enc = _SegEncoder(encode_win) if async_encode else None
+
+        def _finish_seg(idx, seg_path, meta):
+            """写盘之后的收尾：校验帧数 → 记 manifest → 抽预览帧。"""
+            keep_n = int(meta.get("keep") or 0)
+            got_n = probe_frames(seg_path)
+            if got_n != keep_n:
+                raise RuntimeError(f"第 {idx + 1} 段校验失败：期望 {keep_n} 帧，实际 {got_n} 帧")
+            done[str(idx)] = dict(frames=keep_n, bytes=os.path.getsize(seg_path),
+                                  at=int(time.time()))
+            man["done"] = done
+            save_manifest(seg_dir, man)
+            pv = None
+            pdir = meta.get("pdir")
+            if pdir and keep_n > 0:
+                try:
+                    os.makedirs(pdir, exist_ok=True)
+                    name = f"seg_{idx:04d}{preview_ext()}"
+                    if extract_preview(seg_path, random.randrange(keep_n), info["fps"],
+                                       os.path.join(pdir, name)):
+                        pv = name
+                except Exception as e:  # noqa
+                    print(f"[preview] 第 {idx + 1} 段抽帧失败: {e}", flush=True)
+            extra = {"preview": pv, "pv_cur": idx + 1, "pv_total": n_seg} if pv else {}
+            on_stage("seg", idx + 1, n_seg,
+                     f"段 {idx + 1}/{n_seg} 完成（sparse={meta.get('sp')} "
+                     f"kv={meta.get('kv')} local={meta.get('local')}）", **extra)
+
+        def _drain():
+            """收掉后台线程已编码完的段；错误在这里抛回主线程。"""
+            if enc is None:
+                return
+            for idx, spath, meta, err in enc.poll():
+                if err is not None:
+                    raise RuntimeError(f"第 {idx + 1} 段编码失败：{err}")
+                _finish_seg(idx, spath, meta)
+
         for i, (start, win_start, win_end) in enumerate(plans):
+            _drain()
             seg_path = os.path.join(seg_dir, f"seg_{i:04d}.mp4")
             seg_paths.append(seg_path)
             keep_from = start - win_start
@@ -2324,32 +2578,18 @@ class Engine:
             out_frames = res[keep_from:keep_from + keep]
             out_wh = [int(out_frames.shape[2]), int(out_frames.shape[1])]
             on_stage("encode", 0, 1, f"段 {i + 1}/{n_seg} 写盘（{backend}）")
-            encode_win(out_frames, seg_path, None)
+            meta = dict(keep=keep, pdir=params.get("preview_dir"), sp=sp, kv=kk, local=lr)
+            if enc is None:
+                encode_win(out_frames, seg_path, None)
+                _finish_seg(i, seg_path, meta)
+            else:
+                # 异步写盘：GPU 立刻去跑下一窗，编码在后台线程里与推理重叠
+                enc.submit(i, out_frames, seg_path, meta)
             del res, out_frames, win
 
-            got = probe_frames(seg_path)
-            if got != keep:
-                raise RuntimeError(f"第 {i + 1} 段校验失败：期望 {keep} 帧，实际 {got} 帧")
-            done[str(i)] = dict(frames=keep, bytes=os.path.getsize(seg_path), at=int(time.time()))
-            man["done"] = done
-            save_manifest(seg_dir, man)
-
-            # 预览帧：每段随机抽一帧（分段专属，方便边跑边看效果）
-            pv = None
-            pdir = params.get("preview_dir")
-            if pdir and keep > 0:
-                try:
-                    os.makedirs(pdir, exist_ok=True)
-                    name = f"seg_{i:04d}{preview_ext()}"
-                    if extract_preview(seg_path, random.randrange(keep), info["fps"],
-                                       os.path.join(pdir, name)):
-                        pv = name
-                except Exception as e:  # noqa
-                    print(f"[preview] 第 {i + 1} 段抽帧失败: {e}", flush=True)
-
-            on_stage("seg", i + 1, n_seg,
-                     f"段 {i + 1}/{n_seg} 完成（sparse={sp} kv={kk} local={lr}）",
-                     **({"preview": pv, "pv_cur": i + 1, "pv_total": n_seg} if pv else {}))
+        if enc is not None:
+            enc.close()      # 等最后一两段写完，再拼接
+            _drain()
 
         on_stage("encode", 0, 1, f"拼接 {n_seg} 段 + 混入音轨")
         concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality,
