@@ -12,6 +12,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 
+#include "attn_jit.h"
 #include "safetensors.h"
 
 #define NOMINMAX
@@ -413,12 +414,14 @@ static int run_main() {
             q = q.view({1, block_n * q.size(1), kDim});
             k = k.view({1, block_n * k.size(1), kDim});
             v = v.view({1, block_n * v.size(1), kDim});
-            auto attn = attention_block_sparse(q, k, v, kHeads, blk_mask, /*verbose=*/i == 0);
+            auto attn = attn::forward(q, k, v, blk_mask, kHeads, kDim / kHeads);
             if (i == 0) {
-                // sanity: the block-sparse loop must equal the dense masked form
+                // cross-check the fused kernel against the dense masked form
                 auto dense_mask = expand_mask(ref.at("mask"));
                 auto dense = attention(q, k, v, kHeads, &dense_mask);
-                report("sparse=dens", attn, dense);
+                report("jit=dense", attn, dense);
+                auto sparse_aten = attention_block_sparse(q, k, v, kHeads, blk_mask, true);
+                report("jit=aten ", attn, sparse_aten);
             }
             // b (block_n block_s) d -> (b block_n) block_s d -> reverse partition
             attn = attn.view({block_n, attn.size(1) / block_n, kDim});
