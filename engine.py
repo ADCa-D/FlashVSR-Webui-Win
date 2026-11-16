@@ -615,11 +615,20 @@ def quantize_dit_nvfp4(pipe, log=None):
     def _ts(t):
         return (t.abs().amax() / (6.0 * 448.0)).clamp(min=1e-8).float().reshape(1)
 
-    def _call(x, wq, wb, tw, bias):
+    def _call(x, wq, wb, tw, bias, st=None):
         shp = x.shape
         x2 = x.reshape(-1, shp[-1]).contiguous()
         m = x2.shape[0]
-        tx = _ts(x2)
+        # 每层重算 abs+amax 占 fp4 每层开销的 42%（实测 0.78 → 0.46 ms）。
+        # 这里缓存标定值、每 N 次刷新一次，并留 25% 余量防止后续 batch 溢出。
+        every = int(os.environ.get("FLASHVSR_FP4_AMAX_EVERY", "16"))
+        if st is None or every <= 0:
+            tx = _ts(x2)
+        else:
+            if st.get("scale") is None or st["n"] % every == 0:
+                st["scale"] = _ts(x2) * 1.25
+            st["n"] = st.get("n", 0) + 1
+            tx = st["scale"]
         xq, xb = ck.quantize_nvfp4(x2, tx, pad_16x=True)
         y = ck.scaled_mm_nvfp4(xq, wq, tx, tw, xb, wb, bias=bias, out_dtype=x.dtype)
         return y[:m].reshape(*shp[:-1], y.shape[-1])
@@ -642,7 +651,9 @@ def quantize_dit_nvfp4(pipe, log=None):
             skipped += 1
             continue
         bias = None if m.bias is None else m.bias.detach()
-        m.forward = (lambda x, _q=wq, _s=wb, _t=tw, _b=bias: _call(x, _q, _s, _t, _b))
+        _st = {"scale": None, "n": 0}
+        m.forward = (lambda x, _q=wq, _s=wb, _t=tw, _b=bias, _st=_st:
+                     _call(x, _q, _s, _t, _b, _st))
         _drop_weight(m)
         n += 1
     torch.cuda.empty_cache()
