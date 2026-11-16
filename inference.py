@@ -54,8 +54,14 @@ def run_one(eng, src, dst, args):
     print(f"\n=== {os.path.basename(src)} ===")
     if note:
         print(f"  {note}")
-    print(f"  scale={params['scale']} tile={params['tile']} kv={params['kv']} "
-          f"pre={params['pre_scale']} chunk={params['chunk']} quant={params['quant']}")
+    pre = float(params.get("pre_scale") or 1.0)
+    if pre < 1.0:
+        path = (f"输入×{pre:g} → 模型×{params['scale']} → 净×{params['scale'] * pre:g}")
+    else:
+        path = f"模型×{params['scale']}（不预缩放）"
+    print(f"  {path}  tile={params['tile']} kv={params['kv']} "
+          f"chunk={params['chunk']} quant={params['quant']}"
+          + (f"  tune={params['tune']}" if params.get("tune") else ""))
     t0 = time.time()
     info = eng.upscale_video(src, dst, params, lambda *a: None)
     print(f"  完成：{info['frames']} 帧 {info['out_wh'][0]}×{info['out_wh'][1]} "
