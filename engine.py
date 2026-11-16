@@ -877,7 +877,7 @@ def quick_hash(path, chunk=1 << 20):
 # 分段缓存键的字段（面板与引擎共用这一份，别再各写一遍）
 _PARAM_KEY_KEYS = ("scale", "tile", "kv", "chunk", "tile_overlap", "mode", "attention",
                    "quant", "pre_scale", "color_fix", "seam_fix", "hi_precision",
-                   "max_frames")
+                   "max_frames", "reuse")
 
 
 def _param_key(params):
@@ -1424,6 +1424,10 @@ def resolve_params(fields, src_path=None):
     seam_fix = str(fields.get("seam_fix") or "smooth").strip().lower()
     if seam_fix not in ("off", "smooth", "align"):
         seam_fix = "smooth"
+    # 复用模式：off / tile（静止 tile 跳过解码，54.9 dB）/ window（整窗跳过 DiT，50.6 dB）
+    reuse = str(fields.get("reuse") or os.environ.get("FLASHVSR_REUSE", "off")).strip().lower()
+    if reuse not in ("off", "tile", "window"):
+        reuse = "off"
     return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
                 attention=attention, encoder=encoder, quality=quality,
                 quant=quant, budget=budget, pre_scale=pre_scale,
@@ -1432,7 +1436,7 @@ def resolve_params(fields, src_path=None):
                 max_frames=max_frames, tune=tune, extra_args=extra_args,
                 prescale_scaler=scaler, prescale_deband=prescale_deband,
                 deband_grain=deband_grain, prescale_dither=prescale_dither,
-                preview=preview, auto_note=auto_note)
+                reuse=reuse, preview=preview, auto_note=auto_note)
 
 
 class Engine:
@@ -1525,7 +1529,8 @@ class Engine:
                         return _ru["out"]
                     # 形状对不上就不冒险：老老实实解码这一窗
                     print("[win-reuse] 形状不匹配，本窗退回真实解码", flush=True)
-                if (_ru["on"] and _ru["prev"] is not None and cond is not None
+                if (getattr(self, "_reuse_tile", False) and _ru["prev"] is not None
+                        and cond is not None
                         and cond.shape == _ru["prev"].shape and _ru["run"] < _ru["max_run"]):
                     d = (cond.float() - _ru["prev"].float()).abs().mean().item()
                     if d < _ru["thr"]:
@@ -1573,13 +1578,18 @@ class Engine:
             self._win = {"prev": None, "n": 0, "skip": 0, "flag": False,
                          "thr": float(os.environ.get("FLASHVSR_WIN_THR", "0.001")),
                          "on": os.environ.get("FLASHVSR_WIN_REUSE", "0") == "1"}
-            if pl_mod is not None and self._win["on"] and not getattr(pl_mod, "_win_wrapped", False):
+            if pl_mod is not None and not getattr(pl_mod, "_win_wrapped", False):
                 _orig_fn = pl_mod.model_fn_wan_video
                 st = self._win
 
                 def _win_fn(dit, x, timestep, context, **kw):
                     lat = kw.get("LQ_latents")
                     dup = False
+                    if not getattr(self, "_reuse_win", False):
+                        st["n"] += 1
+                        st["prev"] = [t.detach().clone() for t in lat] if lat is not None else None
+                        st["flag"] = False
+                        return _orig_fn(dit, x, timestep, context, **kw)
                     dmax = -1.0
                     if st["prev"] is not None and lat is not None and len(lat) == len(st["prev"]):
                         # 首窗与后续窗的 LQ_latents 时间长度不同（512 vs 1536），
@@ -1811,6 +1821,13 @@ class Engine:
                            on_stage, quant=params.get("quant") or "none",
                            prewarm=(max(16, int(params["tile"]) * int(params["scale"]) // 8),) * 2)
         drop_on = os.environ.get("FLASHVSR_FRAME_DROP", "0") == "1"
+        reuse_mode = str(params.get("reuse") or "off")
+        self._reuse_tile = reuse_mode in ("tile", "window")
+        self._reuse_win = reuse_mode == "window"
+        if reuse_mode != "off":
+            on_stage("infer", 0, 0,
+                     "复用已开启：" + ("整窗跳过 DiT（≈50.6 dB）" if reuse_mode == "window"
+                                     else "静止 tile 跳过解码（≈54.9 dB）"))
         audio = src if info["has_audio"] else None
         quality = int(params.get("quality") or 15)
         bitdepth = int(params.get("bitdepth") or 8)

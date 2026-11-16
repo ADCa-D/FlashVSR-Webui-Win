@@ -152,6 +152,12 @@
         <option value="none">bf16（基准）</option>
         <option value="w8" title="实测：显存 2.03 GiB（比 MXFP8 还略省）、画质 43.33 dB（比 MXFP8 高 1.8 dB），但速度与 bf16 相同——因为它每次前向要把 fp8 权重反量化回 bf16。仅推荐给没有 fp8 张量核的 30/40 系">W8A16（老卡兼容，画质最好但不更快）</option>
       </select>
+      <span class="lk" title="静止内容跳过重复计算。tile：静止的小块直接沿用上一窗解码结果（实测 54.9 dB，省 ~5%）；window：整窗内容没变就跳过 30 层 DiT（实测 50.6 dB，省 ~9%）。两者都只对静态镜头/动画 held 帧生效，运动镜头自动不命中。">复用</span>
+      <select id="reuse" title="静止内容跳过重复计算">
+        <option value="off" selected>关闭</option>
+        <option value="tile">静止块（≈54.9 dB）</option>
+        <option value="window">整窗跳过（≈50.6 dB）</option>
+      </select>
     </div>
     <div class="hint" id="encHint"></div>
     <div class="row">
@@ -320,6 +326,7 @@ function collectFields(){
   if (dev && $('#dither')) o.prescale_dither = $('#dither').value;
   if (dev && $('#extraOn').checked) o.extra_args = $('#extraArgs').value;
   o.quant = $('#quant').value;
+  o.reuse = $('#reuse') ? $('#reuse').value : 'off';
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
   o.tile_overlap = $('#tileOv').value;
