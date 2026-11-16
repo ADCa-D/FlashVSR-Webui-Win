@@ -201,12 +201,6 @@
           </select>
         </div>
         <div class="row">
-          <span class="lk" title="按实际设备选：Blackwell（RTX 50 系）才支持 NVFP4；av1_nvenc 需要 40 系+。选「其它」会隐藏用不上的项">设备架构</span>
-          <select id="devArch">
-            <option value="auto" selected>自动检测</option>
-            <option value="blackwell">Blackwell（RTX 50 系）</option>
-            <option value="other">其它（30/40 系、AMD、Intel 核显）</option>
-          </select>
           <label class="chk" title="勾上后才把下面的参数透传给 ffmpeg"><input type="checkbox" id="extraOn" /> 自定义编码参数</label>
           <input id="extraArgs" type="text" placeholder="-rc vbr -cq 22 -tune hq"
                  style="display:none;width:300px;font-family:var(--mono, monospace)" />
@@ -534,7 +528,6 @@ $('#bitdepth').addEventListener('change', updateEncHint);
 (() => {
   const dev = $('#devMode');
   const body = $('#devBody');
-  const arch = $('#devArch');
   const extraOn = $('#extraOn');
   const extraBox = $('#extraArgs');
   const hint = $('#archHint');
@@ -542,16 +535,13 @@ $('#bitdepth').addEventListener('change', updateEncHint);
   const apply = () => { body.style.display = dev.checked ? '' : 'none'; };
   const applyExtra = () => { extraBox.style.display = extraOn.checked ? '' : 'none'; };
 
-  // 架构 → 隐藏用不上的项：NVFP4 需 sm120（Blackwell）；av1_nvenc 需 40 系+
+  // 架构完全自动判定（不再提供手动选择）：NVFP4 需 sm120（Blackwell）；av1_nvenc 需 40 系+
   const HIDE = {
-    other: { enc: ['av1_nvenc'], quant: ['nvfp4'],
-             note: '已隐藏：NVFP4（需 RTX 50 系 sm120）、av1_nvenc（需 40 系+）' },
-    blackwell: { enc: [], quant: [], note: '按 Blackwell 显示全部选项（NVFP4 / av1_nvenc 可用）' },
-    auto: { enc: [], quant: [], note: '' },
+    other: { enc: ['av1_nvenc'], quant: ['nvfp4'] },
+    blackwell: { enc: [], quant: [] },
   };
 
   function effectiveArch() {
-    if (arch.value !== 'auto') return arch.value;
     const cap = (CAPS && CAPS.gpu && CAPS.gpu.cap) || '';
     return parseFloat(cap) >= 12 ? 'blackwell' : 'other';
   }
@@ -588,22 +578,23 @@ $('#bitdepth').addEventListener('change', updateEncHint);
     if (nv) { nv.hidden = conf.quant.includes('nvfp4'); nv.disabled = nv.hidden; }
     if (nv && nv.hidden && $('#quantDev').value === 'nvfp4') $('#quantDev').value = '';
     rebuildEncoders();
-    hint.textContent = conf.note || ('按检测到的架构：' + (a === 'blackwell' ? 'Blackwell' : '其它'));
+    const g = (CAPS && CAPS.gpu) || {};
+    if (!g.name) {
+      hint.textContent = '未检测到 GPU 架构信息 → 隐藏 NVFP4（需 RTX 50 系 sm120）、av1_nvenc（需 40 系+）';
+    } else if (a === 'blackwell') {
+      hint.textContent = `${g.name}（sm ${g.cap || '?'}）· Blackwell：NVFP4 / av1_nvenc 可用`;
+    } else {
+      hint.textContent = `${g.name}（sm ${g.cap || '?'}）· 非 Blackwell：已隐藏 NVFP4（sm120）与 av1_nvenc（40 系+）`;
+    }
   }
 
   dev.checked = localStorage.getItem('fs_dev') === '1';
-  arch.value = localStorage.getItem('fs_arch') || 'auto';
   extraOn.checked = localStorage.getItem('fs_extra') === '1';
   apply(); applyExtra();
 
   dev.onchange = () => {
     localStorage.setItem('fs_dev', dev.checked ? '1' : '0');
     apply();
-    if (typeof updatePresetLabels === 'function') updatePresetLabels();
-  };
-  arch.onchange = () => {
-    localStorage.setItem('fs_arch', arch.value);
-    applyArch();
     if (typeof updatePresetLabels === 'function') updatePresetLabels();
   };
   extraOn.onchange = () => {
