@@ -790,6 +790,11 @@ python inference.py -s in.mp4 -o out.mp4 --encoder nvenc --extra "-rc vbr -cq 22
 
 ## 命令行（CLI）
 
+> **音频/字幕一律流拷贝**（`-c:a copy -c:s copy`），不重编码、不掉质量：
+> 分段任务里音轨只在最后拼接时混入一次，中间分段本身就是纯视频。
+
+
+
 面板不是唯一入口，`inference.py` 直接调引擎，参数语义与面板完全一致（共用 `engine.resolve_params`）：
 
 ```powershell
@@ -808,7 +813,7 @@ python inference.py -s D:\素材 -o D:\成品 --batch --preset quality
 ```
 
 参数速查：`--quant none|nvfp4|mxfp8|mixed|w8`、`--prescale auto|half|off`、
-`--encoder auto|cpu|nvenc|amf`、`--chunk 0=不分段`、`--overlap`（tile 羽化带）。
+`--encoder auto|cpu|nvenc|qsv|qsv_h264|amf|vulkan|svtav1|av1_nvenc|x265`、`--tune ssim|psnr|vq|vmaf|...`、`--scaler ewa_lanczos4sharpest`、`--deband`、`--dither blue|ordered_fixed`、`--frames N`（试跑）、`--chunk 0=不分段`、`--overlap`（tile 羽化带）。
 
 ## 目录结构
 
