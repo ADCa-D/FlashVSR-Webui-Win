@@ -26,6 +26,7 @@ def build_params(args, src):
     fields.update(chunk=args.chunk, max_frames=args.frames,
                   quant=args.quant, encoder=args.encoder,
                   bitdepth=args.bitdepth, hi_precision=1 if args.hi_precision else 0,
+                  color_fix=0 if args.no_color_fix else 1, seam_fix=args.seam_fix,
                   quality=args.crf, prescale=args.prescale,
                   tile_overlap=args.overlap, mode=args.mode,
                   attention=args.attention, budget=args.budget)
@@ -34,6 +35,14 @@ def build_params(args, src):
     p.update(restart=False, seg_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                  "work", "segments"))
     return p
+
+
+def out_name(path, args):
+    """试跑（--frames）产物加后缀，避免被当成全片成品。"""
+    if not getattr(args, "frames", 0):
+        return path
+    base, ext = os.path.splitext(path)
+    return f"{base}_preview{args.frames}f{ext}"
 
 
 def run_one(eng, src, dst, args):
@@ -74,13 +83,17 @@ def main():
     ap.add_argument("--mode", default="tiny-long", choices=["tiny", "tiny-long"])
     ap.add_argument("--attention", default="sparse", choices=["sparse", "dense"])
     ap.add_argument("--budget", default="auto", choices=["auto", "fixed"])
+    ap.add_argument("--seam-fix", default="smooth", choices=["smooth", "align", "off"],
+                    help="tile 拼接方式：smooth=平滑羽化（默认）/ align=加 DC 对齐（实验）/ off=线性")
+    ap.add_argument("--no-color-fix", action="store_true",
+                    help="关掉逐 tile 颜色对齐（实测会明显掉色，仅排障用）")
     ap.add_argument("--hi-precision", action="store_true",
                     help="浮点解码（gbrpf32le）：YUV→RGB 全程 float32，不经 8bit 量化；内存 4×")
     args = ap.parse_args()
 
     eng = E.Engine()
     if not args.batch:
-        run_one(eng, args.src, args.dst, args)
+        run_one(eng, args.src, out_name(args.dst, args), args)
         return 0
 
     os.makedirs(args.dst, exist_ok=True)
@@ -91,7 +104,8 @@ def main():
         return 1
     done, skip = 0, 0
     for i, f in enumerate(files, 1):
-        out = os.path.join(args.dst, os.path.splitext(os.path.basename(f))[0] + "_x.mp4")
+        out = out_name(os.path.join(args.dst,
+                                    os.path.splitext(os.path.basename(f))[0] + "_x.mp4"), args)
         if os.path.exists(out) and os.path.getsize(out) > 1024:
             print(f"[{i}/{len(files)}] 跳过（已存在）{os.path.basename(out)}")
             skip += 1

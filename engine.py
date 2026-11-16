@@ -172,6 +172,7 @@ def _install_smooth_feather(mod):
     if getattr(mod.create_feather_mask, "_smooth", False):
         return
     orig = mod.create_feather_mask
+    mod._fs_orig_feather = orig
 
     def create_feather_mask(size, overlap):
         if int(overlap) < 2:
@@ -180,6 +181,14 @@ def _install_smooth_feather(mod):
 
     create_feather_mask._smooth = True
     mod.create_feather_mask = create_feather_mask
+
+
+def _uninstall_smooth_feather(mod):
+    """还原原版羽化：同一进程里批量跑不同 seam_fix 时必需，否则 off 会沿用 smooth。"""
+    orig = getattr(mod, "_fs_orig_feather", None)
+    if orig is not None and getattr(mod.create_feather_mask, "_smooth", False):
+        mod.create_feather_mask = orig
+        mod._fs_orig_feather = None
 
 
 def flashvsr_aligned(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
@@ -508,10 +517,29 @@ def quick_hash(path, chunk=1 << 20):
     return h.hexdigest()[:16]
 
 
+# 分段缓存键的字段（面板与引擎共用这一份，别再各写一遍）
+_PARAM_KEY_KEYS = ("scale", "tile", "kv", "chunk", "tile_overlap", "mode", "attention",
+                   "quant", "pre_scale", "color_fix", "seam_fix", "hi_precision",
+                   "max_frames")
+
+
 def _param_key(params):
-    keys = ("scale", "tile", "kv", "chunk", "overlap", "mode", "attention", "quant",
-            "pre_scale", "tile_overlap")
-    return hashlib.sha1(json.dumps({k: params.get(k) for k in keys}, sort_keys=True).encode()).hexdigest()[:8]
+    """分段目录的指纹：**只要会改变画面或分段边界的参数都必须进这里**。
+
+    历史上漏过 color_fix / seam_fix / hi_precision / max_frames，导致改参数后
+    仍命中旧分段（输出与设置不符）以及试跑与全片互相清空缓存。
+    """
+    chunk = max(0, int(params.get("chunk") or 0))
+    ov = int(params.get("overlap") or 8)
+    if chunk:
+        ov = min(ov, chunk // 4)
+    d = {k: params.get(k) for k in _PARAM_KEY_KEYS}
+    d["overlap"] = ov
+    d["color_fix"] = bool(params.get("color_fix", True))
+    d["seam_fix"] = str(params.get("seam_fix") or "smooth")
+    d["hi_precision"] = bool(params.get("hi_precision"))
+    d["max_frames"] = int(params.get("max_frames") or 0)
+    return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 
 
 def seg_root_dir(params):
@@ -1090,6 +1118,8 @@ class Engine:
             else:
                 if seam_fix != "off":
                     _install_smooth_feather(mod)
+                else:
+                    _uninstall_smooth_feather(mod)
                 out = mod.flashvsr(
                     self.pipe, frames, int(scale), bool(color_fix), True, True,
                     tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
@@ -1207,7 +1237,12 @@ class Engine:
                       params_kv=params.get("kv"), params_chunk=params.get("chunk"),
                       params_overlap=params.get("overlap"), params_mode=params.get("mode"),
                       params_attention=params.get("attention"), params_quant=params.get("quant"),
-                      params_pre_scale=params.get("pre_scale"), total=total)
+                      params_pre_scale=params.get("pre_scale"), total=total,
+                      params_tile_overlap=params.get("tile_overlap"),
+                      params_ctrl=dict(color_fix=bool(params.get("color_fix", True)),
+                                       seam_fix=str(params.get("seam_fix") or "smooth"),
+                                       hi_precision=bool(params.get("hi_precision")),
+                                       max_frames=int(params.get("max_frames") or 0)))
         same = bool(man) and all(man.get(k) == v for k, v in expect.items())
         if not same:
             shutil.rmtree(seg_dir, ignore_errors=True)

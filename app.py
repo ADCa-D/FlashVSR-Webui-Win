@@ -400,11 +400,12 @@ def _del_pending(pid):
 
 
 def _seg_key_dir(src, P, root):
-    """与 engine 完全一致的键：源指纹 + 参数指纹。"""
-    probe = dict(scale=P["scale"], tile=P["tile"], kv=P["kv"], chunk=P["chunk"], overlap=8,
-                 mode=P["mode"], attention=P["attention"], quant=P["quant"],
-                 pre_scale=P["pre_scale"])
-    return os.path.join(root, f"{E.quick_hash(src)}_{E._param_key(probe)}")
+    """与 engine 完全一致的键：直接借用 engine._param_key（别再手抄一份字段）。
+
+    手抄那版漏了 tile_overlap，导致面板算出的目录和引擎用的不是同一个：
+    续跑检测永远查不到、忘记缓存删不掉、试跑与全片互相清空。
+    """
+    return os.path.join(root, f"{E.quick_hash(src)}_{E._param_key(P)}")
 
 
 def _resume_info(src, P, root):
@@ -563,6 +564,7 @@ async def run(request):
                        quant=quant, budget=budget, pre_scale=pre_scale,
                        tile_overlap=tile_overlap, bitdepth=P["bitdepth"],
                        hi_precision=P["hi_precision"], max_frames=P["max_frames"],
+                       color_fix=P["color_fix"], seam_fix=P["seam_fix"],
                        preview_dir=(os.path.join(WORK, "preview", jid) if preview else None),
                        restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))
@@ -598,6 +600,14 @@ async def run(request):
                 tail.append(line[-400:])
                 del tail[:-16]
         return proc.wait(), tail
+
+    def retryable(code, lines):
+        """显存不足 / 原生崩溃才值得降档重试；编码器、路径、参数错误重试也没用。"""
+        if code in (3221225477, 3221225725, 3221226505):
+            return True
+        txt = " ".join([ln for ln in lines if ln]).lower()
+        return any(k in txt for k in ("out of memory", "内存不足", "cuda error",
+                                      "cublas", "cudnn", "alloc"))
 
     def work():
         """子进程跑推理；显存不够就自动降档重试（tile/kv 下调，稠密→稀疏）。"""
@@ -637,6 +647,10 @@ async def run(request):
             if j.get("cancelled") or os.path.exists(out):
                 break
             if attempt == 3:
+                break
+            if not retryable(code, last_tail + [j.get("error") or ""]):
+                # 不是显存问题：降 tile 也救不了，别再白跑三轮（每轮都要重载模型）
+                j["msg"] = "失败（非显存问题，已停止自动降档重试）"
                 break
         j["done"] = True
         if j.get("cancelled"):
@@ -803,7 +817,11 @@ async def clear_history(request):
             except OSError:
                 pass
     # 顺带清上传缓存 / 残留分段 / 任务 json
+    # 但**不能碰**鉴权文件：账号、IP 放行名单、cookie 密钥、首次密码提示
+    keep = ("auth_users.json", "auth_ips.json", "auth_secret.txt", "首次登录密码.txt")
     for fn in os.listdir(WORK):
+        if fn in keep:
+            continue
         p = os.path.join(WORK, fn)
         try:
             if os.path.isdir(p):
@@ -942,7 +960,10 @@ async def serve(app):
     await runner.setup()
     sites = [("本机", web.TCPSite(runner, "127.0.0.1", 8288))]
 
-    tls_host = os.environ.get("FLASHVSR_TLS_HOST", "66.66.66.67")
+    # 监听地址：默认所有网卡（0.0.0.0）。以前写死成 EasyTier 的内网 IP，
+    # 换机器/掉线时网络上不了还看不出原因。要固定就设 FLASHVSR_TLS_HOST。
+    tls_host = os.environ.get("FLASHVSR_TLS_HOST", "0.0.0.0")
+    shown = "0.0.0.0" if tls_host in ("", "0.0.0.0") else tls_host
     cert, key = TLS_CERT, TLS_KEY
     if os.path.isfile(cert) and os.path.isfile(key):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -961,10 +982,10 @@ async def serve(app):
             if label == "本机":
                 print("FlashVSR 面板（本机，免登录）：http://127.0.0.1:8288", flush=True)
             elif label == "网络":
-                print(f"FlashVSR 面板（网络，需登录）：https://{tls_host}:8288", flush=True)
+                print(f"FlashVSR 面板（网络，需登录）：https://{shown}:8288", flush=True)
             else:
                 print(f"FlashVSR 面板（手机/无证书客户端，明文需登录）："
-                      f"http://{tls_host}:{plain_port}", flush=True)
+                      f"http://{shown}:{plain_port}", flush=True)
         except OSError as e:
             if label == "本机":
                 # 本机端口都绑不上（通常是另一个面板实例还在跑）→ 直接退出，别静默空转
