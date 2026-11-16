@@ -114,6 +114,33 @@ FALLBACK_CHAIN = {
 CAPS_TTL = 7 * 86400
 
 
+def fallback_chain(backend):
+    """取某个编码器失败后的降级顺序（可用 FLASHVSR_FALLBACK_CHAIN 覆盖）。
+
+    覆盖格式：`x265>svtav1>cpu`（对所有后端生效），或 `qsv=qsv_h264>x265>cpu`
+    只覆盖某一个后端。末尾总是补 cpu，保证一定收得住。
+    """
+    raw = (os.environ.get("FLASHVSR_FALLBACK_CHAIN") or "").strip()
+    chain = None
+    if raw:
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip() == backend:
+                    chain = [x.strip() for x in v.split(">") if x.strip()]
+            elif chain is None:
+                chain = [x.strip() for x in part.split(">") if x.strip()]
+    if chain is None:
+        chain = list(FALLBACK_CHAIN.get(backend, ()))
+    chain = [x for x in chain if x in ENCODER_CHOICES and x != backend]
+    if "cpu" not in chain:
+        chain.append("cpu")
+    return tuple(chain)
+
+
 def _caps_file():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "work", "encoder_caps.json")
 
@@ -1279,7 +1306,7 @@ class Engine:
             且只在第一次失败时付出探测成本（之后 backend 已经改成可用的那个）。
             """
             nonlocal backend, bitdepth
-            chain = (backend,) + tuple(FALLBACK_CHAIN.get(backend, ())) + ("cpu",)
+            chain = (backend,) + fallback_chain(backend)
             seen, last = set(), "未知错误"
             for be in chain:
                 if be in seen:
