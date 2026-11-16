@@ -34,11 +34,12 @@ FFPROBE = _cfg.FFPROBE
 
 MAX_PIXELS = 700_000_000
 
-ENCODER_CHOICES = ("auto", "cpu", "nvenc", "amf", "svtav1", "av1_nvenc", "x265")
+ENCODER_CHOICES = ("auto", "cpu", "nvenc", "qsv", "amf", "svtav1", "av1_nvenc", "x265")
 ENCODER_LABEL = {
     "auto": "自动（CPU 优先，GPU 不可用则回退）",
     "cpu": "CPU · libx264（H.264）",
     "nvenc": "GPU · NVENC H.264",
+    "qsv": "GPU · Intel QSV（Intel 核显，未在本机验证）",
     "amf": "GPU · AMF（AMD 核显）",
     "svtav1": "CPU · SVT-AV1（同画质体积最小，慢）",
     "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
@@ -57,6 +58,14 @@ def encoder_args(backend, quality, bitdepth=8):
     if backend == "av1_nvenc":
         return ["-c:v", "av1_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if backend == "qsv":
+        # Intel Quick Sync：hevc_qsv 支持 main10（p010le），同码率画质优于 AMF，
+        # 但只有带 Intel 核显的机器能用（本机是 AMD 610M，probe_encoders 会标不可用）。
+        if int(bitdepth) == 10:
+            return ["-c:v", "hevc_qsv", "-global_quality", q, "-preset", "medium",
+                    "-pix_fmt", "p010le"]
+        return ["-c:v", "hevc_qsv", "-global_quality", q, "-preset", "medium",
+                "-pix_fmt", "nv12"]
     if backend == "amf":
         # AMD AMF：只有 8 bit（没有 main10），且同码率画质明显弱于 x264/x265，
         # 只当“显卡不支持 NVENC / CPU 又太慢”时的兜底；要画质请用 x265 或 svtav1。
@@ -80,7 +89,7 @@ def encoder_args(backend, quality, bitdepth=8):
 def probe_encoders():
     src = ["-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=0.2", "-frames:v", "1"]
     out = {}
-    for be in ("cpu", "nvenc", "amf", "svtav1", "av1_nvenc", "x265"):
+    for be in ("cpu", "nvenc", "qsv", "amf", "svtav1", "av1_nvenc", "x265"):
         try:
             r = subprocess.run(
                 [FFMPEG, "-hide_banner", "-v", "error"] + src + encoder_args(be, 18) + ["-f", "null", "-"],
@@ -124,7 +133,7 @@ def resolve_encoder(requested, caps=None):
         return be
     if caps.get("cpu", {}).get("ok"):
         return "cpu"
-    for alt in ("nvenc", "amf"):
+    for alt in ("nvenc", "qsv", "amf"):
         if caps.get(alt, {}).get("ok"):
             return alt
     return "cpu"
@@ -968,7 +977,8 @@ class Engine:
         mod.cqdm = Hook
         try:
             _f = torch.from_numpy(np.ascontiguousarray(frames_u8))
-            frames = _f.div_(255.0) if _f.dtype == torch.uint8 else _f.float()
+            # uint8 → [0,1] 需要缩放；float32 已是 [0,1]（不能原地除，否则会把 numpy 缓冲改坏）
+            frames = _f.float().div_(255.0) if _f.dtype == torch.uint8 else _f.float()
             out = mod.flashvsr(
                 self.pipe, frames, int(scale), True, True, True,
                 tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
@@ -1018,9 +1028,10 @@ class Engine:
         quality = int(params.get("quality") or 15)
         bitdepth = int(params.get("bitdepth") or 8)
         backend = resolve_encoder(params.get("encoder"))
-        if bitdepth == 10 and backend != "x265":
-            # 本机只有 libx265 能出 main10；其余编码器（含 AMF/NVENC）都是 8bit
-            on_stage("encode", 0, 0, f"{backend} 不支持 10 bit，本次按 8 bit 输出（要 10 bit 请用 x265）")
+        if bitdepth == 10 and backend not in ("x265", "qsv"):
+            # x265 与 hevc_qsv 能出 main10；其余（含 AMF/NVENC）只有 8bit
+            on_stage("encode", 0, 0,
+                     f"{backend} 不支持 10 bit，本次按 8 bit 输出（要 10 bit 请用 x265 或 qsv）")
             bitdepth = 8
         budget_mode = params.get("budget") or "auto"
 

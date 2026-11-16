@@ -1,5 +1,5 @@
 import os, sys, time
-sys.path.insert(0, r"C:\Users\MECHREVO\Documents\默认项目\flashvsr-web")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import engine as E  # engine 里已设置 expandable_segments
 

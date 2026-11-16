@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """NVFP4 的 host 开销来自哪：CPU 侧 profiler 看 top 操作。"""
+import os
 import sys
 
 import torch
 
-sys.path.insert(0, r"C:\Users\MECHREVO\Documents\默认项目\flashvsr-web")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import comfy_kitchen as ck  # noqa: E402
 
 M, K, N = 2304, 8960, 1536

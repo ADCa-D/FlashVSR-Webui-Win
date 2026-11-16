@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, r"C:\Users\MECHREVO\Documents\默认项目\flashvsr-web")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import engine as E  # noqa: E402
 
 TMP = os.path.join(os.environ.get("TEMP", "."), "av1_bench")

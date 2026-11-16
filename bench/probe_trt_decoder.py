@@ -8,6 +8,7 @@
 
 解码器第一层是 784 通道（16 latent + 3×4×8×8 cond 经 PixelShuffle3d），单独测必须按 784 喂。
 """
+import tempfile
 import os
 import sys
 import time
@@ -88,7 +89,8 @@ def run_shape(dec, ch, lat, ort, providers, tag=""):
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         so.log_severity_level = 3
         provs = []
-        cache_dir = r"C:\Users\MECHREVO\AppData\Local\Temp\trt_cache"
+        # TRT 的 create_directory 不支持非 ASCII 路径，所以放系统临时目录
+        cache_dir = os.path.join(tempfile.gettempdir(), "trt_cache")
         os.makedirs(cache_dir, exist_ok=True)   # TRT 的 create_directory 不支持非 ASCII 路径
         for p in providers:
             if p == "TensorrtExecutionProvider":

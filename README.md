@@ -8,6 +8,20 @@
 
 ---
 
+## 快速开始（3 步）
+
+```bat
+REM 1. 自检：一条命令看清缺什么（模型 / triton / 头文件 / ffmpeg / GPU）
+python check_env.py
+
+REM 2. 缺什么按提示补（见下面「部署流程」）
+
+REM 3. 启动（会自动再自检一次，硬性缺失直接停住并说明原因）
+start.bat
+```
+
+跑起来后浏览器打开 <http://127.0.0.1:8288>，左边选档位 → 拖视频 → 点开始。单机默认走回环地址，**不需要登录**；从别的机器访问才要密码（首次启动会把密码写进 `work/首次登录密码.txt`）。
+
 ## 特性
 
 - **单功能面板**：上传 / 档位 / 进度（含 ETA）/ 结果预览 / 历史清理，没有多余的节点图
@@ -107,6 +121,7 @@ VAE 解码占 kernel 时间约 65%，理论上最值得加速。实测确实能�
 | libsvtav1 | ❌ | 4K 下 10 bit 缓冲翻倍 → `SvtMalloc: allocate memory failed` |
 | h264_nvenc / av1_nvenc | ❌ | 需要 main10 profile，当前卡/驱动不支持 |
 | h264_amf | ❌ | AMF 的 H.264 编码器只有 8 bit；且同码率画质比 x264/x265 差，只适合当“能出片就行”的兜底 |
+| **hevc_qsv** | ✅ | Intel 核显 Quick Sync 支持 main10；**本机无 Intel 核显（AMD 610M），代码就位但未实测** |
 
 两者可以叠加，效果才完整：
 
@@ -334,7 +349,7 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 
 - 显存不够会自动降档重试，进度里会写「自动降档重试（第 N 次）：tile=… kv=…」
 - `权重`：MXFP8（推荐）/ bf16（基准）/ NVFP4（4bit，未必更快）/ 混合（FFN 4bit，省 0.16 GiB、画质 44.65 dB）/ **W8A16**（通用 fp8 权重，30/40 系也能用）
-- `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `amf`（AMD，**仅 8 bit，同码率画质明显弱于 x264/x265**）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
+- `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `qsv`（Intel 核显 Quick Sync，**未在本机验证**：本机是 AMD 610M）/ `amf`（AMD，**仅 8 bit，同码率画质明显弱于 x264/x265**）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
 - 体积对比（业界 RD 基准，非本机实测）：AV1 比 x264 省 **40–50%** 码率、比 x265 省 **20–30%**；代价是 CPU 编码慢
 - `svtav1` 默认 **preset 4 + lp=4**：preset 越低画质越好、同 CRF 体积越小（p4 比 p10 小 ~30%），而编码耗时相对推理可忽略（4K/50 帧：p4≈7 s、p2≈13 s，推理要 30–90 分钟）。
   可用 `FLASHVSR_SVT_PRESET=2` 换最高质量档；`lp` 固定 4（默认按 32 逻辑核并行，4K 下会 ENOMEM）

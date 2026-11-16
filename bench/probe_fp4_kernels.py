@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """看 NVFP4 / MXFP8 的 GEMM 到底调了什么 CUDA 内核（判断是不是真 FP4 张量核）。"""
+import os
 import sys
 
 import torch
 
-sys.path.insert(0, r"C:\Users\MECHREVO\Documents\默认项目\flashvsr-web")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import comfy_kitchen as ck  # noqa: E402
 
 M, K, N = 2304, 8960, 1536

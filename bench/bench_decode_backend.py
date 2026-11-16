@@ -8,9 +8,12 @@ import subprocess
 import sys
 import time
 
-FF = r"D:\ffmpeg-9.0.1\ffmpeg.exe"
-SRC = r"C:\Users\MECHREVO\AppData\Local\Temp\opencode\src4k.mp4"   # 4K h264, 50 帧
-IF = r"D:\ComfyUI_windows_portable\ComfyUI\input\flashvsr_long_544.mp4"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config  # noqa: E402
+
+FF = config.FFMPEG
+SRC = os.environ.get("FLASHVSR_BENCH_4K", "")   # 4K 素材，用环境变量给一个（可选）
+IF = os.path.join(config.BASE, "ComfyUI", "input", "flashvsr_long_544.mp4")
 
 CASES = [
     ("cpu threads4", ["-threads", "4"]),

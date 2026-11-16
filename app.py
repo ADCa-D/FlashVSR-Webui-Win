@@ -44,10 +44,20 @@ ENGINE = E.Engine()  # 仅用于 /api/status 与历史状态，不影响子进�
 # ---------------------------------------------------------------- 鉴权
 # 规则：本机回环免登录；其他 IP 必须（a）在放行名单里，或（b）持有有效会话 cookie。
 # 登录成功后把该 IP 记入放行名单，下次同 IP 直接进。
-TLS_CERT = os.environ.get(
-    "FLASHVSR_TLS_CERT", r"C:\Users\MECHREVO\Desktop\server\certs\server.crt")
-TLS_KEY = os.environ.get(
-    "FLASHVSR_TLS_KEY", r"C:\Users\MECHREVO\Desktop\server\certs\server.key")
+def _first_file(*paths):
+    for p in paths:
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
+# 证书不再写死本机路径：优先环境变量，其次 <项目>/certs，最后桌面 server/certs（旧布局）
+_CERT_DIRS = (os.path.join(APP_DIR, "certs"),
+              os.path.join(os.path.expanduser("~"), "Desktop", "server", "certs"))
+TLS_CERT = os.environ.get("FLASHVSR_TLS_CERT") or _first_file(
+    *[os.path.join(d, "server.crt") for d in _CERT_DIRS])
+TLS_KEY = os.environ.get("FLASHVSR_TLS_KEY") or _first_file(
+    *[os.path.join(d, "server.key") for d in _CERT_DIRS])
 AUTH_USERS = os.path.join(WORK, "auth_users.json")
 AUTH_IPS = os.path.join(WORK, "auth_ips.json")
 AUTH_SECRET = os.path.join(WORK, "auth_secret.txt")

@@ -444,14 +444,15 @@ function updateEncHint(){
   const info = (CAPS && CAPS.encoders && CAPS.encoders[be]) || {};
   const parts = [];
   if (!info.ok && info.detail) parts.push('不可用：' + info.detail);
+  else if (be === 'qsv') parts.push('Intel 核显硬件编码：hevc_qsv 支持 10 bit，需带 Intel 核显的机器');
   else if (be === 'amf') parts.push('仅 8 bit（无 10 bit），同码率画质弱于 x264/x265；兜底用');
   else if (be === 'nvenc') parts.push('与推理共用独显，会占一点显存');
   else if (be === 'av1_nvenc') parts.push('硬件 AV1，40/50 系支持；体积比 H.264 小一半');
   else if (be === 'svtav1') parts.push('CPU 软件 AV1：体积最小；preset 4（质量档，4K/50帧约 7 s），lp 固定 4');
   else if (be === 'x265') parts.push('CPU H.265，体积比 x264 小 30–40%，慢一倍');
   else parts.push('CPU 编码与 GPU 推理天然并行，通常最快');
-  if ($('#bitdepth').value === '10' && be !== 'x265') {
-    parts.push('该编码器不支持 10 bit（只有 x265 支持），会按 8 bit 输出');
+  if ($('#bitdepth').value === '10' && be !== 'x265' && be !== 'qsv') {
+    parts.push('该编码器不支持 10 bit（只有 x265 / qsv 支持），会按 8 bit 输出');
   }
   $('#encHint').textContent = parts.join(' · ');
   const q = (be === 'nvenc' || be === 'av1_nvenc') ? '（CQ，越小越好）'
@@ -478,7 +479,7 @@ updatePresetLabels();
 (async () => {
   try {
     CAPS = await (await fetch('/api/capabilities')).json();
-    const short = {auto:'自动', cpu:'CPU · x264', nvenc:'NVENC', amf:'AMF'};
+    const short = {auto:'自动', cpu:'CPU · x264', nvenc:'NVENC', qsv:'Intel QSV', amf:'AMF'};
     const sel = $('#encoder');
     sel.innerHTML = '';
     (CAPS.choices || ['auto']).forEach(be => {
