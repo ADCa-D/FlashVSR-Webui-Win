@@ -1439,11 +1439,36 @@ class Engine:
             dec.to(memory_format=torch.channels_last)
             _orig_decode = dec.decode_video
 
+            # ---- 静止 tile 复用（FLASHVSR_TILE_REUSE=1 开启）------------------
+            # 依据（实测）：静止块解码后的 RGB 跨窗差 0.26–0.41/255（< 1 LSB），
+            # 运动块 12.6–18.7/255。判据必须用 cond（模型输入侧的 LQ），不能用 latent
+            # —— 静止块的 latent 也差 3.5–4%，噪声结构被解码器抹掉了。
+            _ru = {
+                "on": os.environ.get("FLASHVSR_TILE_REUSE", "0") == "1",
+                "thr": float(os.environ.get("FLASHVSR_REUSE_THR", "0.002")),
+                "max_run": int(os.environ.get("FLASHVSR_REUSE_MAX_RUN", "8")),
+                "prev": None, "out": None, "run": 0, "skip": 0, "n": 0,
+            }
+            self._reuse_stats = _ru
+
             def _decode_cl(x, parallel=True, show_progress_bar=False, cond=None):
                 x = x.contiguous(memory_format=torch.channels_last_3d)
                 if cond is not None:
                     cond = cond.contiguous(memory_format=torch.channels_last_3d)
-                return _orig_decode(x, parallel=parallel, show_progress_bar=show_progress_bar, cond=cond)
+                _ru["n"] += 1
+                if (_ru["on"] and _ru["prev"] is not None and cond is not None
+                        and cond.shape == _ru["prev"].shape and _ru["run"] < _ru["max_run"]):
+                    d = (cond.float() - _ru["prev"].float()).abs().mean().item()
+                    if d < _ru["thr"]:
+                        _ru["skip"] += 1
+                        _ru["run"] += 1
+                        return _ru["out"]
+                _ru["run"] = 0
+                out = _orig_decode(x, parallel=parallel, show_progress_bar=show_progress_bar,
+                                   cond=cond)
+                _ru["prev"] = cond
+                _ru["out"] = out
+                return out
 
             dec.decode_video = _decode_cl
         except Exception as e:  # noqa

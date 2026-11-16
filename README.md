@@ -904,3 +904,41 @@ flashvsr-web/
 ## License
 
 MIT
+
+---
+
+## 静止 tile 复用（实验性，默认关闭）
+
+相邻窗口里**完全没变的 128px tile** 可以跳过解码，直接沿用上一窗的 RGB。
+
+```bat
+set FLASHVSR_TILE_REUSE=1
+set FLASHVSR_REUSE_THR=0.002     REM LQ 帧差的均值阈值（0..1 空间）
+set FLASHVSR_REUSE_MAX_RUN=8     REM 连续复用上限，防细节冻住
+```
+
+实测（544p → 2×，tile 128，33 帧，135 次解码调用）：
+
+| | 解码调用 | 跳过 | 耗时 | 画质 |
+|---|---|---|---|---|
+| 关 | 135 | 0 | 39.0 s | — |
+| **开** | 135 | **19（14.1%）** | **37.2 s（−4.7%）** | **PSNR 54.9 dB**（min 49.3，视觉无损） |
+
+判据必须用 **LQ 帧差**，不能用 latent：静止块的 latent 跨窗也差 3.5–4%（单步 DMD 的 latent
+带每帧不同的噪声结构），但解码后只差 0.26–0.41/255（< 1 LSB）；运动块则是 12.6–18.7/255。
+
+> 跳过率 14% 而不是"静止块占比 40%"，是因为复用单位是**整块 tile**——只有整块都静止才算。
+> 要吃到 40% 得让解码器本身支持空间分块，那是更大的改动。
+
+## cpp/（实验性：脱离 ComfyUI 的 C++ 推理）
+
+包含：safetensors 流式加载器、DiT 前向（ATen 参照实现）、NVRTC 进程内 JIT + 融合 elementwise kernel。
+**目前是研究代码，不是可用产品**：只覆盖 DiT，缺 LQ_proj_in / TCDecoder / 视频编解码。
+
+```bat
+cpp\build.bat dit          REM 需要 TORCH_DIR / CUDA_HDR_INC / CUDA_NVCC_INC（见 build.bat 头注释）
+cpp\build.bat kernel_test  REM 融合 kernel 的单元测试，不加载模型
+```
+
+已实测：加载 5.4 GB f32 checkpoint 的 host 峰值 542 MiB（Python 路线 8631 MiB）；
+DiT 30 层前向 220 ms（Python+sage 73 ms），激活峰值 106 MiB vs 859 MiB。
