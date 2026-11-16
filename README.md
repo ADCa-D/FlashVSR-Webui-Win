@@ -600,17 +600,20 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 |---|---|---|
 | `cpu`（x264） | `-tune X` | ssim、psnr、film、animation、grain、stillimage、fastdecode、zerolatency |
 | `x265` | `-tune X` | ssim、psnr、grain、fastdecode、zerolatency |
-| `svtav1` | `-svtav1-params ...:tune=N`（**只能传数字**） | 0=VQ、1=PSNR、2=SSIM、3=IQ、4=MS_SSIM、5=VMAF |
+| `svtav1` | `-svtav1-params ...:tune=N`（**只能传数字**） | **0=VQ（默认，心理视觉最优）**、1=PSNR、2=SSIM、3=IQ、4=MS_SSIM、5=VMAF |
 | GPU（nvenc/qsv/amf） | 无统一入口 | 走「开发模式」自己传 |
 
 两个坑，都实测过：
 
-1. **SVT 传名字会被静默忽略**：`tune=vq` → 打一行 `Error parsing option tune: vq.`，
+1. **不传 tune 时默认是 PSNR，不是 VQ**：实测 `Svt[config]: 8 / PSNR / ...`，
+   而 VQ 才是 SVT 的主观质量档（心理视觉优化），PSNR/SSIM/MS_SSIM/VMAF 都是"对齐指标"
+   用的。所以本项目对 `svtav1` **总是显式传 `tune=0`**（VQ），用户可改。
+2. **SVT 传名字会被静默忽略**：`tune=vq` → 打一行 `Error parsing option tune: vq.`，
    然后**退回 PSNR**，退出码仍是 0。所以本项目只传数字，并用 `svt_tune_caps()` 在启动时
    实编 1 帧确认本机版本支持哪些（老版本只到 2=SSIM）。
-2. **`tune=3` 是 IQ**，只支持 all-intra / low-delay，视频会直接报
+3. **`tune=3` 是 IQ**，只支持 all-intra / low-delay，视频会直接报
    `Tune IQ only supports all-intra and low delay ...`，所以下拉框不提供。
-3. `tune=5`（VMAF）会启用 SVT 自己的锐化预处理（日志里有
+4. `tune=5`（VMAF）会启用 SVT 自己的锐化预处理（日志里有
    `Tune VMAF: a pre-processing / unsharp masking is applied`），适合"对齐 VMAF 指标"，
    不适合追求自然观感。
 
@@ -622,6 +625,9 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 ```text
 -rc vbr -cq 22 -tune hq -spatial-aq 1
 ```
+
+调整编码参数语义后会改 `ENCODER_ARGS_REV`（在 `_param_key` 里），让旧分段缓存整体失效——
+否则会用"旧语义"的分段续跑出新旧混编的成片。
 
 用途：GPU 编码器的速率控制/调优各家不同，没法做统一 UI。注意它是**本机执行的命令行参数**，
 只给可信的人用（面板有登录，但别把账号密码给不该给的人）。服务端限制：≤300 字符、不含换行。

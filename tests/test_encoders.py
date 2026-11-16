@@ -30,6 +30,10 @@ def main():
         ("qsv_h264 不接受 10bit（仍是 nv12）",
          "nv12" in args("qsv_h264", 10) and "p010le" not in args("qsv_h264", 10)),
         ("x265 10bit 走 yuv420p10le", "yuv420p10le" in args("x265", 10)),
+        ("svtav1 默认 tune=VQ(0)（不能落到 PSNR）", "tune=0" in args("svtav1", 8)),
+        ("svtav1 tune=vmaf → tune=5", "tune=5" in " ".join(
+            E.encoder_args("svtav1", 8, 8, tune="vmaf"))),
+        ("svtav1 不认名字形式（不得出现 tune=vq）", "tune=vq" not in args("svtav1", 8)),
         ("amf 10bit 仍是 8bit",
          "yuv420p" in args("amf", 10) and "10le" not in args("amf", 10)),
         ("硬件编码器都在回退名单里",

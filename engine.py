@@ -101,11 +101,12 @@ def _encoder_base(backend, quality, bitdepth=8, svt_preset=None, tune=None):
         # 用户主动选 svtav1 → 用 FLASHVSR_SVT_PRESET（默认 4，质量档）；
         # 作为**兜底**时由 encode_win 传 svt_preset="8"（4K 实测 p8 只要 p4 的 1/2.8 时间）
         preset = str(svt_preset or os.environ.get("FLASHVSR_SVT_PRESET", "4"))
-        svt = ["lp=4"]
-        if tune in SVT_TUNE_NUM:
-            # 必须传数值：`tune=vq` 这种名字 form 会被拒（Error parsing option tune: vq）
-            # 然后**静默退回 PSNR**，不报错。IQ(3) 只支持 all-intra，视频会直接失败，故不提供。
-            svt.append(f"tune={SVT_TUNE_NUM[tune]}")
+        # 默认必须是 VQ（0）：不传 tune 时 ffmpeg 封装给 SVT 的是 **PSNR**，
+        # 而 VQ 才是 SVT 的主观质量档（心理视觉优化）；PSNR/SSIM/VMAF 只是指标对齐用。
+        tune_num = SVT_TUNE_NUM.get(tune, 0)
+        svt = ["lp=4", f"tune={tune_num}"]
+        # 只能传数值：`tune=vq` 会被拒（Error parsing option tune: vq）然后静默退回 PSNR；
+        # IQ(3) 仅 all-intra/low-delay，视频直接失败，故不提供。
         return (["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
                  "-svtav1-params", ":".join(svt), "-g", "240", "-pix_fmt", "yuv420p"])
     if backend == "x265":
@@ -182,6 +183,9 @@ FALLBACK_CHAIN = {
 }
 
 CAPS_TTL = 7 * 86400
+
+# 编码参数语义变更时 +1：让旧的分段缓存整体失效（否则会用旧语义的成片续跑）
+ENCODER_ARGS_REV = 2
 
 
 def fallback_chain(backend):
@@ -719,6 +723,7 @@ def _param_key(params):
     # 空串与缺省必须等价，否则面板（resolve_params 给 ""）和引擎（没传）会算出不同键
     d["tune"] = str(params.get("tune") or "")
     d["extra_args"] = str(params.get("extra_args") or "").strip()
+    d["enc_rev"] = ENCODER_ARGS_REV
     return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 
 

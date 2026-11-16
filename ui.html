@@ -140,14 +140,14 @@
         <option value="8" selected>8 bit</option>
         <option value="10">10 bit（仅 x265）</option>
       </select>
-      <span class="lk" title="编码器调优（只有 CPU 编码器有统一入口）：x264/x265 用 -tune，svtav1 用 tune=vq/psnr/ssim；GPU 编码器请用开发模式自传参数">调优</span>
+      <span class="lk" title="编码器调优（只有 CPU 编码器有统一入口）：x264/x265 用 -tune；SVT-AV1 默认 tune=VQ（心理视觉，主观最优），VMAF/SSIM/PSNR 是对齐指标用；GPU 编码器走开发模式自传">调优</span>
       <select id="tune">
-        <option value="" selected>默认</option>
+        <option value="" selected>默认（AV1 = VQ 心理视觉）</option>
         <option value="ssim">ssim（结构相似）</option>
         <option value="psnr">psnr（信噪比）</option>
         <option value="vq">vq（AV1 主观）</option>
         <option value="ms_ssim">ms_ssim（AV1）</option>
-        <option value="vmaf">vmaf（AV1，主观+锐化）</option>
+        <option value="vmaf">vmaf（AV1，指标对齐+锐化）</option>
         <option value="film">film（x264 系）</option>
         <option value="animation">animation（x264 系）</option>
         <option value="grain">grain（保颗粒）</option>
