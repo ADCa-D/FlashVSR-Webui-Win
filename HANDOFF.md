@@ -92,6 +92,19 @@ for %f in (tests\test_*.py) do D:\ComfyUI_windows_portable\python_embeded\python
 8. **libplacebo 的 `preset=high_quality` 必须写成 `extra_opts=preset=high_quality`**（字典选项），且它会覆盖缩放器（VMAF −3.8）。
 9. **PSNR 不能用来判缩放器/后处理优劣**（本例里它给出与 VMAF 相反的排序）。
 10. 完整清单在知识库：`~/.config/opencode/reflection/`、`tricks/`、`have-solved/`（**先读这里，很多结论已经做过**）。
+11. **任务管理器里的"专用 GPU 内存 8.0/8.0 GB"是假象**：这台机器 ReBAR 开着
+    （`nvidia-smi -q` 里 BAR1 Total = 8192 MiB），任务管理器把 BAR1 映射窗口算成占用。
+    真实占用看 `nvidia-smi --query-gpu=memory.used`（空闲时是 0 MiB）。
+12. **PCIe 链路空载会降频到 Gen1**，负载时才升到 Gen4 x8（实测 10.3 GB/s ≈ 饱和）。
+    别拿空载时的 `pcie.link.gen.current=1` 当"链路有问题"的证据。
+13. **没有"每 tile 重新上传权重"这回事**：`TCDecoder` 只在第一次 pipe 调用时 CPU→GPU，
+    之后常驻；`torch.cuda.memory_allocated()` 稳定在 ~2725 MiB 不抖动。任务管理器里
+    Copy 引擎 ~3%、3D ~64%，说明是**算力跑满**，不是 PCIe 瓶颈。
+    推论：mmap+pin 只对"一次性加载"有意义（能省 2–4 s）；ReBAR 直写（CPU write-combining
+    写 VRAM）约 1–3 GB/s，**比 DMA 的 13 GB/s 更慢**，不要走。
+14. 量化权重有落盘缓存（`work/qcache/`，键 = checkpoint 的 size+mtime，1.34 GB）：
+    重复加载 22.8 s → 11.5 s。`FLASHVSR_QCACHE=0` 关闭。注意 commit 峰值（13 GB→10.7 GB）
+    和这个缓存关系不大——那段来自 5.4 GB f32 的读取/转换，不是量化。
 
 ## 8. bench/ 里能直接用的探针
 

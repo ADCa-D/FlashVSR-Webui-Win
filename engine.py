@@ -521,6 +521,13 @@ def install_stream_loader():
             return False
         orig = utils.load_state_dict_from_safetensors
 
+        # 缓存里已有的层：不读盘、不转 bf16，直接在显存里占位（真张量，不是 meta，
+        # 这样节点的 model.to(dtype, device) 不会崩）。随后 quantize_dit_mxfp8 会用
+        # 缓存里的 fp8 覆盖 forward 并把占位丢掉，所以这些空张量只活几秒。
+        skip = _qcache_keys(_qcache_path_static("mxfp8")) if \
+            os.environ.get("FLASHVSR_QCACHE", "1") != "0" else set()
+        dev_ph = "cuda" if torch.cuda.is_available() else "cpu"
+
         def patched(file_path, torch_dtype=None):
             """不用 safe_open（它 mmap 整个文件，5.4 GB 文件页会常驻工作集）。
 
@@ -536,6 +543,7 @@ def install_stream_loader():
             import torch as _t
 
             dev = "cuda" if _t.cuda.is_available() else "cpu"
+            skipped_n = 0
             np_dtype = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16,
                         "I64": np.int64, "I32": np.int32, "I16": np.int16,
                         "I8": np.int8, "U8": np.uint8, "BOOL": np.bool_}
@@ -546,6 +554,13 @@ def install_stream_loader():
                 base = 8 + hlen
                 for k, info in hdr.items():
                     if k == "__metadata__" or not isinstance(info, dict):
+                        continue
+                    _base = k[:-7] if k.endswith(".weight") else k
+                    if _base in skip:
+                        out[k] = torch.empty(info["shape"],
+                                             dtype=torch_dtype or torch.bfloat16,
+                                             device=dev_ph)
+                        skipped_n += 1
                         continue
                     beg, end = info["data_offsets"]
                     f.seek(base + beg)
@@ -563,6 +578,9 @@ def install_stream_loader():
                         ten = ten.to(torch_dtype)
                     out[k] = ten.to(dev)
                     del ten, arr, raw
+            if skipped_n:
+                print(f"[stream-load] 跳过 {skipped_n} 个已在缓存里的权重（不读盘、不转 bf16）",
+                      flush=True)
             return out
 
         def guarded(file_path, torch_dtype=None):
