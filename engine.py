@@ -417,6 +417,67 @@ def _uninstall_smooth_feather(mod):
         mod._fs_orig_feather = None
 
 
+def _gpu_canvas_fits(n_frames, h, w, scale, limit_gb=0.8):
+    """画布（fp16 NHWC）+ 权重图要多少显存；太大就回退 CPU 画布。"""
+    try:
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:  # noqa
+        return False
+    need = n_frames * (h * scale) * (w * scale) * 3 * 2 * 1.5   # canvas + wsum + 余量
+    return need < min(limit_gb * 2 ** 30, free * 0.5)
+
+
+def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
+                        sparse, kv, local, seed=0):
+    """和节点的 tiled_dit 分支等价，但**画布与混合都在 GPU 上**。
+
+    省掉的成本：每 tile 一次 `.to("cpu")`（8 帧 256² ≈ 3 MB PCIe）+ CPU 上的
+    float16 乘加（15 tile ≈ 0.5–0.8 s，且与 GPU 串行）。
+    """
+    device = pipe.device
+    dtype = pipe.torch_dtype
+    n0 = frames.shape[0]
+    add_n = mod.next_8n5(n0) - n0
+    if add_n > 0:
+        frames = torch.cat([frames, frames[-1:, :, :, :].repeat(add_n, 1, 1, 1)], dim=0)
+
+    N, H, W, C = frames.shape
+    canvas = torch.zeros((N, H * scale, W * scale, C), dtype=torch.float16, device=device)
+    wsum = torch.zeros((N, H * scale, W * scale, 1), dtype=torch.float16, device=device)
+    coords = mod.calculate_tile_coords(H, W, tile, tile_overlap)
+    pipe_cls = getattr(mod, "FlashVSRTinyLongPipeline", None)
+
+    for x1, y1, x2, y2 in mod.cqdm(coords, desc="Processing Tiles"):
+        input_tile = frames[:, y1:y2, x1:x2, :]
+        LQ_tile, th, tw, F = mod.prepare_input_tensor(input_tile, device, scale=scale, dtype=dtype)
+        if pipe_cls is not None and not isinstance(pipe, pipe_cls):
+            LQ_tile = LQ_tile.to(device)
+        out_gpu = pipe(
+            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
+            tiled=True, LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
+            is_full_block=False, if_buffer=True,
+            topk_ratio=sparse * 768 * 1280 / (th * tw), kv_ratio=kv, local_range=local,
+            color_fix=color_fix, unload_dit=False, force_offload=False)
+        tile_gpu = mod.tensor2video(out_gpu)                    # (F,H,W,C)
+        # 实测：tiny-long 的 pipe(...) 输出会落到 CPU（流式解码内部就搬了），
+        # 所以这里先对齐设备——若是 CPU 就 H2D（3 MB/tile ≈ 0.25 ms，可忽略），
+        # 换取混合在显存里做（省掉 CPU 上的 float16 乘加）。
+        if tile_gpu.device.type == "cpu":
+            tile_gpu = tile_gpu.to(device, non_blocking=True)
+        mask = _feather_mask((tile_gpu.shape[1], tile_gpu.shape[2]),
+                             int(tile_overlap) * scale, smooth=True).to(tile_gpu.device)
+        mask = mask.permute(0, 2, 3, 1).to(tile_gpu.dtype)
+        ox1, oy1 = x1 * scale, y1 * scale
+        ox2, oy2 = ox1 + tile_gpu.shape[2], oy1 + tile_gpu.shape[1]
+        canvas[:, oy1:oy2, ox1:ox2, :] += (tile_gpu * mask).to(torch.float16)
+        wsum[:, oy1:oy2, ox1:ox2, :] += mask.to(torch.float16)
+        del LQ_tile, out_gpu, tile_gpu
+        mod.clean_vram()
+
+    out = canvas / wsum.clamp_min_(1e-6)
+    return out[:n0]
+
+
 def flashvsr_aligned(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
                      sparse, kv, local, seed=0):
     """逐 tile 推理 + **偏置对齐** 的拼接（对应节点的 tiled_dit 分支）。
@@ -1332,15 +1393,21 @@ class Engine:
         state = {"n": 0}
 
         def _fast_clean_vram():
+            # 实测（8 帧 / tile128 / 2×）：每个 tile 做 gc+empty_cache 会让整轮慢 7%
+            # （去掉它 6.29s → 5.84s）；只做 gc.collect() 更慢 60%（它要遍历整个对象图）。
+            # empty_cache 会与驱动同步、把缓存还给系统，随后又得重新申请，纯负收益。
+            # 因此默认空操作；真要回收只在段与段之间做（见 upscale_video 的段循环）。
             state["n"] += 1
-            if state["n"] % 8 == 0:
+            if os.environ.get("FLASHVSR_AGGRESSIVE_GC") == "1" and state["n"] % 8 == 0:
                 _gc.collect()
-            torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
         self.mod.clean_vram = _fast_clean_vram
 
         # VAE 解码走 NHWC：实测 625 → 540 ms（−13.6%），输出逐位一致（maxdiff 0）
         try:
+            if os.environ.get("FLASHVSR_VAE_CL", "1") == "0":
+                raise RuntimeError("channels_last disabled by FLASHVSR_VAE_CL=0")
             dec = self.pipe.TCDecoder
             dec.to(memory_format=torch.channels_last)
             _orig_decode = dec.decode_video
@@ -1455,7 +1522,16 @@ class Engine:
             _f = torch.from_numpy(np.ascontiguousarray(frames_u8))
             # uint8 → [0,1] 需要缩放；float32 已是 [0,1]（不能原地除，否则会把 numpy 缓冲改坏）
             frames = _f.float().div_(255.0) if _f.dtype == torch.uint8 else _f.float()
-            if seam_fix == "align":
+            use_gpu_canvas = (os.environ.get("FLASHVSR_GPU_CANVAS", "1") != "0")
+            if use_gpu_canvas:
+                n_f, h_f, w_f = frames.shape[0], frames.shape[1], frames.shape[2]
+                if not _gpu_canvas_fits(n_f, h_f, w_f, int(scale)):
+                    use_gpu_canvas = False
+            if use_gpu_canvas:
+                out = flashvsr_gpu_canvas(
+                    mod, self.pipe, frames, int(scale), bool(color_fix), tile,
+                    int(tile_overlap), float(sparse), float(kv), int(local), 0)
+            elif seam_fix == "align":
                 _install_smooth_feather(mod)
                 out = flashvsr_aligned(
                     mod, self.pipe, frames, int(scale), bool(color_fix), tile,

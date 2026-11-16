@@ -860,6 +860,24 @@ flashvsr-web/
 **Q: 系统内存回收脚本（如 `mem-reclaim`）会不会打断推理**
 会 —— 全局 `EmptyWorkingSets` 会把解码帧踢进页面文件。本项目在任务运行时写 `pause.flag`（内容=PID），此类脚本校验 PID 存活即跳过；另有 `nvidia-smi` 利用率兜底。
 
+## 推理侧的三项实测优化（8 帧 / 2× / tile128 / mxfp8）
+
+| 改动 | 收益 | 说明 |
+|---|---|---|
+| 去掉每 tile 的 `gc.collect()+empty_cache()` | **6.29 → 5.84 s（−7%）** | `empty_cache` 与驱动同步、把缓存还给系统再重新申请；`gc.collect()` 单独更糟（要遍历整个对象图，慢 60%） |
+| TCDecoder `channels_last` | 5.96 → 5.79 s（−3%） | 保留（`FLASHVSR_VAE_CL=0` 可关） |
+| **拼接改 GPU 画布** | **5.85 → 5.53 s（−5.4%）** | tile 结果不再在 CPU 上做 float16 乘加；输出与 CPU 画布平均差 0.001/255、最大 1、99.9% 像素完全相同 |
+
+三项叠加：**6.29 → 5.53 s（−12%）**。
+
+细节：
+
+- GPU 画布会做显存门限：`帧数 × 输出分辨率 × 3 × 2B × 1.5 > 0.8 GB` 或超过空闲显存一半时**自动回退 CPU 画布**
+  （例如 21 帧 1080p→4K 就是回退，不会因此 OOM）。`FLASHVSR_GPU_CANVAS=0` 可强制关闭。
+- 注意 `tiny-long` 的 `pipe(...)` **输出会落到 CPU**（流式解码内部就搬了），所以 GPU 画布会做一次
+  H2D（约 3 MB/tile ≈ 0.25 ms），换来省掉 CPU 上 15 × 1.6M 元素的 float16 乘加——整体仍是净赚。
+- 想要回旧的"每 8 个 tile 清一次"行为：`FLASHVSR_AGGRESSIVE_GC=1`。
+
 ## 显存为什么不需要手动释放
 
 模型只存在于 **worker 子进程**里：任务结束（或取消、或崩溃）时进程退出，CUDA context 随之销毁，
