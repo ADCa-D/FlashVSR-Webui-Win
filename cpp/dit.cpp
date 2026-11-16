@@ -173,7 +173,26 @@ Tensor attention(const Tensor& q_in, const Tensor& k_in, const Tensor& v_in, int
     return torch::matmul(p, vh).transpose(1, 2).reshape({B, S, D}).to(q_in.dtype());
 }
 
-// Block-sparse self-attention, same blocking as sage: BLOCK_M = 128 query
+// Fast path: batched GEMM (cuBLAS, tensor cores) + one masked softmax.
+// At these shapes the kv span is tiny (kv_len=3 blocks -> Skv=384..1536), so a
+// dense score matrix is cheap; what killed the ATen version was 280 launches
+// per layer, not the FLOPs. 4 launches per layer instead.
+Tensor attention_fast(const Tensor& q, const Tensor& k, const Tensor& v, int64_t heads,
+                      const Tensor& mask_bias /* bf16 [B,H,S,Skv], 0 or -inf */) {
+    const auto B = q.size(0), S = q.size(1), D = q.size(2), hd = D / heads;
+    const auto Skv = k.size(1);
+    auto qh = q.view({B, S, heads, hd}).transpose(1, 2);
+    auto kh = k.view({B, Skv, heads, hd}).transpose(1, 2);
+    auto vh = v.view({B, Skv, heads, hd}).transpose(1, 2);
+    auto s = torch::matmul(qh, kh.transpose(2, 3)) * (1.0 / std::sqrt((double)hd));
+    s = s + mask_bias;
+    auto p = torch::softmax(s, -1);
+    p = torch::nan_to_num(p, 0.0);
+    auto o = torch::matmul(p, vh);
+    return o.transpose(1, 2).reshape({B, S, D});
+}
+
+
 // tokens, BLOCK_N = 64 kv tokens, block mask [B,H,Sq/128,Skv/64].
 //
 // This is the part that must NOT be done densely: a naive [B,H,S,S] score
@@ -371,7 +390,12 @@ static int run_main() {
         std::printf("rope cos[0][0]    %.8f   half=%lld\n", ca[0][0], (long long)cc.size(1));
     }
     auto blk_mask = ref.at("mask").to(torch::kFloat);   // [B,H,Sq/128,Skv/64]
+    // precompute the additive attention bias ONCE (0 / -inf); all 30 layers reuse it
+    auto mask_bias = torch::where(expand_mask(ref.at("mask")), 0.0,
+                                  -std::numeric_limits<double>::infinity())
+                         .to(torch::kBFloat16);
 
+    const bool prof = std::getenv("FLASH_DIT_PROF") != nullptr;
     auto run = [&](Tensor cur, const char* tag) {
         for (int64_t i = 0; i < kLayers; ++i) {
             const std::string p = "blocks." + std::to_string(i) + ".";
@@ -414,14 +438,14 @@ static int run_main() {
             q = q.view({1, block_n * q.size(1), kDim});
             k = k.view({1, block_n * k.size(1), kDim});
             v = v.view({1, block_n * v.size(1), kDim});
-            auto attn = attn::forward(q, k, v, blk_mask, kHeads, kDim / kHeads);
+            auto attn = attention_fast(q, k, v, kHeads, mask_bias);
             if (i == 0) {
-                // cross-check the fused kernel against the dense masked form
+                // cross-checks: dense fp32 reference and the fused JIT kernel
                 auto dense_mask = expand_mask(ref.at("mask"));
                 auto dense = attention(q, k, v, kHeads, &dense_mask);
-                report("jit=dense", attn, dense);
-                auto sparse_aten = attention_block_sparse(q, k, v, kHeads, blk_mask, true);
-                report("jit=aten ", attn, sparse_aten);
+                report("fast=dense", attn, dense);
+                auto jit = attn::forward(q, k, v, blk_mask, kHeads, kDim / kHeads);
+                report("fast=jit  ", attn, jit);
             }
             // b (block_n block_s) d -> (b block_n) block_s d -> reverse partition
             attn = attn.view({block_n, attn.size(1) / block_n, kDim});
@@ -450,11 +474,24 @@ static int run_main() {
             if (i == 0 && ref.count("block00")) report("block00", cur, ref.at("block00"));
             if (i == 15 && ref.count("block15")) report("block15", cur, ref.at("block15"));
             if (i == 29 && ref.count("block29")) report("block29", cur, ref.at("block29"));
+            if (prof && i < 28) {
+                static auto last = std::chrono::high_resolution_clock::now();
+                cudaDeviceSynchronize();
+                auto now = std::chrono::high_resolution_clock::now();
+                std::printf("   layer %2lld: %6.1f ms\n", (long long)i,
+                            std::chrono::duration<double, std::milli>(now - last).count());
+                last = now;
+            }
         }
         return cur;
     };
 
+    auto tl0 = std::chrono::high_resolution_clock::now();
     auto out = run(seq, "final");
+    cudaDeviceSynchronize();
+    std::printf("loop (30 layers): %.1f ms\n",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - tl0).count());
 
     // ---- head + unpatchify -------------------------------------------------
     auto hmods = (w("head.modulation") + t).chunk(2, 1);
@@ -487,6 +524,19 @@ static int run_main() {
         ev("layer_norm_plain", 30, [&] { auto r = layer_norm_plain(a, kEps); (void)r; });
         ev("gelu(8960)", 30, [&] { auto z = a.repeat({1, 1, 6}).contiguous();
                                    auto r = torch::gelu(z, "tanh"); (void)r; });
+        {
+            auto qq = torch::randn({1, 384, kDim}, opt);
+            auto bb = torch::where(expand_mask(ref.at("mask")), 0.0,
+                                   -std::numeric_limits<double>::infinity())
+                          .to(torch::kBFloat16);
+            ev("attn_fast(whole)", 30, [&] { auto r = attention_fast(qq, qq, qq, kHeads, bb); (void)r; });
+            auto qh = qq.view({1, 384, kHeads, 128}).transpose(1, 2);
+            auto kh = qq.view({1, 384, kHeads, 128}).transpose(1, 2);
+            ev("bmm qk", 30, [&] { auto r = torch::matmul(qh, kh.transpose(2, 3)); (void)r; });
+            auto sc = torch::matmul(qh, kh.transpose(2, 3));
+            ev("softmax(1,12,384,384)", 30, [&] { auto r = torch::softmax(sc, -1); (void)r; });
+            ev("add mask", 30, [&] { auto r = sc + bb; (void)r; });
+        }
     }
 
     auto t2 = std::chrono::high_resolution_clock::now();
