@@ -161,6 +161,24 @@ REM qsv_h264（H.264 8bit，兼容最老）：
 | HEVC 10bit（`bitdepth=10`） | 9 代 Kaby Lake |
 | AV1 编码 | 11 代 Tiger Lake（本项目未接 `av1_qsv`） |
 
+### 怎么做到"不确定硬件也能跑"
+
+二代到 14 代、乃至以后的核显，QSV 能力差异太大（编解码器、4K level、10bit、驱动新旧），
+**没有一份静态表可以写死**。所以本项目不猜，改成三层兜底：
+
+1. **按目标分辨率当场验证**（`probe_encoders(w, h)`）
+   不是用 256×256 试，而是用**这次要输出的分辨率**（4K 就试 4K）各编 1 帧。
+   老核显"支持 H.264 但撑不住 4K level"这种情况，只有这样才能提前发现。
+   结果缓存在 `work/encoder_caps.json`（同一块 GPU + 同一尺寸，7 天内复用，二次启动 0 秒）。
+2. **编码失败沿阶梯降级**（`FALLBACK_CHAIN`）
+   `qsv → qsv_h264 → x265 → cpu`（NVENC/AMF/SVT-AV1 也都收敛到 `x265 → cpu`），
+   第一段失败后就把 `backend` 换成能用的那个，后续段不再重试失败项。
+3. **只降级，不中断**：每一步都往进度里写原因（如 `Error creating a MFX session: -9`），
+   所以"跑不通"发生在第 1 段的前 2 秒，而不是跑完 87 段后才发现。
+
+`auto` 的实际选择顺序是 **cpu → x265 → nvenc → qsv → qsv_h264 → amf**：
+GPU 编码会和推理抢显存与功耗预算（实测 NVENC/AMF 都不划算），只当 CPU 不可用时兜底。
+
 **失败即回退**：任何硬件编码器（`qsv`/`qsv_h264`/`nvenc`/`av1_nvenc`/`amf`）初始化失败，
 都会自动改用 `x265` 继续编码，并在进度里写明原因（例如 `Error creating a MFX session: -9`）。
 所以即使 QSV 在你机器上跑不通，也只是慢一点，不会让跑了几小时的任务白费。

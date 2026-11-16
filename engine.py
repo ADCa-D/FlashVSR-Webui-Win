@@ -96,58 +96,124 @@ def encoder_args(backend, quality, bitdepth=8):
             "-threads", "4", "-pix_fmt", "yuv420p"]
 
 
-# 走 GPU 编码的引擎：初始化失败（驱动/核显不支持该 codec）时自动回退 CPU
+# 走 GPU 编码的引擎：初始化失败（驱动/核显不支持该 codec，或撑不住目标分辨率）时自动降级
 HW_ENCODERS = ("nvenc", "av1_nvenc", "qsv", "qsv_h264", "amf")
 
+# 降级阶梯：先同族（HEVC→H.264），再 CPU 高质量（x265），最后最兼容（x264）
+FALLBACK_CHAIN = {
+    "qsv": ("qsv_h264", "x265", "cpu"),
+    "qsv_h264": ("x265", "cpu"),
+    "nvenc": ("x265", "cpu"),
+    "av1_nvenc": ("x265", "cpu"),
+    "amf": ("x265", "cpu"),
+    "svtav1": ("x265", "cpu"),
+    "x265": ("cpu",),
+    "cpu": (),
+}
 
-def probe_encoders():
-    src = ["-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=0.2", "-frames:v", "1"]
+CAPS_TTL = 7 * 86400
+
+
+def _caps_file():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "work", "encoder_caps.json")
+
+
+def _gpu_tag():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:  # noqa
+        pass
+    return "unknown"
+
+
+def _load_caps_cache():
+    try:
+        with open(_caps_file(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa
+        return {}
+
+
+def _save_caps_cache(data):
+    try:
+        os.makedirs(os.path.dirname(_caps_file()), exist_ok=True)
+        tmp = _caps_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _caps_file())
+    except Exception:  # noqa
+        pass
+
+
+def probe_encoders(w=256, h=256):
+    """在**实际目标分辨率**上各编 1 帧，判断这个编码器在本机+本尺寸下能不能用。
+
+    为什么不用 256×256：老核显可能支持 H.264，但 4K（level 5.1+）超规格 —
+    小尺寸探测通过、真跑 4K 就失败，等于白等几小时。
+    """
+    w = max(64, int(w) // 2 * 2)
+    h = max(64, int(h) // 2 * 2)
+    src = ["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=5:d=0.2", "-frames:v", "1"]
     out = {}
     for be in ("cpu", "nvenc", "qsv", "qsv_h264", "amf", "svtav1", "av1_nvenc", "x265"):
         try:
             r = subprocess.run(
                 [FFMPEG, "-hide_banner", "-v", "error"] + src + encoder_args(be, 18) + ["-f", "null", "-"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             if r.returncode == 0:
                 out[be] = dict(ok=True, detail="")
             else:
-                # 从 stderr 里挑出真正有信息量的那行（编码器初始化失败比 "no packets" 有用）
+                # 从 stderr 里挑出真正有信息量的那行（初始化失败比 "no packets" 有用）
                 lines = [l.strip() for l in (r.stderr or "").splitlines() if l.strip()]
                 key = [l for l in lines if any(k in l.lower() for k in
-                                               ("error", "invalid", "not support", "failed", "cannot", "unable", "api"))]
+                                               ("error", "invalid", "not support", "failed",
+                                                "cannot", "unable", "api", "mfx"))]
                 pick = (key or lines or ["未知错误"])
                 out[be] = dict(ok=False, detail=" / ".join(pick[:2])[:220])
         except Exception as e:  # noqa
             out[be] = dict(ok=False, detail=f"{type(e).__name__}: {e}")
     if out["cpu"]["ok"]:
         out["auto"] = dict(ok=True, detail="CPU 优先")
-    elif out.get("nvenc", {}).get("ok"):
-        out["auto"] = dict(ok=True, detail="回退 NVENC")
-    elif out.get("amf", {}).get("ok"):
-        out["auto"] = dict(ok=True, detail="回退 AMF")
+    elif out.get("x265", {}).get("ok"):
+        out["auto"] = dict(ok=True, detail="回退 x265")
     else:
-        out["auto"] = dict(ok=False, detail="没有可用的 H.264 编码器")
+        out["auto"] = dict(ok=False, detail="没有可用的编码器")
     return out
 
 
-_CAPS = None
+_CAPS = {}
 
 
-def get_caps(force=False):
-    global _CAPS
-    if _CAPS is None or force:
-        _CAPS = probe_encoders()
-    return _CAPS
+def get_caps(force=False, w=256, h=256):
+    """按 (GPU, w×h) 取能力表；有 7 天内的缓存就直接用，省掉每次开任务的探测时间。"""
+    w = max(64, int(w) // 2 * 2)
+    h = max(64, int(h) // 2 * 2)
+    key = f"{_gpu_tag()}|{w}x{h}"
+    if not force and key in _CAPS:
+        return _CAPS[key]
+    cache = _load_caps_cache()
+    ent = cache.get(key)
+    if not force and ent and time.time() - float(ent.get("ts") or 0) < CAPS_TTL:
+        _CAPS[key] = ent["caps"]
+        return _CAPS[key]
+    caps = probe_encoders(w, h)
+    _CAPS[key] = caps
+    cache[key] = dict(ts=int(time.time()), caps=caps)
+    _save_caps_cache(cache)
+    return caps
 
 
-def resolve_encoder(requested, caps=None):
-    caps = caps or get_caps()
+def resolve_encoder(requested, caps=None, w=256, h=256):
+    """把用户选的编码器解析成"本机真能跑"的那个（不可用就走 auto 顺序）。"""
+    caps = caps or get_caps(w=w, h=h)
     be = requested if requested in ENCODER_CHOICES else "auto"
     if be != "auto" and caps.get(be, {}).get("ok"):
         return be
-    if caps.get("cpu", {}).get("ok"):
-        return "cpu"
-    for alt in ("nvenc", "qsv", "qsv_h264", "amf"):
+    # auto / 不可用的显式选择 → CPU 优先（实测：GPU 编码会抢推理的显存与功耗预算，
+    # AMF 画质还明显更差，所以硬件编码器只排在后面当兜底）
+    for alt in ("cpu", "x265", "nvenc", "qsv", "qsv_h264", "amf"):
         if caps.get(alt, {}).get("ok"):
             return alt
     return "cpu"
@@ -1195,7 +1261,10 @@ class Engine:
         audio = src if info["has_audio"] else None
         quality = int(params.get("quality") or 15)
         bitdepth = int(params.get("bitdepth") or 8)
-        backend = resolve_encoder(params.get("encoder"))
+        # 能力探测用**输出分辨率**：老核显能编 H.264 不代表能编 4K
+        caps = get_caps(w=int(info["w"]) * int(params["scale"]),
+                        h=int(info["h"]) * int(params["scale"]))
+        backend = resolve_encoder(params.get("encoder"), caps)
         if bitdepth == 10 and backend not in ("x265", "qsv"):
             # x265 与 hevc_qsv 能出 main10；其余（含 AMF/NVENC）只有 8bit
             on_stage("encode", 0, 0,
@@ -1204,20 +1273,33 @@ class Engine:
         budget_mode = params.get("budget") or "auto"
 
         def encode_win(frames_in, path, audio_src=None):
-            """统一编码入口：硬件编码器初始化失败 → 自动回退 x265（并说明原因）。"""
-            nonlocal backend
-            try:
-                encode_frames(frames_in, info["fps"], path, audio_src,
-                              quality=quality, backend=backend, bitdepth=bitdepth)
-            except RuntimeError as e:
-                if backend not in HW_ENCODERS:
-                    raise
-                msg = str(e).strip().splitlines()[-1][:140] if str(e).strip() else "未知错误"
-                on_stage("encode", 0, 0,
-                         f"{backend} 编码失败（多半是核显/驱动不支持该 codec），自动回退 x265：{msg}")
-                backend = "x265"
-                encode_frames(frames_in, info["fps"], path, audio_src,
-                              quality=quality, backend=backend, bitdepth=bitdepth)
+            """统一编码入口：沿 FALLBACK_CHAIN 降级（qsv→qsv_h264→x265→cpu），并记住能用的那个。
+
+            这样"哪代核显支持什么"不需要我们预先知道——本机当场试，失败就换下一个，
+            且只在第一次失败时付出探测成本（之后 backend 已经改成可用的那个）。
+            """
+            nonlocal backend, bitdepth
+            chain = (backend,) + tuple(FALLBACK_CHAIN.get(backend, ())) + ("cpu",)
+            seen, last = set(), "未知错误"
+            for be in chain:
+                if be in seen:
+                    continue
+                seen.add(be)
+                bd = bitdepth
+                if bd == 10 and be not in ("x265", "qsv"):
+                    bd = 8                 # 只有 x265 / hevc_qsv 能出 10bit
+                try:
+                    encode_frames(frames_in, info["fps"], path, audio_src,
+                                  quality=quality, backend=be, bitdepth=bd)
+                    if be != backend:
+                        on_stage("encode", 0, 0,
+                                 f"编码器 {backend} 不可用，已改用 {be}（后续段沿用）")
+                        backend, bitdepth = be, bd
+                    return
+                except RuntimeError as e:
+                    last = (str(e).strip().splitlines() or ["未知错误"])[-1][:160]
+                    on_stage("encode", 0, 0, f"{be} 编码失败：{last}")
+            raise RuntimeError(f"所有编码器都失败，最后一次：{last}")
 
         def budget_for(win_u8, kv):
             if budget_mode != "auto" or len(win_u8) < 2:
