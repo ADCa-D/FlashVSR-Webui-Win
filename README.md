@@ -617,7 +617,21 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
    `Tune VMAF: a pre-processing / unsharp masking is applied`），适合"对齐 VMAF 指标"，
    不适合追求自然观感。
 
-### 开发模式（自定义编码参数）
+### 开发模式（面板底部，收纳所有"待完善 / 不稳定"的选项）
+
+主面板只放稳定项。勾上底部的「开发模式」才会出现：
+
+| 选项 | 状态 |
+|---|---|
+| 浮点解码（`hi_precision`） | 实验：内存 4×，端到端 PSNR 42.36 dB 的差异，收益未定 |
+| tile 提到 192 | 更快，但高分辨率素材更容易 OOM |
+| 接缝修正 `seam_fix` | `align` 实测无收益（0.54→0.59），只作对照；默认 `smooth` |
+| 附加编码参数（`extra_args`） | GPU 编码器的速率控制/调优没有统一入口，需要自己传 |
+
+**关闭开发模式时，上面四项一律按稳定默认值下发**（`hi_precision=0`、`seam_fix=smooth`、
+不加 extra、不用 tile192），避免"上次在开发模式里试过的东西"悄悄带进正式任务。
+
+
 
 面板勾「开发模式」后出现一个输入框，内容会**原样追加**到 ffmpeg 编码参数末尾
 （后写的覆盖前面的），例如 NVIDIA：

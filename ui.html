@@ -68,6 +68,8 @@
   .modal .detail{color:var(--dim);font-size:12.5px;line-height:1.7}
   .modal .detail b{color:var(--ok)}
   .modal .detail code{background:#0f131b;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:11.5px}
+.dev{margin-top:14px;border-top:1px dashed var(--line,#262b36);padding-top:12px}
+.devBody{margin-top:8px;padding:10px 12px;border:1px dashed var(--line,#262b36);border-radius:10px}
 </style>
 </head>
 <body>
@@ -97,7 +99,6 @@
       <span style="color:var(--dim);font-size:12.5px">scale</span><input id="scale" type="number" min="2" max="4" step="1" value="4" disabled />
       <span style="color:var(--dim);font-size:12.5px">tile</span><input id="tile" type="number" min="64" max="512" step="32" value="128" disabled />
       <span style="color:var(--dim);font-size:12.5px">kv</span><input id="kv" type="number" min="1" max="4" step="0.5" value="3" disabled />
-      <label class="chk" title="量化后 tile192 更快，但高分辨率素材容易 OOM"><input type="checkbox" id="tileUp" /> tile 提到 192</label>
       <span style="color:var(--dim);font-size:12.5px" title="tile 之间的羽化带（像素）。24 是画质默认，越小 tile 数越少、越快">重叠</span>
       <input id="tileOv" type="number" min="0" max="128" step="4" value="0" title="tile 重叠（羽化带）：0 = 自动（tile/4，tile128→32、tile256→64）；手动填小可省时间，但接缝更明显" />
     </div>
@@ -155,10 +156,6 @@
         <option value="fastdecode">fastdecode（解码省算力）</option>
         <option value="zerolatency">zerolatency（低延迟）</option>
       </select>
-      <label class="chk" title="解码走 libplacebo 的 gbrpf32le：YUV→RGB 全程 float32，不经 rgb24 的 8bit 量化。56 帧 1080p 约多花 0.8 s，内存 4×（超过 2 GB 窗口自动回退）"><input type="checkbox" id="hiPrec" /> 浮点解码</label>
-      <label class="chk" title="开发模式：显示「附加编码参数」。GPU 编码器的速率控制/调优没有统一入口，需要自己传（例如 -rc vbr -cq 22 -tune hq）"><input type="checkbox" id="devMode" /> 开发模式</label>
-      <input id="extraArgs" type="text" placeholder="附加参数：-rc vbr -cq 22"
-             style="display:none;width:240px;font-family:var(--mono, monospace)" />
       <span class="lk">权重</span>
       <select id="quant">
         <option value="mxfp8" selected>MXFP8（推荐）</option>
@@ -181,6 +178,34 @@
 
     <div class="row">
       <label class="chk"><input type="checkbox" id="budgetAuto" checked /> 运动自适应预算（静止镜头省算力）</label>
+    </div>
+
+    <div class="dev">
+      <label class="chk" title="展开「待完善 / 不稳定」的选项。关闭时这些参数一律回到稳定默认值">
+        <input type="checkbox" id="devMode" /> 开发模式（实验项与不稳定功能）
+      </label>
+      <div id="devBody" class="devBody" style="display:none">
+        <div class="row">
+          <label class="chk" title="解码走 libplacebo 的 gbrpf32le：YUV→RGB 全程 float32，不经 rgb24 的 8bit 量化。内存 4×，超过 2 GB 窗口自动回退">
+            <input type="checkbox" id="hiPrec" /> 浮点解码
+          </label>
+          <label class="chk" title="量化后 tile192 更快，但高分辨率素材容易 OOM">
+            <input type="checkbox" id="tileUp" /> tile 提到 192
+          </label>
+          <span class="lk" title="tile 拼接方式：smooth=平滑羽化（默认，4K 实测无接缝）；align=逐块 DC 对齐（实测无收益）；off=线性羽化（对照用）">接缝修正</span>
+          <select id="seamFix">
+            <option value="smooth" selected>平滑羽化（默认）</option>
+            <option value="align">偏置对齐（实验，实测无收益）</option>
+            <option value="off">线性羽化（对照）</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="lk" title="原样追加到 ffmpeg 编码参数末尾（后写的覆盖前面的），≤300 字符、不含换行">附加编码参数</span>
+          <input id="extraArgs" type="text" placeholder="-rc vbr -cq 22 -tune hq"
+                 style="width:280px;font-family:var(--mono, monospace)" />
+          <span class="hint" style="margin:0">GPU 编码器的速率控制/调优没有统一入口，需要自己传</span>
+        </div>
+      </div>
     </div>
 
     <div class="row" style="margin-top:16px">
@@ -282,15 +307,17 @@ function collectFields(){
   o.encoder = $('#encoder').value;
   o.quality = $('#quality').value;
   o.bitdepth = $('#bitdepth').value;
-  o.hi_precision = $('#hiPrec').checked ? '1' : '0';
+  const dev = $('#devMode').checked;
+  o.hi_precision = (dev && $('#hiPrec').checked) ? '1' : '0';
   o.tune = $('#tune').value;
-  if ($('#devMode').checked) o.extra_args = $('#extraArgs').value;
+  o.seam_fix = dev ? $('#seamFix').value : 'smooth';
+  if (dev) o.extra_args = $('#extraArgs').value;
   o.quant = $('#quant').value;
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
   o.tile_overlap = $('#tileOv').value;
   o.preview = $('#previewOn').checked ? '1' : '0';
-  if ($('#tileUp').checked) o.tile_up = '1';
+  if (dev && $('#tileUp').checked) o.tile_up = '1';
   return o;
 }
 
@@ -495,8 +522,8 @@ $('#bitdepth').addEventListener('change', updateEncHint);
 // ---------- 开发模式：附加编码参数
 (() => {
   const dev = $('#devMode');
-  const box = $('#extraArgs');
-  const apply = () => { box.style.display = dev.checked ? '' : 'none'; };
+  const body = $('#devBody');
+  const apply = () => { body.style.display = dev.checked ? '' : 'none'; };
   dev.checked = localStorage.getItem('fs_dev') === '1';
   apply();
   dev.onchange = () => { localStorage.setItem('fs_dev', dev.checked ? '1' : '0'); apply(); };
