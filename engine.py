@@ -897,6 +897,88 @@ def quantize_dit_w8a16(pipe, log=None):
     return n
 
 
+QCACHE_REV = 1            # 权重格式/量化实现变了就 +1，旧缓存自动失效
+
+
+def _qcache_dir():
+    d = os.environ.get("FLASHVSR_QCACHE_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "work", "qcache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _qcache_path(pipe, quant):
+    """缓存键：DiT 前 8 个 Linear 的形状 + 权重切片哈希 + 量化档 + 格式版本。
+
+    刻意不 hash 5.4 GB（那本身就慢）；8×256 个数足以区分不同 checkpoint，
+    换模型/换量化实现都会变。
+    """
+    try:
+        import hashlib
+        h = hashlib.sha1()
+        cnt = 0
+        for name, m in _iter_linears(pipe.dit):
+            w = getattr(m, "weight", None)
+            if w is None:
+                continue
+            h.update(f"{name}{tuple(w.shape)}".encode())
+            h.update(w.detach().flatten()[:256].float().cpu().numpy().tobytes())
+            cnt += 1
+            if cnt >= 8:
+                break
+        if cnt == 0:
+            return None
+        key = f"dit_{h.hexdigest()[:16]}_{quant}_v{QCACHE_REV}"
+        return os.path.join(_qcache_dir(), key + ".safetensors")
+    except Exception:
+        return None
+
+
+def _qcache_load(path, log=None):
+    """读缓存 → {layer: (wq, wb)}；格式不对就当没有。"""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        from safetensors.torch import load_file
+        d = load_file(path, device="cuda")
+        out = {}
+        for k in d:
+            if not k.endswith("|q"):
+                continue
+            name = k[:-2]
+            b = d.get(name + "|b")
+            if b is None:
+                return None
+            out[name] = (d[k].view(torch.float8_e4m3fn), b.view(torch.float8_e8m0fnu))
+        if log:
+            log(f"量化缓存命中：{len(out)} 层（{os.path.getsize(path) / 2**30:.2f} GB）")
+        return out or None
+    except Exception as e:  # noqa
+        if log:
+            log(f"量化缓存读取失败（忽略，重新量化）: {e}")
+        return None
+
+
+def _qcache_save(path, items, log=None):
+    """原子写：先写 .tmp 再 rename，中断不会留半截文件。"""
+    if not path or not items:
+        return
+    try:
+        from safetensors.torch import save_file
+        blob = {}
+        for name, (wq, wb) in items.items():
+            blob[name + "|q"] = wq.contiguous().view(torch.uint8).cpu()
+            blob[name + "|b"] = wb.contiguous().view(torch.uint8).cpu()
+        tmp = path + ".tmp"
+        save_file(blob, tmp)
+        os.replace(tmp, path)
+        if log:
+            log(f"量化缓存已写盘：{len(items)} 层（{os.path.getsize(path) / 2**30:.2f} GB）")
+    except Exception as e:  # noqa
+        if log:
+            log(f"量化缓存落盘失败（不影响本次运行）: {e}")
+
+
 def quantize_dit_mxfp8(pipe, log=None):
     """MXFP8（e4m3 + 每 32 元素 e8m0）。Ada/Hopper/Blackwell 都有原生 FP8 张量核。
 
@@ -911,29 +993,45 @@ def quantize_dit_mxfp8(pipe, log=None):
         y = ck.scaled_mm_mxfp8(xq, wq, xb, wb, bias=bias, out_dtype=x.dtype)
         return y.reshape(*shp[:-1], y.shape[-1])
 
-    n = skipped = 0
+    # 权重是**确定的产物**：算一次就落盘，之后直接复用。
+    # 除了省一次量化，更重要的是把量化期间的 commit 峰值削掉——那一段会把机器逼进
+    # 页文件交换（实测 commit 峰值 12.5 GB），页文件写入才是真伤 SSD 的东西。
+    use_cache = os.environ.get("FLASHVSR_QCACHE", "1") != "0"
+    cache_path = _qcache_path(pipe, "mxfp8") if use_cache else None
+    cached = _qcache_load(cache_path, log) if cache_path else None
+    fresh = {}
+
+    n = skipped = n_hit = 0
     for name, m in _iter_linears(pipe.dit):
         if not _should_quant(name):
             skipped += 1
             continue
-        w = _take_weight(m)
-        if w is None or w.shape[1] % 32 != 0:
-            skipped += 1
-            continue
-        try:
-            wq, wb = ck.quantize_mxfp8(w)
-        except Exception as e:  # noqa
-            if log:
-                log(f"mxfp8 量化失败 {name}: {e}")
-            skipped += 1
-            continue
+        hit = cached.get(name) if cached else None
+        if hit is not None:
+            wq, wb = hit
+            n_hit += 1
+        else:
+            w = _take_weight(m)
+            if w is None or w.shape[1] % 32 != 0:
+                skipped += 1
+                continue
+            try:
+                wq, wb = ck.quantize_mxfp8(w)
+                fresh[name] = (wq, wb)
+            except Exception as e:  # noqa
+                if log:
+                    log(f"mxfp8 量化失败 {name}: {e}")
+                skipped += 1
+                continue
         bias = None if m.bias is None else m.bias.detach()
         m.forward = (lambda x, _q=wq, _s=wb, _b=bias: _call(x, _q, _s, _b))
         _drop_weight(m)
         n += 1
+    if fresh and cache_path:
+        _qcache_save(cache_path, fresh, log)
     torch.cuda.empty_cache()
     if log:
-        log(f"MXFP8: {n} 个 Linear 已量化，跳过 {skipped}")
+        log(f"MXFP8: {n} 个 Linear（缓存命中 {n_hit}，本次新量化 {len(fresh)}），跳过 {skipped}")
     return n
 
 
@@ -1295,6 +1393,12 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
 
 def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=15,
                     bitdepth=8, tune=None, extra=None):
+    """拼接分段，**一次成型**：concat 与音轨封装放在同一条 ffmpeg 命令里。
+
+    改之前是"分段 → concat_video.mp4 → 再封装音轨"：一个任务写盘量 = 输出大小的 3 倍
+    （分段 1x + 中间文件 1x + 成品 1x），中间文件还留在 work/ 里。现在压到 2x
+    （分段 + 成品），不再产生中间文件。对机械盘 / QLC SSD 的寿命影响明显。
+    """
     if not seg_paths:
         raise RuntimeError("没有可拼接的分段")
     tmp_dir = os.path.dirname(seg_paths[0])
@@ -1303,36 +1407,83 @@ def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=
         for p in seg_paths:
             f.write("file '%s'\n" % p.replace("\\", "/").replace("'", "'\\''"))
 
-    silent = os.path.join(tmp_dir, "concat_video.mp4")
     base = ([FFMPEG, "-y", "-v", "error"] + encoder_global_args(backend)
             + ["-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", list_path])
-    r = subprocess.run(base + ["-c", "copy", silent],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if r.returncode != 0 or not os.path.exists(silent) or os.path.getsize(silent) < 1024:
-        r = subprocess.run(base + encoder_args(backend, quality, bitdepth, None, tune, extra)
-                           + [silent],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if r.returncode != 0:
-            raise RuntimeError("分段拼接失败：" + (r.stderr or "")[-400:])
+    if audio_src:
+        base += ["-i", audio_src]
+
+    def _ok(*args):
+        return subprocess.run(args, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+
+    def _done():
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 1024
 
     if audio_src:
-        r = subprocess.run(
-            [FFMPEG, "-y", "-v", "error", "-i", silent, "-i", audio_src,
-             "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
-             "-c", "copy", "-shortest", out_path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if r.returncode != 0:
-            # 字幕/音轨封装失败时退回只带音轨（很多 mp4 没有字幕流，-map 1:s? 本身不会报错）
-            r = subprocess.run(
-                [FFMPEG, "-y", "-v", "error", "-i", silent, "-i", audio_src,
-                 "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-shortest", out_path],
-                capture_output=True, text=True, encoding="utf-8", errors="replace")
+        for maps in (["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?"],
+                     ["-map", "0:v:0", "-map", "1:a?"]):
+            r = _ok(*(base + maps + ["-c", "copy", "-shortest", out_path]))
+            if r.returncode == 0 and _done():
+                return
+        r = _ok(*(base + ["-map", "0:v:0", "-map", "1:a?"]
+                  + encoder_args(backend, quality, bitdepth, None, tune, extra)
+                  + ["-c:a", "copy", "-shortest", out_path]))
+        if r.returncode == 0 and _done():
+            return
+    else:
+        r = _ok(*(base + ["-c", "copy", out_path]))
+        if r.returncode == 0 and _done():
+            return
+        r = _ok(*(base + encoder_args(backend, quality, bitdepth, None, tune, extra) + [out_path]))
+        if r.returncode == 0 and _done():
+            return
+
+    # 全失败才退回"中间文件"路径，并且立刻删掉中间文件
+    silent = os.path.join(tmp_dir, "concat_video.mp4")
+    r = _ok(*([FFMPEG, "-y", "-v", "error"] + encoder_global_args(backend)
+              + ["-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", list_path,
+                 "-c", "copy", silent]))
+    if r.returncode != 0 or not os.path.exists(silent):
+        raise RuntimeError("分段拼接失败：" + (r.stderr or "")[-400:])
+    if audio_src:
+        r = _ok(*([FFMPEG, "-y", "-v", "error", "-i", silent, "-i", audio_src,
+                   "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-shortest", out_path]))
         if r.returncode != 0:
             shutil.move(silent, out_path)
         else:
-            os.remove(silent)
+            try:
+                os.remove(silent)
+            except OSError:
+                pass
     else:
         shutil.move(silent, out_path)
+
+
+def prune_segments(root, keep_days=None, max_dirs=None):
+    """清理过期的分段缓存（续跑用）。默认保留 7 天 / 最近 8 个任务。
+
+    分段文件 = 整个输出大小，不清会一直涨；反复写盘对 SSD 寿命也不友好。
+    """
+    if keep_days is None:
+        keep_days = float(os.environ.get("FLASHVSR_SEG_KEEP_DAYS", "7"))
+    if max_dirs is None:
+        max_dirs = int(os.environ.get("FLASHVSR_SEG_KEEP_DIRS", "8"))
+    removed = 0
+    try:
+        if not os.path.isdir(root):
+            return 0
+        paths = [os.path.join(root, d) for d in os.listdir(root)
+                 if os.path.isdir(os.path.join(root, d))]
+        paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        now = time.time()
+        for i, p in enumerate(paths):
+            if ((keep_days > 0 and (now - os.path.getmtime(p)) > keep_days * 86400)
+                    or (max_dirs > 0 and i >= max_dirs)):
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+    except Exception:
+        return removed
+    return removed
 
 
 # ---------------------------------------------------------------- 引擎
@@ -2016,6 +2167,10 @@ class Engine:
         src_sig = dict(size=os.path.getsize(src), hash=quick_hash(src))
         pkey = _param_key(params)
         root = seg_root_dir(params)
+        # 顺手清掉过期分段缓存（默认 7 天 / 最近 8 个任务，可用环境变量调）
+        pruned = prune_segments(root)
+        if pruned:
+            on_stage("seg", 0, 0, f"已清理 {pruned} 个过期分段缓存（省盘）")
         seg_dir = os.path.join(root, f"{src_sig['hash']}_{pkey}")
         if params.get("restart"):
             shutil.rmtree(seg_dir, ignore_errors=True)
