@@ -178,8 +178,9 @@ downscaler=ewa_lanczos4sharpest:deband=1:deband_grain=0:dithering=blue
 
 - **去色带**：默认阈值下把平台从 40px 打碎到 26px、层级从 26 增到 30，代价 50 帧 +0.2 s；
   它会给平坦区加细颗粒（`deband_grain` 默认 6，设 0 可关）。
-- **抖动**：本机枚举只有 `none / blue / ordered / ordered_fixed / white`，
-  **没有 `error_diffusion`**（传了会被忽略）。默认 `blue`，一般不用改。
+- **抖动**：实际只有 **`blue`（蓝噪声，默认）** 和 **`ordered_fixed`（固定有序矩阵）** 值得用；
+  `none` 可关掉，`error_diffusion` 本机不存在（传了会被忽略，项目里也不会暴露）。
+  默认 `blue`，一般不用改。
 - 开关位置：面板「开发模式 → 去色带 / 抖动」；CLI `--deband --deband-grain 0 --dither blue`。
 
 ## 用 Vulkan 跑？分两件事说清

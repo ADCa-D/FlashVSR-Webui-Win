@@ -65,7 +65,8 @@ SCALERS = ("ewa_lanczos4sharpest", "ewa_lanczos", "lanczos", "spline36", "sinc",
            "bicubic", "bilinear", "nearest")
 DEFAULT_SCALER = "ewa_lanczos4sharpest"
 # libplacebo 的抖动方式（本机枚举，没有 error_diffusion）
-DITHERS = ("", "blue", "ordered", "ordered_fixed", "white")
+# 实际可用/可推荐的只有 blue 与 ordered_fixed（ordered / white 虽能跑，属实现变体，不暴露）
+DITHERS = ("", "blue", "ordered_fixed")
 
 TUNE_ALL = ("", "ssim", "psnr", "vq", "vmaf", "ms_ssim", "film", "animation",
             "grain", "stillimage", "fastdecode", "zerolatency")

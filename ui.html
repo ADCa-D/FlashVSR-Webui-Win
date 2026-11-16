@@ -212,13 +212,11 @@
             <option value="bilinear">bilinear</option>
           </select>
           <label class="chk" title="libplacebo 去色带：把平滑渐变里的台阶打碎（实测最长同值平台 40px→26px，代价 50 帧 +0.2 s）。会给平坦区域加细颗粒，可用 deband_grain=0 关掉"><input type="checkbox" id="deband" /> 去色带</label>
-          <span class="lk" title="输出 8bit 时的抖动方式；本机只有 blue/ordered/ordered_fixed/white（没有 error_diffusion）">抖动</span>
+          <span class="lk" title="输出抖动方式：blue=蓝噪声（libplacebo 默认，推荐）、ordered_fixed=固定有序矩阵">抖动</span>
           <select id="dither">
-            <option value="" selected>不指定</option>
-            <option value="blue">blue（蓝噪声，推荐）</option>
-            <option value="ordered">ordered</option>
-            <option value="ordered_fixed">ordered_fixed</option>
-            <option value="white">white</option>
+            <option value="" selected>不指定（默认 blue）</option>
+            <option value="blue">blue（蓝噪声）</option>
+            <option value="ordered_fixed">ordered_fixed（有序矩阵）</option>
           </select>
           <label class="chk" title="勾上后才把下面的参数透传给 ffmpeg"><input type="checkbox" id="extraOn" /> 自定义编码参数</label>
           <input id="extraArgs" type="text" placeholder="-rc vbr -cq 22 -tune hq"

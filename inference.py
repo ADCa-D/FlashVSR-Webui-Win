@@ -96,7 +96,7 @@ def main():
     ap.add_argument("--deband-grain", type=float, default=None,
                     help="去色带时加的颗粒量（默认由 libplacebo 决定，0=不加）")
     ap.add_argument("--dither", default="", choices=[""] + list(E.DITHERS),
-                    help="8bit 输出抖动方式（blue/ordered/ordered_fixed/white）")
+                    help="输出抖动方式：blue（默认）或 ordered_fixed")
     ap.add_argument("--seam-fix", default="smooth", choices=["smooth", "align", "off"],
                     help="tile 拼接方式：smooth=平滑羽化（默认）/ align=加 DC 对齐（实验）/ off=线性")
     ap.add_argument("--no-color-fix", action="store_true",
