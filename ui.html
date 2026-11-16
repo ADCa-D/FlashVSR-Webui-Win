@@ -212,7 +212,6 @@
     <div class="row" style="margin-top:16px">
       <button id="go" disabled>开始超分</button>
       <button id="cancelBtn" class="ghost" disabled>取消任务</button>
-      <button id="unload" class="ghost">释放显存</button>
       <button id="clearCache" class="ghost">忘记历史缓存</button>
     </div>
     <div class="cache" id="cacheInfo"></div>
@@ -701,12 +700,6 @@ $('#cancelBtn').onclick = async () => {
   if (!jobId) return;
   $('#cancelBtn').disabled = true;
   await fetch('/api/job/cancel/' + jobId, {method:'POST'});
-};
-
-$('#unload').onclick = async () => {
-  const r = await fetch('/api/unload', {method:'POST'});
-  const j = await r.json().catch(()=>({}));
-  $('#stage').textContent = j.note || '显存由任务子进程持有，任务结束后自动释放';
 };
 
 // ---------- 历史

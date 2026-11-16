@@ -39,7 +39,6 @@ os.makedirs(os.path.join(WORK, "segments"), exist_ok=True)
 
 JOBS = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
-ENGINE = E.Engine()  # 仅用于 /api/status 与历史状态，不影响子进程推理
 
 # ---------------------------------------------------------------- 鉴权
 # 规则：本机回环免登录；其他 IP 必须（a）在放行名单里，或（b）持有有效会话 cookie。
@@ -869,13 +868,6 @@ async def clear_segments(request):
     return web.json_response(dict(ok=True, freed_mb=round(size / 1048576, 1), files=files))
 
 
-async def unload(request):
-    busy = any(not j.get("done") for j in JOBS.values())
-    if busy:
-        return web.json_response({"ok": False, "note": "任务进行中，显存被 worker 占用，无法释放（可先取消任务）"})
-    return web.json_response({"ok": True, "note": "模型随任务子进程退出已释放；无需手动操作"})
-
-
 async def cancel(request):
     jid = request.match_info["job"]
     j = JOBS.get(jid)
@@ -918,9 +910,10 @@ async def current_job(request):
 
 
 async def status(request):
-    loaded = ENGINE.pipe is not None
+    # 模型只存在于 worker 子进程里（跑完即退 → 显存自动释放），面板进程从不加载模型，
+    # 所以这里只有"有没有任务在跑"这一个有意义的状态。
     busy = any(not j.get("done") for j in JOBS.values())
-    return web.json_response({"loaded": loaded, "busy": busy})
+    return web.json_response({"busy": busy})
 
 
 def main():
@@ -948,7 +941,6 @@ def main():
         web.post("/api/history/clear", clear_history),
         web.get("/api/segments", segments),
         web.post("/api/segments/clear", clear_segments),
-        web.post("/api/unload", unload),
         web.post("/api/job/cancel/{job}", cancel),
         web.get("/api/status", status),
         web.get("/api/current", current_job),
