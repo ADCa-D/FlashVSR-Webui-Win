@@ -752,9 +752,9 @@ def resolve_params(fields, src_path=None):
 
     chunk = int(fields.get("chunk", 0) or 0)
     try:
-        tile_overlap = int(fields.get("tile_overlap") or 12)
+        tile_overlap = int(fields.get("tile_overlap") or 24)
     except ValueError:
-        tile_overlap = 12
+        tile_overlap = 24
     tile_overlap = max(4, min(tile_overlap, max(8, tile // 4)))
 
     # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），

@@ -59,7 +59,7 @@ def main():
     ap.add_argument("--scale", type=int, default=4)
     ap.add_argument("--tile", type=int, default=128)
     ap.add_argument("--kv", type=float, default=3.0)
-    ap.add_argument("--overlap", type=int, default=12, help="tile 重叠（羽化带）")
+    ap.add_argument("--overlap", type=int, default=24, help="tile 重叠（羽化带，越大接缝越稳）")
     ap.add_argument("--chunk", type=int, default=48, help="帧/段，0=不分段")
     ap.add_argument("--quant", default="mxfp8", choices=list(E.QUANT_CHOICES))
     ap.add_argument("--prescale", default="auto", choices=["auto", "half", "off"],

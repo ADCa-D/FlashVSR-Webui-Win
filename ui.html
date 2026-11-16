@@ -98,8 +98,8 @@
       <span style="color:var(--dim);font-size:12.5px">tile</span><input id="tile" type="number" min="64" max="512" step="32" value="128" disabled />
       <span style="color:var(--dim);font-size:12.5px">kv</span><input id="kv" type="number" min="1" max="4" step="0.5" value="3" disabled />
       <label class="chk" title="量化后 tile192 更快，但高分辨率素材容易 OOM"><input type="checkbox" id="tileUp" /> tile 提到 192</label>
-      <span style="color:var(--dim);font-size:12.5px" title="tile 之间的羽化带（像素）。越小 tile 数越少、越快">重叠</span>
-      <input id="tileOv" type="number" min="4" max="64" step="4" value="12" title="tile 重叠；12 比 24 少约 25% 的 tile" />
+      <span style="color:var(--dim);font-size:12.5px" title="tile 之间的羽化带（像素）。24 是画质默认，越小 tile 数越少、越快">重叠</span>
+      <input id="tileOv" type="number" min="4" max="64" step="4" value="24" title="tile 重叠：24 是画质默认；降到 12 省约 10% 时间但接缝更明显" />
     </div>
     <div class="row">
       <label class="chk"><input type="checkbox" id="chunkOn" checked /> 长视频分段</label>
