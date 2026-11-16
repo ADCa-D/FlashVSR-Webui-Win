@@ -201,6 +201,16 @@
           </select>
         </div>
         <div class="row">
+          <span class="lk" title="输入预缩放（/2）用的 libplacebo 缩放器。实测往返保真度：ewa_lanczos4sharpest 36.45 dB > spline36 35.94 dB，代价 50 帧多 2.9 s">预缩放算法</span>
+          <select id="scaler">
+            <option value="ewa_lanczos4sharpest" selected>ewa_lanczos4sharpest（默认）</option>
+            <option value="spline36">spline36（最快）</option>
+            <option value="ewa_lanczos">ewa_lanczos</option>
+            <option value="lanczos">lanczos</option>
+            <option value="sinc">sinc</option>
+            <option value="bicubic">bicubic</option>
+            <option value="bilinear">bilinear</option>
+          </select>
           <label class="chk" title="勾上后才把下面的参数透传给 ffmpeg"><input type="checkbox" id="extraOn" /> 自定义编码参数</label>
           <input id="extraArgs" type="text" placeholder="-rc vbr -cq 22 -tune hq"
                  style="display:none;width:300px;font-family:var(--mono, monospace)" />
@@ -315,6 +325,7 @@ function collectFields(){
   o.hi_precision = (dev && $('#hiPrec').checked) ? '1' : '0';
   o.tune = $('#tune').value;
   o.seam_fix = dev ? $('#seamFix').value : 'smooth';
+  if (dev && $('#scaler')) o.prescale_scaler = $('#scaler').value;
   if (dev && $('#extraOn').checked) o.extra_args = $('#extraArgs').value;
   const qDev = dev && $('#quantDev') ? $('#quantDev').value : '';
   o.quant = qDev || $('#quant').value;
@@ -590,6 +601,11 @@ $('#bitdepth').addEventListener('change', updateEncHint);
 
   dev.checked = localStorage.getItem('fs_dev') === '1';
   extraOn.checked = localStorage.getItem('fs_extra') === '1';
+  const scal = $('#scaler');
+  if (scal) {
+    scal.value = localStorage.getItem('fs_scaler') || 'ewa_lanczos4sharpest';
+    scal.onchange = () => localStorage.setItem('fs_scaler', scal.value);
+  }
   apply(); applyExtra();
 
   dev.onchange = () => {

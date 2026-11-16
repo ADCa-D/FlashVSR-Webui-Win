@@ -133,6 +133,32 @@ python inference.py -s in.mp4 -o out.mp4 --hi-precision --bitdepth 10 --encoder 
 
 只开 `--bitdepth 10` 而不开 `--hi-precision` 意义有限：源在解码阶段就已经被量化到 8 bit 了。
 
+## 输入预缩放用哪种缩放器（libplacebo）
+
+预缩放（源 /2）是整条链路里唯一"纯图像处理"的一步，换缩放器不花推理时间。
+实测（1080p → 540p，20 帧，往返回到 1080p 与原片比）：
+
+| 缩放器 | 往返 PSNR | SSIM | 50 帧耗时 |
+|---|---|---|---|
+| **ewa_lanczos4sharpest（默认）** | **36.45 dB** | **0.9852** | 4.3 s |
+| spline36（原默认） | 35.94 dB | 0.9832 | **1.4 s** |
+| `extra_opts=preset=high_quality` | 32.69 dB | 0.9792 | 4.3 s* |
+
+结论：
+
+- 默认换成 **`ewa_lanczos4sharpest`**：比 spline36 高 0.5 dB，代价 50 帧多 2.9 s
+  （1000 帧也就多 1 分钟，相对几小时的推理可忽略）。
+- **`extra_opts=preset=high_quality` 不要用**：一是它会把 `downscaler` **覆盖掉**
+  （实测 `downscaler=ewa_lanczos4sharpest:extra_opts=preset=high_quality` 与
+  `downscaler=spline36:extra_opts=preset=high_quality` 输出**字节完全相同**），
+  二是保真度反而更低（32.69 dB）。
+- 可用缩放器（本机 ffmpeg 9.0.1 / libplacebo 实测）：
+  `ewa_lanczos4sharpest`、`ewa_lanczossharp`、`ewa_lanczos`、`ewa_hanning`、`lanczos`、
+  `spline64`、`spline36`、`sinc`、`ginseng`、`bicubic`、`mitchell`、`catmull_rom`、
+  `bilinear`、`nearest`。**没有 `jinc`**（会报 `No such scaler preset 'jinc'`）。
+- 参数：面板「开发模式 → 预缩放算法」，或 `--scaler ewa_lanczos4sharpest`、
+  环境变量 `FLASHVSR_PRESCALE_SCALER`。换算法会改分段缓存键（画面不同）。
+
 ## 用 Vulkan 跑？分两件事说清
 
 **模型推理：不行。** PyTorch 2.13（cu130）没有 Vulkan 后端（`torch.backends.vulkan` 不存在），

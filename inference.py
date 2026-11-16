@@ -27,7 +27,7 @@ def build_params(args, src):
                   quant=args.quant, encoder=args.encoder,
                   bitdepth=args.bitdepth, hi_precision=1 if args.hi_precision else 0,
                   color_fix=0 if args.no_color_fix else 1, seam_fix=args.seam_fix,
-                  tune=args.tune, extra_args=args.extra,
+                  tune=args.tune, extra_args=args.extra, prescale_scaler=args.scaler,
                   quality=args.crf, prescale=args.prescale,
                   tile_overlap=args.overlap, mode=args.mode,
                   attention=args.attention, budget=args.budget)
@@ -88,6 +88,8 @@ def main():
                     help="CPU 编码器调优：ssim/psnr（x264/x265/svtav1）、vq（svtav1）、"
                          "film/animation/grain/stillimage/fastdecode/zerolatency（x264 系）")
     ap.add_argument("--extra", default="", help="附加编码参数（开发模式，整串透传）")
+    ap.add_argument("--scaler", default="", choices=[""] + list(E.SCALERS),
+                    help="预缩放所用的 libplacebo 缩放器（默认 ewa_lanczos4sharpest）")
     ap.add_argument("--seam-fix", default="smooth", choices=["smooth", "align", "off"],
                     help="tile 拼接方式：smooth=平滑羽化（默认）/ align=加 DC 对齐（实验）/ off=线性")
     ap.add_argument("--no-color-fix", action="store_true",

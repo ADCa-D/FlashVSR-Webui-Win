@@ -51,6 +51,14 @@ def main():
                                             "qsv_h264", "amf", "av1_nvenc"))),
     ]
 
+    # 预缩放缩放器：进入 ffmpeg 命令行，非法值回落到默认
+    cmd, _, _ = E._decode_cmd("x.mp4", 960, 544, 0.5, 0, 10, 25.0, False,
+                              "ewa_lanczos4sharpest")
+    checks.append(("预缩放用 ewa_lanczos4sharpest",
+                   "downscaler=ewa_lanczos4sharpest" in " ".join(cmd)))
+    cmd2, _, _ = E._decode_cmd("x.mp4", 960, 544, 0.5, 0, 10, 25.0, False, "bogus")
+    checks.append(("非法缩放器回落默认", "downscaler=" + E.DEFAULT_SCALER in " ".join(cmd2)))
+
     fails = [tag for tag, ok in checks if not ok]
     if fails:
         print(FAIL)
