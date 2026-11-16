@@ -22,3 +22,9 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# C++ 编译中间产物与本地生成的导入库
+*.obj
+*.exe
+cpp/*.lib
+cpp/*.exp
