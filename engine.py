@@ -1302,11 +1302,14 @@ class Engine:
                                           on_progress=lambda n, ws=win_start: on_stage(
                                               "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
                 if len(win) != win_end - win_start:
-                    # VFR/帧数不准：用实际解出的帧修正窗口
-                    win_end = win_start + len(win)
-                    keep = win_end - start
-                    if keep <= 0:
-                        break
+                    # 帧数与探测不符（典型：VFR 源）。以前只修正本段的 keep、
+                    # 不动后续段起点，结果是成片中间**静默缺帧**。宁可失败：
+                    got_n = len(win)
+                    raise RuntimeError(
+                        f"解码帧数与探测不符：第 {i + 1}/{n_seg} 段期望 "
+                        f"{win_end - win_start} 帧，实际 {got_n} 帧。\n"
+                        f"这是 VFR（可变帧率）源的典型表现。先转成恒定帧率再跑：\n"
+                        f'  ffmpeg -i "输入.mp4" -fps_mode cfr -r 30 -c:v libx264 -crf 12 "输入_cfr.mp4"')
             on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg}：{win_start}–{win_end} 帧")
 
             def tile_cb(c, t, i=i):
