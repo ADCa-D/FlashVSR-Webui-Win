@@ -930,15 +930,21 @@ set FLASHVSR_REUSE_MAX_RUN=8     REM 连续复用上限，防细节冻住
 > 跳过率 14% 而不是"静止块占比 40%"，是因为复用单位是**整块 tile**——只有整块都静止才算。
 > 要吃到 40% 得让解码器本身支持空间分块，那是更大的改动。
 
-## cpp/（实验性：脱离 ComfyUI 的 C++ 推理）
+## C++ 推理（在独立分支 `cpp-port`）
 
-包含：safetensors 流式加载器、DiT 前向（ATen 参照实现）、NVRTC 进程内 JIT + 融合 elementwise kernel。
-**目前是研究代码，不是可用产品**：只覆盖 DiT，缺 LQ_proj_in / TCDecoder / 视频编解码。
+脱离 ComfyUI 的 C++ 推理是独立的研究线，代码不在本分支上：
 
 ```bat
-cpp\build.bat dit          REM 需要 TORCH_DIR / CUDA_HDR_INC / CUDA_NVCC_INC（见 build.bat 头注释）
-cpp\build.bat kernel_test  REM 融合 kernel 的单元测试，不加载模型
+git fetch origin && git checkout cpp-port
 ```
 
-已实测：加载 5.4 GB f32 checkpoint 的 host 峰值 542 MiB（Python 路线 8631 MiB）；
-DiT 30 层前向 220 ms（Python+sage 73 ms），激活峰值 106 MiB vs 859 MiB。
+那边包含：safetensors 流式加载器、DiT 前向（ATen 参照实现）、TCDecoder（27 层 TAEHV + memblock 流式）、
+NVRTC 进程内 JIT + 融合 elementwise kernel。
+
+实测（供参考，不是本产品的性能）：
+- 加载 5.4 GB f32 checkpoint 的 host 峰值 **542 MiB**（Python 路线 8631 MiB）
+- DiT 30 层前向 **220 ms**（Python+sage 73 ms），激活峰值 **106 MiB vs 859 MiB**
+
+**结论：C++ 省显存，但不更快**——GPU 本来就没空转，跨语言只换调度外壳。
+真正的价值在"静态内存规划 + 摆脱 ComfyUI 依赖"，速度要靠减少工作量（复用/更大 tile）。
+
