@@ -991,9 +991,56 @@ def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None
 
 
 PREVIEW_WIDTH = int(os.environ.get("FLASHVSR_PREVIEW_WIDTH", "1280"))
+PREVIEW_FORMAT = os.environ.get("FLASHVSR_PREVIEW_FORMAT", "avif").lower()
+_PREVIEW_ENC = None
 
 
-def extract_preview(path, idx, fps, out_path, width=None):
+def preview_encoder(fmt=None):
+    """返回 (ffmpeg 参数, 扩展名)；本机不支持就依次回退。结果缓存。"""
+    global _PREVIEW_ENC
+    fmt = (fmt or PREVIEW_FORMAT).lower()
+    order = [fmt] + [f for f in ("avif", "webp", "jpg") if f != fmt]
+
+    def args_for(f):
+        if f == "avif":
+            return (["-c:v", "libsvtav1", "-crf", "28", "-still-picture", "1"], ".avif")
+        if f == "webp":
+            return (["-c:v", "libwebp", "-quality", "90"], ".webp")
+        if f == "png":
+            return (["-c:v", "png"], ".png")
+        return (["-c:v", "mjpeg", "-q:v", "2"], ".jpg")
+
+    if _PREVIEW_ENC is not None and _PREVIEW_ENC[0] == fmt:
+        return _PREVIEW_ENC[1], _PREVIEW_ENC[2]
+    probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work", "_pv_probe")
+    os.makedirs(probe, exist_ok=True)
+    for f in order:
+        a, ext = args_for(f)
+        dst = os.path.join(probe, "t" + ext)
+        try:
+            r = subprocess.run(
+                [FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=gray:s=64x64:d=0.1",
+                 "-frames:v", "1"] + a + [dst], capture_output=True, timeout=60)
+            # 64x64 的 webp 只有 60 字节，阈值给 0 就行（只看能否编出来）
+            if r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                _PREVIEW_ENC = (fmt, a, ext)
+                return a, ext
+        except Exception:  # noqa
+            pass
+        finally:
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+    _PREVIEW_ENC = (fmt, ["-c:v", "mjpeg", "-q:v", "2"], ".jpg")
+    return _PREVIEW_ENC[1], _PREVIEW_ENC[2]
+
+
+def preview_ext():
+    return preview_encoder()[1]
+
+
+def extract_preview(path, idx, fps, out_path, width=None, fmt=None):
     """从分段文件里抽一帧存成 jpg（预览用）。
 
     宽度默认 1280 且不超过原片宽度：以前是 640，而页面用 width:100% 铺满卡片，
@@ -1001,8 +1048,9 @@ def extract_preview(path, idx, fps, out_path, width=None):
     """
     w = int(width or PREVIEW_WIDTH)
     t = max(0.0, float(idx) / max(float(fps), 1e-6))
+    enc, _ext = preview_encoder(fmt)
     cmd = [FFMPEG, "-y", "-v", "error", "-ss", f"{t:.4f}", "-i", path,
-           "-frames:v", "1", "-vf", f"scale='min({w},iw)':-2", "-q:v", "3", out_path]
+           "-frames:v", "1", "-vf", f"scale='min({w},iw)':-2"] + enc + [out_path]
     subprocess.run(cmd, capture_output=True, timeout=120)
     return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
 
@@ -1674,7 +1722,7 @@ class Engine:
             if pdir and keep > 0:
                 try:
                     os.makedirs(pdir, exist_ok=True)
-                    name = f"seg_{i:04d}.jpg"
+                    name = f"seg_{i:04d}{preview_ext()}"
                     if extract_preview(seg_path, random.randrange(keep), info["fps"],
                                        os.path.join(pdir, name)):
                         pv = name

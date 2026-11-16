@@ -494,6 +494,28 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 自动分段因此按 tile 取预算：`tile≥192 → 1.0 GB`、否则 `3.2 GB`。
 
 
+### 预览帧格式：默认 AVIF
+
+1280 宽单帧实测（参考为无损 PNG）：
+
+| 格式 | 体积 | 编码耗时 | PSNR | SSIM |
+|---|---|---|---|---|
+| PNG | 2469 KB | 0.64 s | 无损 | — |
+| JPEG `q:v 3` | 262 KB | 0.40 s | 42.96 dB | 0.9885 |
+| JPEG `q:v 2` | 331 KB | 0.42 s | 43.86 dB | 0.9906 |
+| WebP `-quality 90` | 214 KB | 0.50 s | 45.11 dB | 0.9928 |
+| **AVIF（svtav1 crf28）** | **125 KB** | 0.72 s | 44.20 dB | 0.9904 |
+| AVIF（libaom crf28） | 72 KB | 1.20 s | 42.99 dB | 0.9887 |
+| HEIC | — | — | 本机 ffmpeg 没有 heif muxer，且浏览器基本不支持 | |
+
+结论：**默认 AVIF**——体积只有 JPEG 的一半，画质还更高；浏览器（Chrome 85+/Edge/Firefox/Safari 16+）都支持。
+AVIF 编码器不可用时自动回退 **WebP → JPEG**。PNG 只适合"要逐像素看"的场合（单帧 2.4 MB，87 段就是 215 MB）。
+
+```bat
+set FLASHVSR_PREVIEW_FORMAT=webp     REM avif（默认）/ webp / jpg / png
+set FLASHVSR_PREVIEW_WIDTH=1600      REM 默认 1280，且不超过原片宽度
+```
+
 ## 分段预览
 
 勾了「长视频分段」时，**每跑完一段就随机抽一帧**（缩到 640 宽）推到界面进度条下方，带「第 i/n 段」标签。

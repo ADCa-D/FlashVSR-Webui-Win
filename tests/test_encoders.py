@@ -69,6 +69,12 @@ def main():
                                dither="error_diffusion")
     checks.append(("非法抖动被忽略", "dithering" not in " ".join(cmd4)))
 
+    # 预览格式：默认 AVIF，且能按需指定
+    a, ext = E.preview_encoder("avif")
+    checks.append(("预览默认 AVIF", ext == ".avif" and "libsvtav1" in " ".join(a)))
+    a2, ext2 = E.preview_encoder("webp")
+    checks.append(("预览可切 WebP", ext2 == ".webp" and "libwebp" in " ".join(a2)))
+
     fails = [tag for tag, ok in checks if not ok]
     if fails:
         print(FAIL)
