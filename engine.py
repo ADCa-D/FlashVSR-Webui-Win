@@ -1663,6 +1663,10 @@ class Engine:
             plans.append([start, win_start, win_end])
             start = win_end
         n_seg = len(plans)
+        step = max(1, chunk - overlap)
+        on_stage("seg", 0, n_seg,
+                 f"共 {n_seg} 段：{total} 帧，{chunk} 帧/段"
+                 f"（含 {overlap} 帧段间重叠 → 每段实际推进 {step} 帧）")
         man["plans"] = plans
         save_manifest(seg_dir, man)
 

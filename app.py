@@ -455,7 +455,9 @@ async def capabilities(request):
                               "choices": list(E.ENCODER_CHOICES),
                               "svt_tunes": tunes, "gpu": gpu,
                               "tunes": {be: list(E.tunes_for(be))
-                                        for be in E.ENCODER_CHOICES if E.tunes_for(be)}})
+                                        for be in E.ENCODER_CHOICES if E.tunes_for(be)},
+                              # auto 会解析成某个具体编码器，tune 选项跟着它走
+                              "tunes_auto": list(E.tunes_for(E.resolve_encoder("auto", caps)))})
 
 
 async def run(request):

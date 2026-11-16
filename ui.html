@@ -107,7 +107,7 @@
       <label class="chk"><input type="checkbox" id="chunkOn" checked /> 长视频分段</label>
       <input id="chunk" type="number" min="8" max="400" step="8" value="48" title="帧/段；填 0 = 按显存自动（太大时会自动下调）" />
       <span style="color:var(--dim);font-size:12px">帧/段</span>
-      <span class="lk" title="只跑前 N 帧：先用 2 秒验证参数（tile / overlap / 量化），别等整片跑完才发现不对">试跑</span>
+      <span class="lk" title="只跑前 N 帧：先用 2 秒验证参数（tile / overlap / 量化），别等整片跑完才发现不对。超过「帧/段」会分成多段跑，预览图也会有多张">试跑</span>
       <input id="maxFrames" type="number" min="0" max="9999" step="8" value="0" />
       <span style="color:var(--dim);font-size:12px">帧（0=全片）</span>
       <label class="chk"><input type="checkbox" id="resume" checked /> 续跑</label>
@@ -161,7 +161,7 @@
         <option value="half">强制 /2 + 4× 模型（输出恒 2×）</option>
         <option value="off">关闭（不预缩放）</option>
       </select>
-      <span class="hint" style="margin:0">/2 走核显 libplacebo(spline36)</span>
+      <span class="hint" style="margin:0">/2 走核显 libplacebo(默认 ewa_lanczos4sharpest)</span>
     </div>
 
     <div class="row">
@@ -474,7 +474,8 @@ function watch(id){
     $('#stage').innerHTML = `<b>${names[d.stage] || d.stage}</b> · ${d.msg || ''}` + (orphanNote || '') +
       (d.elapsed ? ` · 已用 ${Math.round(d.elapsed)}s` : '') + eta +
       (d.params ? ` · ${d.params.scale}× tile${d.params.tile} kv${d.params.kv}` +
-        (d.params.pre_scale && d.params.pre_scale < 1 ? ' · 源/2' : '') : '');
+        (d.params.pre_scale && d.params.pre_scale < 1
+          ? ` · 输入/2 → ${d.params.scale}×模型（净 ${d.params.scale / 2}×）` : '') : '');
     if (d.stage === 'error'){
       $('#err').textContent = d.error || '失败';
       $('#go').disabled = false; $('#cancelBtn').disabled = true; es.close(); loadHist(); loadCache();
@@ -525,7 +526,8 @@ const TUNE_LABEL = {
 function rebuildTunes(be) {
   const sel = $('#tune');
   if (!sel) return;
-  const list = (CAPS && CAPS.tunes && CAPS.tunes[be]) || [];
+  let list = (CAPS && CAPS.tunes && CAPS.tunes[be]) || [];
+  if (!list.length && be === 'auto') list = (CAPS && CAPS.tunes_auto) || [];
   const keep = sel.value;
   sel.innerHTML = '';
   const o0 = document.createElement('option');
@@ -568,7 +570,7 @@ function updateEncHint(){
                (st.length ? '；本机 tune 支持 ' + st.join(' / ') : '；tune 支持面未知'));
   }
   else if (be === 'x265') parts.push('CPU H.265，体积比 x264 小 30–40%，慢一倍');
-  else parts.push('CPU 编码与 GPU 推理天然并行，通常最快');
+  else parts.push('CPU 编码不占显存、也不与推理抢显存；但会吃共享功耗预算，别指望它更快');
   if ($('#bitdepth').value === '10' && be !== 'x265' && be !== 'qsv') {
     parts.push('该编码器不支持 10 bit（只有 x265 / qsv(HEVC) 支持），会按 8 bit 输出');
   }
