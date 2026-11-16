@@ -1483,6 +1483,18 @@ class Engine:
                 if cond is not None:
                     cond = cond.contiguous(memory_format=torch.channels_last_3d)
                 _ru["n"] += 1
+                if os.environ.get("FLASHVSR_WIN_DEBUG") == "1":
+                    print(f"[win-debug] decode #{_ru['n']} latent {tuple(x.shape)} "
+                          f"cond {tuple(cond.shape) if cond is not None else None}",
+                          flush=True)
+                wst = getattr(self, "_win", None)
+                if wst is not None and wst.get("flag"):
+                    wst["flag"] = False
+                    if _ru["out"] is not None and _ru.get("out_t") == x.size(1):
+                        wst["reused_frames"] = wst.get("reused_frames", 0) + 1
+                        return _ru["out"]
+                    # 形状对不上就不冒险：老老实实解码这一窗
+                    print("[win-reuse] 形状不匹配，本窗退回真实解码", flush=True)
                 if (_ru["on"] and _ru["prev"] is not None and cond is not None
                         and cond.shape == _ru["prev"].shape and _ru["run"] < _ru["max_run"]):
                     d = (cond.float() - _ru["prev"].float()).abs().mean().item()
@@ -1495,6 +1507,7 @@ class Engine:
                                    cond=cond)
                 _ru["prev"] = cond
                 _ru["out"] = out
+                _ru["out_t"] = x.size(1)
                 return out
 
             dec.decode_video = _decode_cl
@@ -1519,6 +1532,69 @@ class Engine:
             self.pipe.generate_noise = _noise
         except Exception as e:  # noqa
             print(f"[FlashVSR] 抽帧噪声对齐未启用: {e}", flush=True)
+
+        # ---- 整窗复用：保持时间轴，只跳过 30 层 DiT 的计算 -------------------
+        # 判据用 LQ_latents（LQ_proj_in 的输出，随窗口更新），命中则：
+        #   ① 不跑 blocks；② kv cache 复制最后一块（时间轴不变）；③ noise_pred 返回 0
+        #   ④ decode 包装器看到 flag 直接返回上一窗的 RGB
+        # ③④ 必须共用同一个 flag，否则会把纯噪声解码成画面。
+        try:
+            pl_mod = sys.modules.get("flashvsr_node.src.pipelines.flashvsr_tiny_long")
+            self._win = {"prev": None, "n": 0, "skip": 0, "flag": False,
+                         "thr": float(os.environ.get("FLASHVSR_WIN_THR", "0.001")),
+                         "on": os.environ.get("FLASHVSR_WIN_REUSE", "0") == "1"}
+            if pl_mod is not None and self._win["on"] and not getattr(pl_mod, "_win_wrapped", False):
+                _orig_fn = pl_mod.model_fn_wan_video
+                st = self._win
+
+                def _win_fn(dit, x, timestep, context, **kw):
+                    lat = kw.get("LQ_latents")
+                    dup = False
+                    dmax = -1.0
+                    if st["prev"] is not None and lat is not None and len(lat) == len(st["prev"]):
+                        # 首窗与后续窗的 LQ_latents 时间长度不同（512 vs 1536），
+                        # 形状不一致就不比、也不复用（安全优先）
+                        same_shape = all(a.shape == b.shape for a, b in zip(lat, st["prev"]))
+                        if same_shape:
+                            dmax = 0.0
+                            for a, b in zip(lat, st["prev"]):
+                                dmax = max(dmax, float((a.float() - b.float()).abs().mean()))
+                            dup = dmax < st["thr"]
+                    if not dup:
+                        st["prev"] = [t.detach().clone() for t in lat] if lat is not None else None
+                        st["n"] += 1
+                        out = _orig_fn(dit, x, timestep, context, **kw)
+                        st["flag"] = False
+                        return out
+
+                    # --- 跳过 30 层：cache 复制最后一块，再裁到 kv_len ---
+                    st["n"] += 1
+                    st["skip"] += 1
+                    st["flag"] = True
+                    one = max(1, int(x.size(2)) // 2)
+                    kvl = int(kw.get("kv_ratio") or 3)
+                    for key in ("pre_cache_k", "pre_cache_v"):
+                        lst = kw.get(key)
+                        if not lst:
+                            continue
+                        for bi in range(len(lst)):
+                            ck = lst[bi]
+                            if ck is None:
+                                continue
+                            new = torch.cat([ck, ck[-one:]], dim=0)
+                            if new.size(0) > kvl:
+                                new = new[-kvl:]
+                            lst[bi] = new
+                    if st["n"] % 5 == 1:
+                        print(f"[win-reuse] 命中（LQ 差 {dmax:.4f} < {st['thr']}）"
+                              f" 累计 {st['skip']}/{st['n']}", flush=True)
+                    return torch.zeros_like(x), kw.get("pre_cache_k"), kw.get("pre_cache_v")
+
+                pl_mod.model_fn_wan_video = _win_fn
+                pl_mod._win_wrapped = True
+                print(f"[FlashVSR] 整窗复用已启用（阈值 {self._win['thr']}）", flush=True)
+        except Exception as e:  # noqa
+            print(f"[FlashVSR] 整窗复用未启用: {e}", flush=True)
 
         # VAE 解码换 TensorRT（逐帧 9 个 past，实测 ~1.8×；任何异常都回退 torch）
         try:
