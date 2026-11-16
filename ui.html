@@ -439,7 +439,7 @@ function updateEncHint(){
   else if (be === 'amf') parts.push('核显 610M 只有 2 CU，1440p 以上通常比 CPU 慢');
   else if (be === 'nvenc') parts.push('与推理共用独显，会占一点显存');
   else if (be === 'av1_nvenc') parts.push('硬件 AV1，40/50 系支持；体积比 H.264 小一半');
-  else if (be === 'svtav1') parts.push('CPU 软件 AV1：体积最小；用 preset 10（实时档），4–8 是归档级，4K 下慢到不可用');
+  else if (be === 'svtav1') parts.push('CPU 软件 AV1：体积最小；默认 preset 10 + lp=4（线程数不限制会在 4K 下 ENOMEM）');
   else if (be === 'x265') parts.push('CPU H.265，体积比 x264 小 30–40%，慢一倍');
   else parts.push('CPU 编码与 GPU 推理天然并行，通常最快');
   $('#encHint').textContent = parts.join(' · ');

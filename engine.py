@@ -59,9 +59,11 @@ def encoder_args(backend, quality):
         return ["-c:v", "h264_amf", "-quality", "high_quality",
                 "-rc", "hqvbr", "-qvbr_quality_level", q, "-pix_fmt", "yuv420p"]
     if backend == "svtav1":
-        # SVT-AV1 的 crf 范围 0–63；preset 10≈实时档（4–8 是归档级，4K 下慢到不可用且吃 2–4 GB 内存）
+        # SVT-AV1 的 crf 0–63；preset 10≈实时档（4–8 是归档级）。
+        # lp（并行线程）必须显式限制：默认取全部逻辑核，4K/preset≤8 时会因单次分配过大直接 ENOMEM。
+        lp = int(os.environ.get("FLASHVSR_SVT_LP", "4"))
         return ["-c:v", "libsvtav1", "-crf", q, "-preset", "10",
-                "-g", "240", "-pix_fmt", "yuv420p"]
+                "-svtav1-params", f"lp={lp}", "-g", "240", "-pix_fmt", "yuv420p"]
     if backend == "x265":
         return ["-c:v", "libx265", "-preset", "medium", "-crf", q, "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-preset", "slow", "-crf", q, "-pix_fmt", "yuv420p"]
