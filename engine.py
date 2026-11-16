@@ -505,6 +505,36 @@ def _expand(out, p, n):
     return out if p <= 1 else np.repeat(out, p, axis=0)[:n]
 
 
+def _quant8(out):
+    """float [0,1] → uint8。**这里是整条链路唯一的 8bit 量化点**。
+
+    之前是纯 round()，没有抖动 → 渐变/大面积平坦区在 8bit 输出上会出色带。
+    预缩放阶段的 libplacebo 抖动输出的是 gbrpf32le（浮点），没有 8bit 目标可抖，
+    所以那些抖动对本项目无效——必须抖在这一步。
+
+    用 FLASHVSR_DITHER 选：
+      off     纯四舍五入（默认，保持历史行为）
+      ordered 8×8 Bayer 有序抖动（确定性、逐帧不变、几乎不加码率）
+      tpdf    三角分布随机抖动（最平滑，但会略微增加码率）
+    """
+    mode = (os.environ.get("FLASHVSR_DITHER") or "off").lower()
+    x = out.clamp(0, 1) * 255.0
+    if mode == "ordered":
+        bayer = torch.tensor(
+            [[0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+             [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+             [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+             [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21]],
+            dtype=torch.float32, device=x.device) / 64.0 - 0.5
+        h, w = x.shape[-3], x.shape[-2]
+        tile = bayer.repeat((h // 8) + 1, (w // 8) + 1)[:h, :w]
+        x = x + tile.view(1, h, w, 1)
+    elif mode == "tpdf":
+        n = torch.rand_like(x) - torch.rand_like(x)     # 三角分布，幅度 ±1 LSB
+        x = x + n
+    return x.round().clamp_(0, 255).to(torch.uint8).cpu().numpy()
+
+
 def flashvsr_aligned(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
                      sparse, kv, local, seed=0):
     """逐 tile 推理 + **偏置对齐** 的拼接（对应节点的 tiled_dit 分支）。
@@ -1718,7 +1748,7 @@ class Engine:
                 out = mod.flashvsr(
                     self.pipe, frames, int(scale), bool(color_fix), True, True,
                     tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
-            return (out.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
+            return _quant8(out)
         finally:
             mod.cqdm = orig
 
