@@ -841,9 +841,13 @@ def resolve_params(fields, src_path=None):
 
     chunk = int(fields.get("chunk", 0) or 0)
     try:
-        tile_overlap = int(fields.get("tile_overlap") or 24)
+        tile_overlap = int(fields.get("tile_overlap") or 0)
     except ValueError:
-        tile_overlap = 24
+        tile_overlap = 0
+    if tile_overlap <= 0:
+        # 自动：羽化带随 tile 走。4K 实测 tile256 用 12 时接缝处清晰度掉 13%，
+        # 提到 64（=tile/4）后缝处/非缝比值 0.866 → 0.997，肉眼即消失。
+        tile_overlap = max(24, tile // 4)
     tile_overlap = max(4, min(tile_overlap, max(8, tile // 2)))
 
     # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），
