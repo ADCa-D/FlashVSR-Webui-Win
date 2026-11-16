@@ -121,7 +121,8 @@ VAE 解码占 kernel 时间约 65%，理论上最值得加速。实测确实能�
 | libsvtav1 | ❌ | 4K 下 10 bit 缓冲翻倍 → `SvtMalloc: allocate memory failed` |
 | h264_nvenc / av1_nvenc | ❌ | 需要 main10 profile，当前卡/驱动不支持 |
 | h264_amf | ❌ | AMF 的 H.264 编码器只有 8 bit；且同码率画质比 x264/x265 差，只适合当“能出片就行”的兜底 |
-| **hevc_qsv** | ✅ | Intel 核显 Quick Sync 支持 main10；**本机无 Intel 核显（AMD 610M），代码就位但未实测** |
+| **hevc_qsv**（`qsv`） | ✅ | Intel 核显 main10（9 代+）；**本机无 Intel 核显（AMD 610M），代码就位但未实测** |
+| h264_qsv（`qsv_h264`） | ❌ | H.264 硬件编码只有 8bit |
 
 两者可以叠加，效果才完整：
 
@@ -131,6 +132,40 @@ python inference.py -s in.mp4 -o out.mp4 --hi-precision --bitdepth 10 --encoder 
 ```
 
 只开 `--bitdepth 10` 而不开 `--hi-precision` 意义有限：源在解码阶段就已经被量化到 8 bit 了。
+
+## Intel QSV（核显编码）：通用可行方案
+
+手头没有 Intel 机器实测，所以按"最可能一次跑通"的方式写，并把失败后果限制住：
+
+```bat
+REM qsv（HEVC 8bit）实际下发：
+-c:v hevc_qsv -preset medium -global_quality 20 -profile:v main -vf format=nv12 -pix_fmt nv12
+REM qsv_h264（H.264 8bit，兼容最老）：
+-c:v h264_qsv -preset medium -global_quality 20 -profile:v high -vf format=nv12 -pix_fmt nv12
+```
+
+三个刻意的取舍：
+
+| 决定 | 原因 |
+|---|---|
+| **系统内存输入 + `nv12`**，不用 `hwupload`/`hwframes` | 后者依赖 D3D11 纹理池，Windows 上老驱动常报 `Error creating a MFX session`；系统内存由驱动内部拷贝，多一次上传但兼容性最好 |
+| **ICQ（`-global_quality`）**，不写死码率 | 4K 下固定码率要么糊要么爆；ICQ 与 CRF 语义接近（越小越好），`quality` 直接透传 |
+| 拆成 `qsv` / `qsv_h264` 两个选项 | HEVC 压缩好但要求新；H.264 兼容性最高，老机器也能出片 |
+
+硬件代际（厂商能力表，**不是本机实测**）：
+
+| 能力 | 最低代际 |
+|---|---|
+| H.264 4K 编码 | 4 代 Haswell / 5 代 Broadwell |
+| HEVC 8bit 4K 编码 | 6 代 Skylake |
+| HEVC 10bit（`bitdepth=10`） | 9 代 Kaby Lake |
+| AV1 编码 | 11 代 Tiger Lake（本项目未接 `av1_qsv`） |
+
+**失败即回退**：任何硬件编码器（`qsv`/`qsv_h264`/`nvenc`/`av1_nvenc`/`amf`）初始化失败，
+都会自动改用 `x265` 继续编码，并在进度里写明原因（例如 `Error creating a MFX session: -9`）。
+所以即使 QSV 在你机器上跑不通，也只是慢一点，不会让跑了几小时的任务白费。
+
+想换速度档：`FLASHVSR_QSV_PRESET=fast`（默认 `medium`）。
 
 ## 编码器：NVENC 需要驱动 ≥ 610
 
@@ -349,7 +384,7 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 
 - 显存不够会自动降档重试，进度里会写「自动降档重试（第 N 次）：tile=… kv=…」
 - `权重`：MXFP8（推荐）/ bf16（基准）/ NVFP4（4bit，未必更快）/ 混合（FFN 4bit，省 0.16 GiB、画质 44.65 dB）/ **W8A16**（通用 fp8 权重，30/40 系也能用）
-- `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `qsv`（Intel 核显 Quick Sync，**未在本机验证**：本机是 AMD 610M）/ `amf`（AMD，**仅 8 bit，同码率画质明显弱于 x264/x265**）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
+- `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `qsv`（Intel 核显 HEVC 8bit，**未在本机验证**：本机是 AMD 610M）/ `qsv_h264`（Intel 核显 H.264 8bit，兼容最老）/ `amf`（AMD，**仅 8 bit，同码率画质明显弱于 x264/x265**）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
 - 体积对比（业界 RD 基准，非本机实测）：AV1 比 x264 省 **40–50%** 码率、比 x265 省 **20–30%**；代价是 CPU 编码慢
 - `svtav1` 默认 **preset 4 + lp=4**：preset 越低画质越好、同 CRF 体积越小（p4 比 p10 小 ~30%），而编码耗时相对推理可忽略（4K/50 帧：p4≈7 s、p2≈13 s，推理要 30–90 分钟）。
   可用 `FLASHVSR_SVT_PRESET=2` 换最高质量档；`lp` 固定 4（默认按 32 逻辑核并行，4K 下会 ENOMEM）

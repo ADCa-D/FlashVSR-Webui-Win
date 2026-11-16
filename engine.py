@@ -34,12 +34,14 @@ FFPROBE = _cfg.FFPROBE
 
 MAX_PIXELS = 700_000_000
 
-ENCODER_CHOICES = ("auto", "cpu", "nvenc", "qsv", "amf", "svtav1", "av1_nvenc", "x265")
+ENCODER_CHOICES = ("auto", "cpu", "nvenc", "qsv", "qsv_h264", "amf", "svtav1",
+                    "av1_nvenc", "x265")
 ENCODER_LABEL = {
     "auto": "自动（CPU 优先，GPU 不可用则回退）",
     "cpu": "CPU · libx264（H.264）",
     "nvenc": "GPU · NVENC H.264",
-    "qsv": "GPU · Intel QSV（Intel 核显，未在本机验证）",
+    "qsv": "GPU · Intel QSV · HEVC 8bit（4K，6 代+ 核显）",
+    "qsv_h264": "GPU · Intel QSV · H.264 8bit（4K，兼容最老，4 代+）",
     "amf": "GPU · AMF（AMD 核显）",
     "svtav1": "CPU · SVT-AV1（同画质体积最小，慢）",
     "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
@@ -58,14 +60,22 @@ def encoder_args(backend, quality, bitdepth=8):
     if backend == "av1_nvenc":
         return ["-c:v", "av1_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
-    if backend == "qsv":
-        # Intel Quick Sync：hevc_qsv 支持 main10（p010le），同码率画质优于 AMF，
-        # 但只有带 Intel 核显的机器能用（本机是 AMD 610M，probe_encoders 会标不可用）。
-        if int(bitdepth) == 10:
-            return ["-c:v", "hevc_qsv", "-global_quality", q, "-preset", "medium",
-                    "-pix_fmt", "p010le"]
-        return ["-c:v", "hevc_qsv", "-global_quality", q, "-preset", "medium",
-                "-pix_fmt", "nv12"]
+    if backend in ("qsv", "qsv_h264"):
+        # Intel Quick Sync 的"通用可行"写法：**系统内存 + nv12 + ICQ**。
+        # 不用 hwupload/hwframes —— 那套依赖 D3D11 纹理池，老驱动/老核显经常初始化失败；
+        # 系统内存输入由驱动内部拷贝，兼容性最好（代价是多一次上传）。
+        #   qsv      → hevc_qsv（8bit main；6 代 Skylake 起支持 4K 编码，9 代起 main10）
+        #   qsv_h264 → h264_qsv（8bit high；4-5 代起支持 4K，兼容最老）
+        preset = os.environ.get("FLASHVSR_QSV_PRESET", "medium")
+        if backend == "qsv":
+            if int(bitdepth) == 10:
+                return ["-c:v", "hevc_qsv", "-preset", preset, "-global_quality", q,
+                        "-profile:v", "main10", "-vf", "format=p010le",
+                        "-pix_fmt", "p010le"]
+            return ["-c:v", "hevc_qsv", "-preset", preset, "-global_quality", q,
+                    "-profile:v", "main", "-vf", "format=nv12", "-pix_fmt", "nv12"]
+        return ["-c:v", "h264_qsv", "-preset", preset, "-global_quality", q,
+                "-profile:v", "high", "-vf", "format=nv12", "-pix_fmt", "nv12"]
     if backend == "amf":
         # AMD AMF：只有 8 bit（没有 main10），且同码率画质明显弱于 x264/x265，
         # 只当“显卡不支持 NVENC / CPU 又太慢”时的兜底；要画质请用 x265 或 svtav1。
@@ -86,10 +96,14 @@ def encoder_args(backend, quality, bitdepth=8):
             "-threads", "4", "-pix_fmt", "yuv420p"]
 
 
+# 走 GPU 编码的引擎：初始化失败（驱动/核显不支持该 codec）时自动回退 CPU
+HW_ENCODERS = ("nvenc", "av1_nvenc", "qsv", "qsv_h264", "amf")
+
+
 def probe_encoders():
     src = ["-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=0.2", "-frames:v", "1"]
     out = {}
-    for be in ("cpu", "nvenc", "qsv", "amf", "svtav1", "av1_nvenc", "x265"):
+    for be in ("cpu", "nvenc", "qsv", "qsv_h264", "amf", "svtav1", "av1_nvenc", "x265"):
         try:
             r = subprocess.run(
                 [FFMPEG, "-hide_banner", "-v", "error"] + src + encoder_args(be, 18) + ["-f", "null", "-"],
@@ -133,7 +147,7 @@ def resolve_encoder(requested, caps=None):
         return be
     if caps.get("cpu", {}).get("ok"):
         return "cpu"
-    for alt in ("nvenc", "qsv", "amf"):
+    for alt in ("nvenc", "qsv", "qsv_h264", "amf"):
         if caps.get(alt, {}).get("ok"):
             return alt
     return "cpu"
@@ -1189,6 +1203,22 @@ class Engine:
             bitdepth = 8
         budget_mode = params.get("budget") or "auto"
 
+        def encode_win(frames_in, path, audio_src=None):
+            """统一编码入口：硬件编码器初始化失败 → 自动回退 x265（并说明原因）。"""
+            nonlocal backend
+            try:
+                encode_frames(frames_in, info["fps"], path, audio_src,
+                              quality=quality, backend=backend, bitdepth=bitdepth)
+            except RuntimeError as e:
+                if backend not in HW_ENCODERS:
+                    raise
+                msg = str(e).strip().splitlines()[-1][:140] if str(e).strip() else "未知错误"
+                on_stage("encode", 0, 0,
+                         f"{backend} 编码失败（多半是核显/驱动不支持该 codec），自动回退 x265：{msg}")
+                backend = "x265"
+                encode_frames(frames_in, info["fps"], path, audio_src,
+                              quality=quality, backend=backend, bitdepth=bitdepth)
+
         def budget_for(win_u8, kv):
             if budget_mode != "auto" or len(win_u8) < 2:
                 return 2.0, 11, kv
@@ -1219,7 +1249,7 @@ class Engine:
                 lambda c, t: on_stage("infer", c, t, f"tile {c}/{t}"))
             frames_out = out_t[:total]
             on_stage("encode", 0, 1, f"编码中（sparse={sp} kv={kk} local={lr}）")
-            encode_frames(frames_out, info["fps"], dst, audio, quality=quality, backend=backend, bitdepth=bitdepth)
+            encode_win(frames_out, dst, audio)
             on_stage("encode", 1, 1, f"编码完成（{backend}）")
             return dict(frames=total, fps=info["fps"], in_wh=[info["w"], info["h"]],
                         out_wh=[int(frames_out.shape[2]), int(frames_out.shape[1])], segments=0)
@@ -1319,7 +1349,7 @@ class Engine:
             out_frames = res[keep_from:keep_from + keep]
             out_wh = [int(out_frames.shape[2]), int(out_frames.shape[1])]
             on_stage("encode", 0, 1, f"段 {i + 1}/{n_seg} 写盘（{backend}）")
-            encode_frames(out_frames, info["fps"], seg_path, None, quality=quality, backend=backend, bitdepth=bitdepth)
+            encode_win(out_frames, seg_path, None)
             del res, out_frames, win
 
             got = probe_frames(seg_path)
