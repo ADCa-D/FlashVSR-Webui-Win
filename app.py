@@ -349,12 +349,12 @@ def _resolve_params(fields, src_path=None):
     #   half → 强制 源/2 + 4×模型（不管上面填的 scale 是多少，输出恒为 2×）
     #   off  → 不预缩放（scale=2 就是原生 2×，由模型自己放大）
     pre_scale = 1.0
-    twox = fields.get("twox") or "downscale"      # 兼容旧字段
     prescale = (fields.get("prescale") or "").strip()
     if prescale not in ("auto", "half", "off"):
         prescale = "auto"
     if prescale == "auto":
-        prescale = "half" if (int(scale) == 2 and twox == "downscale") else "off"
+        # 目标 2× 就先 /2（模型走 4×，留在训练分布内）；其它倍率不缩放
+        prescale = "half" if int(scale) == 2 else "off"
     if prescale == "half":
         scale, pre_scale = 4, 0.5
         tile = max(64, tile // 2)          # 输入减半，tile 相应缩小才是同一块画面

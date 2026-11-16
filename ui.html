@@ -255,7 +255,6 @@ function collectFields(){
   o.quant = $('#quant').value;
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
-  o.twox = $('#prescale').value === 'half' ? 'downscale' : 'native';
   o.tile_overlap = $('#tileOv').value;
   o.preview = $('#previewOn').checked ? '1' : '0';
   if ($('#tileUp').checked) o.tile_up = '1';
