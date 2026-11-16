@@ -110,6 +110,33 @@ def main():
         h.remove()
     wan.generate_draft_block_mask_sage = orig_sage
 
+    # ---- block0 内部中间值（用于把 q_w 的偏差定位到具体一步） --------------
+    internals = {}
+    with torch.no_grad():
+        blk = dit.blocks[0]
+        mods = (blk.modulation.to(dtype=t_mod.dtype) + t_mod).chunk(6, dim=1)
+        shift_msa, scale_msa = mods[0], mods[1]
+        x0 = x_patch
+        inp = wan.modulate(blk.norm1(x0), shift_msa, scale_msa)
+        q_pre = blk.self_attn.norm_q(blk.self_attn.q(inp))
+        k_pre = blk.self_attn.norm_k(blk.self_attn.k(inp))
+        v_pre = blk.self_attn.v(inp)
+        freqs = torch.cat([
+            dit.freqs[0][:grid[0]].view(grid[0], 1, 1, -1).expand(grid[0], grid[1], grid[2], -1),
+            dit.freqs[1][:grid[1]].view(1, grid[1], 1, -1).expand(grid[0], grid[1], grid[2], -1),
+            dit.freqs[2][:grid[2]].view(1, 1, grid[2], -1).expand(grid[0], grid[1], grid[2], -1),
+        ], dim=-1).reshape(grid[0] * grid[1] * grid[2], 1, -1).to(x0.device)
+        q_rope = wan.rope_apply(q_pre, freqs, blk.self_attn.num_heads)
+        k_rope = wan.rope_apply(k_pre, freqs, blk.self_attn.num_heads)
+        internals = {
+            "b0_inp": inp.detach().float().cpu(),
+            "b0_q_pre": q_pre.detach().float().cpu(),
+            "b0_k_pre": k_pre.detach().float().cpu(),
+            "b0_v_pre": v_pre.detach().float().cpu(),
+            "b0_q_rope": q_rope.detach().float().cpu(),
+            "b0_k_rope": k_rope.detach().float().cpu(),
+        }
+
     ref = {
         "seed": SEED,
         "config": {
@@ -127,7 +154,7 @@ def main():
         "t_mod": t_mod.detach().float().cpu(),
         "x_patch": x_patch.detach().float().cpu(),
         "y": y.detach().float().cpu(),
-        **grabs, **cap,
+        **grabs, **cap, **internals,
     }
     torch.save(ref, os.path.join(OUT, "ref.pt"))
 
