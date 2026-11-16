@@ -34,12 +34,15 @@ FFPROBE = _cfg.FFPROBE
 
 MAX_PIXELS = 700_000_000
 
-ENCODER_CHOICES = ("auto", "cpu", "nvenc", "amf")
+ENCODER_CHOICES = ("auto", "cpu", "nvenc", "amf", "svtav1", "av1_nvenc", "x265")
 ENCODER_LABEL = {
     "auto": "自动（CPU 优先，GPU 不可用则回退）",
-    "cpu": "CPU · libx264",
-    "nvenc": "GPU · NVENC（NVIDIA 独显）",
+    "cpu": "CPU · libx264（H.264）",
+    "nvenc": "GPU · NVENC H.264",
     "amf": "GPU · AMF（AMD 核显）",
+    "svtav1": "CPU · SVT-AV1（同画质体积最小，慢）",
+    "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
+    "x265": "CPU · libx265（H.265，均衡）",
 }
 QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed", "w8")
 
@@ -49,16 +52,25 @@ def encoder_args(backend, quality):
     if backend == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if backend == "av1_nvenc":
+        return ["-c:v", "av1_nvenc", "-preset", "p7", "-tune", "hq",
+                "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
     if backend == "amf":
         return ["-c:v", "h264_amf", "-quality", "high_quality",
                 "-rc", "hqvbr", "-qvbr_quality_level", q, "-pix_fmt", "yuv420p"]
+    if backend == "svtav1":
+        # SVT-AV1 的 crf 范围 0–63，preset 0–13（越大越快）
+        return ["-c:v", "libsvtav1", "-crf", q, "-preset", "8",
+                "-g", "240", "-pix_fmt", "yuv420p"]
+    if backend == "x265":
+        return ["-c:v", "libx265", "-preset", "medium", "-crf", q, "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-preset", "slow", "-crf", q, "-pix_fmt", "yuv420p"]
 
 
 def probe_encoders():
     src = ["-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=0.2", "-frames:v", "1"]
     out = {}
-    for be in ("cpu", "nvenc", "amf"):
+    for be in ("cpu", "nvenc", "amf", "svtav1", "av1_nvenc", "x265"):
         try:
             r = subprocess.run(
                 [FFMPEG, "-hide_banner", "-v", "error"] + src + encoder_args(be, 18) + ["-f", "null", "-"],
