@@ -1253,6 +1253,22 @@ def resolve_params(fields, src_path=None):
         if tile % step:
             tile = max(step, (tile // step) * step)
 
+    # 按**输入**分辨率自动选 tile：输入小 → 192（GEMM 的 M 更大、tile 更少）；
+    # 输入大 → 保持 128（1080p 上 tile192 峰值 6636 MiB，余量只剩 1.5 GB）。
+    # 输出分辨率影响的是 LQ 缓冲与画布，由下面的自动分段（chunk）兜。
+    if (os.environ.get("FLASHVSR_AUTO_TILE", "0") == "1" and src_path
+            and preset in ("quality", "balance") and not fields.get("tile")):
+        try:
+            _info = probe(src_path)
+            _iw = int(round(_info["w"] * pre_scale))
+            _ih = int(round(_info["h"] * pre_scale))
+            if _iw * _ih <= 960 * 600:
+                tile = 192 if tile < 192 else tile
+                if tile % step:
+                    tile = max(64, int(round(tile / step)) * step)
+        except Exception:
+            pass
+
     chunk = int(fields.get("chunk", 0) or 0)
     try:
         tile_overlap = int(fields.get("tile_overlap") or 0)
