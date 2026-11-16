@@ -990,11 +990,19 @@ def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None
     return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3), info
 
 
-def extract_preview(path, idx, fps, out_path, width=640):
-    """从分段文件里抽一帧存成 jpg（预览用，缩到 width 宽）。"""
+PREVIEW_WIDTH = int(os.environ.get("FLASHVSR_PREVIEW_WIDTH", "1280"))
+
+
+def extract_preview(path, idx, fps, out_path, width=None):
+    """从分段文件里抽一帧存成 jpg（预览用）。
+
+    宽度默认 1280 且不超过原片宽度：以前是 640，而页面用 width:100% 铺满卡片，
+    宽屏下等于把 640 的图放大插值 → 看着糊。
+    """
+    w = int(width or PREVIEW_WIDTH)
     t = max(0.0, float(idx) / max(float(fps), 1e-6))
     cmd = [FFMPEG, "-y", "-v", "error", "-ss", f"{t:.4f}", "-i", path,
-           "-frames:v", "1", "-vf", f"scale={int(width)}:-2", "-q:v", "4", out_path]
+           "-frames:v", "1", "-vf", f"scale='min({w},iw)':-2", "-q:v", "3", out_path]
     subprocess.run(cmd, capture_output=True, timeout=120)
     return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
 
