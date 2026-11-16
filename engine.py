@@ -59,10 +59,11 @@ def encoder_args(backend, quality):
         return ["-c:v", "h264_amf", "-quality", "high_quality",
                 "-rc", "hqvbr", "-qvbr_quality_level", q, "-pix_fmt", "yuv420p"]
     if backend == "svtav1":
-        # SVT-AV1 的 crf 0–63；preset 10（实时档）。
-        # lp 固定 4：默认按全部逻辑核并行，4K/preset≤8 时会因单次分配过大直接 ENOMEM
-        # （本机 32 核实测：lp=4 成功，lp=8/12 失败），所以不给可调入口。
-        return ["-c:v", "libsvtav1", "-crf", q, "-preset", "10",
+        # SVT-AV1：preset 越低画质越好、同 CRF 体积越小（p4 比 p10 小 ~30%）。
+        # 编码时间相对推理可忽略（4K/50 帧：p4≈7s、p2≈13s，而推理要 30–90 分钟），所以默认质量档。
+        # lp 必须固定 4：默认按全部逻辑核并行，4K 下会 ENOMEM（本机 32 核实测 lp=8/12 失败）。
+        preset = os.environ.get("FLASHVSR_SVT_PRESET", "4")
+        return ["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
                 "-svtav1-params", "lp=4", "-g", "240", "-pix_fmt", "yuv420p"]
     if backend == "x265":
         return ["-c:v", "libx265", "-preset", "medium", "-crf", q, "-pix_fmt", "yuv420p"]
