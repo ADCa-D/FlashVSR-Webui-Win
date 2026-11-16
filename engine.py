@@ -47,8 +47,10 @@ ENCODER_LABEL = {
 QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed", "w8")
 
 
-def encoder_args(backend, quality):
+def encoder_args(backend, quality, bitdepth=8):
     q = str(int(quality))
+    # 10-bit：只有 x265 在本机验证可用（x264 是 8bit 构建、SVT-AV1 在 4K 下 10bit 会 OOM）
+    pix = "yuv420p10le" if (int(bitdepth) == 10 and backend == "x265") else "yuv420p"
     if backend == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
@@ -68,7 +70,7 @@ def encoder_args(backend, quality):
     if backend == "x265":
         # 共享功耗墙：CPU 编码线程开太多会抢走 GPU 的 boost 预算，而编码本身不是瓶颈
         return ["-c:v", "libx265", "-preset", "medium", "-crf", q,
-                "-threads", "4", "-pix_fmt", "yuv420p"]
+                "-threads", "4", "-pix_fmt", pix]
     return ["-c:v", "libx264", "-preset", "slow", "-crf", q,
             "-threads", "4", "-pix_fmt", "yuv420p"]
 
@@ -523,12 +525,22 @@ def probe(path):
     return dict(w=w, h=h, fps=fps, duration=dur, frames=frames, has_audio=has_audio)
 
 
-def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0):
-    """拼 ffmpeg 命令；start_frame/count 给定时只解这一段（输入侧 -ss + 精确 seek）。"""
+def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, fp32=False):
+    """拼 ffmpeg 命令；start_frame/count 给定时只解这一段（输入侧 -ss + 精确 seek）。
+
+    fp32=True 时走 libplacebo 的 gbrpf32le 输出：源精度一路保留到模型输入，
+    不再经过 rgb24 的 8bit 量化（代价是每帧内存 4×）。
+    """
     vf = None
+    tw, th = w, h
     if abs(pre_scale - 1.0) > 1e-6:
         tw = max(2, int(round(w * pre_scale / 2)) * 2)
         th = max(2, int(round(h * pre_scale / 2)) * 2)
+    if fp32:
+        vf = (f"libplacebo=w={tw}:h={th}:downscaler=spline36:format=gbrpf32le,"
+              f"hwdownload,format=gbrpf32le")
+        w, h = tw, th
+    elif abs(pre_scale - 1.0) > 1e-6:
         vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
         w, h = tw, th
     cmd = [FFMPEG, "-v", "error"]
@@ -544,17 +556,18 @@ def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0):
         cmd += ["-vf", vf]
     if count:
         cmd += ["-frames:v", str(int(count))]
-    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "gbrpf32le" if fp32 else "rgb24", "-"]
     return cmd, w, h
 
 
-def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress=None):
-    """只解 [start, start+count) 这一段，返回 uint8 NHWC（内存只跟段长有关）。"""
+def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress=None,
+                        fp32=False):
+    """只解 [start, start+count) 这一段，返回 NHWC（uint8 或 float32，内存只跟段长有关）。"""
     info = probe(path)
     if info["w"] <= 0 or info["h"] <= 0:
         raise RuntimeError("读不到视频尺寸，文件可能不是视频")
-    cmd, w, h = _decode_cmd(path, info["w"], info["h"], pre_scale, start, count, fps)
-    frame_bytes = w * h * 3
+    cmd, w, h = _decode_cmd(path, info["w"], info["h"], pre_scale, start, count, fps, fp32)
+    frame_bytes = w * h * 3 * (4 if fp32 else 1)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     chunks, n = [], 0
     while n < count:
@@ -567,20 +580,25 @@ def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress
             on_progress(n)
     proc.wait()
     if not chunks:
-        return np.zeros((0, h, w, 3), np.uint8)
+        return np.zeros((0, h, w, 3), np.float32 if fp32 else np.uint8)
+    if fp32:
+        # gbrpf32le = 平面 G/B/R，转成 HWC 的 R/G/B 并夹到 [0,1]（spline36 会有过冲）
+        a = np.frombuffer(b"".join(chunks), np.float32).reshape(-1, 3, h, w)
+        a = a[:, [2, 0, 1]].transpose(0, 2, 3, 1)
+        return np.clip(a, 0.0, 1.0, out=a)
     return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3)
 
 
-def decode_frames(path, on_progress=None, pre_scale=1.0):
-    """解成 uint8 NHWC。pre_scale<1 用 libplacebo(spline36) 在核显上降采样。"""
+def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False):
+    """解成 NHWC（uint8 或 float32）。pre_scale<1 用 libplacebo(spline36) 在核显上降采样。"""
     info = probe(path)
     w, h = info["w"], info["h"]
     if w <= 0 or h <= 0:
         raise RuntimeError("读不到视频尺寸，文件可能不是视频")
-    cmd, w, h = _decode_cmd(path, w, h, pre_scale)
+    cmd, w, h = _decode_cmd(path, w, h, pre_scale, fp32=fp32)
     if abs(pre_scale - 1.0) > 1e-6:
         info["w"], info["h"] = w, h
-    frame_bytes = w * h * 3
+    frame_bytes = w * h * 3 * (4 if fp32 else 1)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     chunks, n = [], 0
     while True:
@@ -597,6 +615,10 @@ def decode_frames(path, on_progress=None, pre_scale=1.0):
     proc.wait()
     if not chunks:
         raise RuntimeError("没解出任何帧")
+    if fp32:
+        a = np.frombuffer(b"".join(chunks), np.float32).reshape(-1, 3, h, w)
+        a = a[:, [2, 0, 1]].transpose(0, 2, 3, 1)
+        return np.clip(a, 0.0, 1.0, out=a), info
     return np.frombuffer(b"".join(chunks), np.uint8).reshape(-1, h, w, 3), info
 
 
@@ -609,7 +631,8 @@ def extract_preview(path, idx, fps, out_path, width=640):
     return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
 
 
-def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend="cpu"):
+def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend="cpu",
+                  bitdepth=8):
     h, w = frames_u8.shape[1], frames_u8.shape[2]
     cmd = [FFMPEG, "-y", "-v", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
@@ -618,7 +641,7 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         # 音轨和字幕流都无损 copy（字幕没有就静默跳过）
         cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
                 "-c:a", "copy", "-c:s", "copy", "-shortest"]
-    cmd += encoder_args(backend, quality) + ["-fps_mode", "cfr", out_path]
+    cmd += encoder_args(backend, quality, bitdepth) + ["-fps_mode", "cfr", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     for i in range(0, len(frames_u8), 8):
         proc.stdin.write(frames_u8[i:i + 8].tobytes())
@@ -628,7 +651,7 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         raise RuntimeError(f"{backend} 编码失败：" + err.strip()[-400:])
 
 
-def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=15):
+def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=15, bitdepth=8):
     if not seg_paths:
         raise RuntimeError("没有可拼接的分段")
     tmp_dir = os.path.dirname(seg_paths[0])
@@ -643,7 +666,7 @@ def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=
     r = subprocess.run(base + ["-c", "copy", silent],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not os.path.exists(silent) or os.path.getsize(silent) < 1024:
-        r = subprocess.run(base + encoder_args(backend, quality) + [silent],
+        r = subprocess.run(base + encoder_args(backend, quality, bitdepth) + [silent],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0:
             raise RuntimeError("分段拼接失败：" + (r.stderr or "")[-400:])
@@ -771,10 +794,13 @@ def resolve_params(fields, src_path=None):
         quality = 15
     quality = max(10, min(28, quality))
 
+    bitdepth = 10 if str(fields.get("bitdepth") or "8").strip() == "10" else 8
+    hi_precision = str(fields.get("hi_precision") or "0").strip() in ("1", "true", "on", "yes")
     return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
                 attention=attention, encoder=encoder, quality=quality,
                 quant=quant, budget=budget, pre_scale=pre_scale,
-                tile_overlap=tile_overlap, preview=preview, auto_note=auto_note)
+                tile_overlap=tile_overlap, bitdepth=bitdepth,
+                hi_precision=hi_precision, preview=preview, auto_note=auto_note)
 
 
 class Engine:
@@ -939,7 +965,8 @@ class Engine:
 
         mod.cqdm = Hook
         try:
-            frames = torch.from_numpy(np.ascontiguousarray(frames_u8)).float().div_(255.0)
+            _f = torch.from_numpy(np.ascontiguousarray(frames_u8))
+            frames = _f.div_(255.0) if _f.dtype == torch.uint8 else _f.float()
             out = mod.flashvsr(
                 self.pipe, frames, int(scale), True, True, True,
                 tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
@@ -955,11 +982,25 @@ class Engine:
         # 分段时只解当前窗口需要的帧（原来会把整段视频一次解完，30 帧/段也照样吃满内存）
         info = probe(src)
         total = int(info.get("frames") or 0) or int(round(info.get("duration", 0) * info.get("fps", 25)))
+        # 浮点解码：YUV→RGB 全程 float32（libplacebo），不再经过 rgb24 的 8bit 量化。
+        # 不做预缩放时也有效（省掉 swscale 的四舍五入与抖动），代价是每帧内存 4×。
+        fp32 = bool(params.get("hi_precision"))
+        if fp32:
+            tw = max(2, int(round(info["w"] * pre_scale / 2)) * 2)
+            th = max(2, int(round(info["h"] * pre_scale / 2)) * 2)
+            win_f = min(total, chunk) if chunk else total
+            gb = win_f * tw * th * 3 * 4 / 2 ** 30
+            if gb > 2.0:
+                on_stage("decode", 0, total,
+                         f"浮点解码需要 {gb:.1f} GB 内存，超过 2 GB 上限 → 回退 8bit")
+                fp32 = False
+            else:
+                on_stage("decode", 0, total, f"浮点解码（gbrpf32le，窗口约 {gb:.2f} GB）")
         frames = None
         if chunk <= 0 or total <= chunk or total <= 0:
             frames, info = decode_frames(
                 src, on_progress=lambda n: on_stage("decode", n, 0, f"解码中 {n} 帧"),
-                pre_scale=pre_scale)
+                pre_scale=pre_scale, fp32=fp32)
             total = len(frames)
             on_stage("decode", total, total, f"共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
         else:
@@ -973,6 +1014,7 @@ class Engine:
                            prewarm=(max(16, int(params["tile"]) * int(params["scale"]) // 8),) * 2)
         audio = src if info["has_audio"] else None
         quality = int(params.get("quality") or 15)
+        bitdepth = int(params.get("bitdepth") or 8)
         backend = resolve_encoder(params.get("encoder"))
         budget_mode = params.get("budget") or "auto"
 
@@ -1004,7 +1046,7 @@ class Engine:
                 lambda c, t: on_stage("infer", c, t, f"tile {c}/{t}"))
             frames_out = out_t[:total]
             on_stage("encode", 0, 1, f"编码中（sparse={sp} kv={kk} local={lr}）")
-            encode_frames(frames_out, info["fps"], dst, audio, quality=quality, backend=backend)
+            encode_frames(frames_out, info["fps"], dst, audio, quality=quality, backend=backend, bitdepth=bitdepth)
             on_stage("encode", 1, 1, f"编码完成（{backend}）")
             return dict(frames=total, fps=info["fps"], in_wh=[info["w"], info["h"]],
                         out_wh=[int(frames_out.shape[2]), int(frames_out.shape[1])], segments=0)
@@ -1078,7 +1120,7 @@ class Engine:
             else:
                 on_stage("decode", win_start, total, f"解码 {win_start}–{win_end} 帧")
                 win = decode_frames_range(src, win_start, win_end - win_start,
-                                          pre_scale=pre_scale, fps=info["fps"],
+                                          pre_scale=pre_scale, fps=info["fps"], fp32=fp32,
                                           on_progress=lambda n, ws=win_start: on_stage(
                                               "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
                 if len(win) != win_end - win_start:
@@ -1096,7 +1138,7 @@ class Engine:
             out_frames = res[keep_from:keep_from + keep]
             out_wh = [int(out_frames.shape[2]), int(out_frames.shape[1])]
             on_stage("encode", 0, 1, f"段 {i + 1}/{n_seg} 写盘（{backend}）")
-            encode_frames(out_frames, info["fps"], seg_path, None, quality=quality, backend=backend)
+            encode_frames(out_frames, info["fps"], seg_path, None, quality=quality, backend=backend, bitdepth=bitdepth)
             del res, out_frames, win
 
             got = probe_frames(seg_path)
@@ -1124,7 +1166,7 @@ class Engine:
                      **({"preview": pv, "pv_cur": i + 1, "pv_total": n_seg} if pv else {}))
 
         on_stage("encode", 0, 1, f"拼接 {n_seg} 段 + 混入音轨")
-        concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality)
+        concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality, bitdepth=bitdepth)
         got = probe_frames(dst)
         if got and got != total:
             on_stage("encode", 1, 1,

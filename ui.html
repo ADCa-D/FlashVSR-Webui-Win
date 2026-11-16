@@ -132,6 +132,12 @@
       </select>
       <span class="lk">质量<span id="qLabel" style="font-size:11px">（CRF）</span></span>
       <input id="quality" type="number" min="10" max="28" step="1" value="15" />
+      <span class="lk" title="10 位输出能保留模型浮点精度的低位，减少渐变处色带；仅 x265 支持">位深</span>
+      <select id="bitdepth">
+        <option value="8" selected>8 bit</option>
+        <option value="10">10 bit（仅 x265）</option>
+      </select>
+      <label class="chk" title="解码走 libplacebo 的 gbrpf32le：YUV→RGB 全程 float32，不经 rgb24 的 8bit 量化。56 帧 1080p 约多花 0.8 s，内存 4×（超过 2 GB 窗口自动回退）"><input type="checkbox" id="hiPrec" /> 浮点解码</label>
       <span class="lk">权重</span>
       <select id="quant">
         <option value="mxfp8" selected>MXFP8（推荐）</option>
@@ -253,6 +259,8 @@ function collectFields(){
   o.attention = $('#attention').value;
   o.encoder = $('#encoder').value;
   o.quality = $('#quality').value;
+  o.bitdepth = $('#bitdepth').value;
+  o.hi_precision = $('#hiPrec').checked ? '1' : '0';
   o.quant = $('#quant').value;
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;

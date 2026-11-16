@@ -85,6 +85,37 @@ VAE 解码占 kernel 时间约 65%，理论上最值得加速。实测确实能�
 
 原则：**把 CPU 功耗省下来给 GPU**，因为整条链路（DiT + VAE 解码）是 GPU 瓶颈。
 
+## 高精度解码与 10 位输出
+
+模型内部是 bf16/fp8，输入帧却常常只有 8 bit——**量化发生在解码这一步**，和推理精度无关。两条独立的路子：
+
+### 1. 浮点解码（面板「浮点解码」/ `--hi-precision`）
+
+- 走 `libplacebo` 的 `gbrpf32le`：YUV→RGB 全程 float32，**不再经过 rgb24 的 8bit 四舍五入**，色度上采样也在核显（Vulkan）上做。
+- 实测（544p，48 帧）：uint8 `0.25 s` → fp32 `1.09 s`；内存 4×（960×544×48：72 → 287 MiB）。
+- 与 uint8 的差异：平均 `0.21/255`，p90 `0.66/255`；只有 **0.17% 的像素差 >8/255**，集中在高饱和色边——那是色度上采样核不同，不是错帧。
+- 默认关。窗口占用超过 2 GB 会自动回退 8bit（按 `分段帧数 × 解码分辨率 × 3 × 4B` 估算）。
+- 关键事实：`hwdownload,format=rgb24` **不支持**（Vulkan hwframe 不能直接下成 8bit RGB），所以 8bit 路径只能 `hwdownload,format=yuv420p` 再由 swscale 转 rgb24；fp32 反而可以 `gbrpf32le` 直接下载，这也是唯一能拿到 >8bit 精度的通道。
+- 不能去掉 hw device：软件 libplacebo 慢 3.5 倍（544p 0.82 → 2.54 s），`-init_hw_device vulkan=pl -filter_hw_device pl` 必须保留。
+
+### 2. 10 位编码（面板「位深」/ `--bitdepth 10`）
+
+| 编码器 | 10 bit | 说明 |
+|---|---|---|
+| **libx265** | ✅ | `-pix_fmt yuv420p10le`，本机唯一验证可用的 |
+| libx264 | ❌ | 本机 ffmpeg 的 x264 是 8 bit 构建 |
+| libsvtav1 | ❌ | 4K 下 10 bit 缓冲翻倍 → `SvtMalloc: allocate memory failed` |
+| h264_nvenc / av1_nvenc | ❌ | 需要 main10 profile，当前卡/驱动不支持 |
+
+两者可以叠加，效果才完整：
+
+```bat
+REM 源精度一路保留到模型输入，再以 10 bit 落盘（低 2 位不被 8bit 编码丢掉）
+python inference.py -s in.mp4 -o out.mp4 --hi-precision --bitdepth 10 --encoder x265 --crf 18
+```
+
+只开 `--bitdepth 10` 而不开 `--hi-precision` 意义有限：源在解码阶段就已经被量化到 8 bit 了。
+
 ## 环境要求
 
 - Windows 10/11

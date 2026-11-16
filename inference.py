@@ -24,6 +24,7 @@ def build_params(args, src):
     if args.preset == "custom":
         fields.update(scale=args.scale, tile=args.tile, kv=args.kv)
     fields.update(chunk=args.chunk, quant=args.quant, encoder=args.encoder,
+                  bitdepth=args.bitdepth, hi_precision=1 if args.hi_precision else 0,
                   quality=args.crf, prescale=args.prescale,
                   tile_overlap=args.overlap, mode=args.mode,
                   attention=args.attention, budget=args.budget)
@@ -65,9 +66,13 @@ def main():
                     help="源预缩放：auto=目标 2× 时先 /2")
     ap.add_argument("--encoder", default="auto", choices=list(E.ENCODER_CHOICES))
     ap.add_argument("--crf", type=int, default=15)
+    ap.add_argument("--bitdepth", type=int, default=8, choices=[8, 10],
+                    help="10 位输出（仅 x265 支持；保留模型浮点精度）")
     ap.add_argument("--mode", default="tiny-long", choices=["tiny", "tiny-long"])
     ap.add_argument("--attention", default="sparse", choices=["sparse", "dense"])
     ap.add_argument("--budget", default="auto", choices=["auto", "fixed"])
+    ap.add_argument("--hi-precision", action="store_true",
+                    help="浮点解码（gbrpf32le）：YUV→RGB 全程 float32，不经 8bit 量化；内存 4×")
     args = ap.parse_args()
 
     eng = E.Engine()
