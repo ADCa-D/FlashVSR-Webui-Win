@@ -187,11 +187,6 @@
           <label class="chk" title="解码走 libplacebo 的 gbrpf32le：YUV→RGB 全程 float32，不经 rgb24 的 8bit 量化。内存 4×，超过 2 GB 窗口自动回退">
             <input type="checkbox" id="hiPrec" /> 浮点解码
           </label>
-          <span class="lk" title="实验权重：混合档（FFN 4bit）实测 44.65 dB，比 MXFP8 低 6 dB、只省 0.16 GiB。NVFP4 已停用">实验权重</span>
-          <select id="quantDev">
-            <option value="" selected>跟随主面板</option>
-            <option value="mixed">混合 FFN 4bit（−6 dB，不建议）</option>
-          </select>
           <span class="lk" title="tile 拼接方式：smooth=平滑羽化（默认，4K 实测无接缝）；align=逐块 DC 对齐（实测无收益）；off=线性羽化（对照用）">接缝修正</span>
           <select id="seamFix">
             <option value="smooth" selected>平滑羽化（默认）</option>
@@ -335,8 +330,7 @@ function collectFields(){
   if (dev && $('#deband')) o.prescale_deband = $('#deband').checked ? '1' : '0';
   if (dev && $('#dither')) o.prescale_dither = $('#dither').value;
   if (dev && $('#extraOn').checked) o.extra_args = $('#extraArgs').value;
-  const qDev = dev && $('#quantDev') ? $('#quantDev').value : '';
-  o.quant = qDev || $('#quant').value;
+  o.quant = $('#quant').value;
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
   o.tile_overlap = $('#tileOv').value;
@@ -634,9 +628,7 @@ $('#bitdepth').addEventListener('change', updateEncHint);
   window.__applyArch = applyArch;   // 能力表加载完再调一次
 })();
 function effectiveQuant(){
-  const dev = $('#devMode') && $('#devMode').checked;
-  const qDev = dev && $('#quantDev') ? $('#quantDev').value : '';
-  return qDev || $('#quant').value;
+  return $('#quant').value;
 }
 function updatePresetLabels(){
   document.querySelectorAll('.preset').forEach(el => {
@@ -646,7 +638,7 @@ function updatePresetLabels(){
   });
 }
 $('#quant').onchange = updatePresetLabels;
-if ($('#quantDev')) $('#quantDev').onchange = updatePresetLabels;
+
 if ($('#devMode')) $('#devMode').addEventListener('change', updatePresetLabels);
 updatePresetLabels();
 (async () => {

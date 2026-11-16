@@ -48,9 +48,10 @@ ENCODER_LABEL = {
     "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
     "x265": "CPU · libx265（H.265，均衡）",
 }
-# NVFP4 已停用：画质太差（含它的混合档实测 44.65 dB，比 MXFP8 低 6 dB），
-# 小 token 下也不快；代码保留在 quantize_dit_nvfp4 里备查，但不再对外暴露。
-QUANT_CHOICES = ("none", "mxfp8", "mixed", "w8")
+# NVFP4 与混合档（FFN 用 NVFP4）都已停用：画质比 MXFP8 低 6 dB（44.65 dB vs 50.75 dB），
+# 显存还更大（3.40 GiB vs 2.05 GiB），速度只在超大 token 才占优。
+# 对外只保留三档：bf16 基准 / MXFP8 推荐 / W8A16 老卡兼容。
+QUANT_CHOICES = ("none", "mxfp8", "w8")
 
 
 TUNE_CHOICES = {
@@ -585,6 +586,7 @@ def quantize_dit_nvfp4(pipe, log=None):
 
 
 def quantize_dit_mixed(pipe, log=None):
+    # 【已停用】FFN 用 NVFP4，实测 44.65 dB（比 MXFP8 低 6 dB），仅保留代码备查。
     """混合精度：FFN 用 NVFP4（权重最省、M 最大），注意力/投影保 MXFP8，
     形状不兼容（列数不是 16/32 的倍数）的层自动退回 bf16。
 
@@ -1222,10 +1224,10 @@ def resolve_params(fields, src_path=None):
         encoder = "auto"
     quant = fields.get("quant") or "none"
     note_nv = ""
-    if quant == "nvfp4":
+    if quant in ("nvfp4", "mixed"):
         # 老配置兜底：落到 MXFP8（显存接近、画质高 6 dB），不要静默变 bf16（更容易 OOM）
+        note_nv = f"{quant.upper() if quant == 'nvfp4' else '混合档'} 已停用（画质差），本次改用 MXFP8"
         quant = "mxfp8"
-        note_nv = "NVFP4 已停用（画质差），本次改用 MXFP8"
     if quant not in QUANT_CHOICES:
         quant = "none"
     budget = fields.get("budget") or "auto"
