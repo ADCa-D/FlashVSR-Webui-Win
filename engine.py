@@ -901,6 +901,8 @@ def _param_key(params):
     d["extra_args"] = str(params.get("extra_args") or "").strip()
     d["enc_rev"] = ENCODER_ARGS_REV
     d["prescale_scaler"] = str(params.get("prescale_scaler") or DEFAULT_SCALER)
+    # 面板侧没有 reuse 字段时按 "off" 归一（否则两边指纹不一致 → 续跑混用旧分段）
+    d["reuse"] = str(params.get("reuse") or "off")
     d["prescale_deband"] = bool(params.get("prescale_deband"))
     d["deband_grain"] = params.get("deband_grain")
     d["prescale_dither"] = str(params.get("prescale_dither") or "")
