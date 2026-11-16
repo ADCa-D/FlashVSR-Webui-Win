@@ -187,11 +187,10 @@
           <label class="chk" title="解码走 libplacebo 的 gbrpf32le：YUV→RGB 全程 float32，不经 rgb24 的 8bit 量化。内存 4×，超过 2 GB 窗口自动回退">
             <input type="checkbox" id="hiPrec" /> 浮点解码
           </label>
-          <span class="lk" title="这些量化档实测都有明显代价：NVFP4 只在超大 token 下更快（小 token 反而慢），混合档画质 44.65 dB、只省 0.16 GiB">实验权重</span>
+          <span class="lk" title="实验权重：混合档（FFN 4bit）实测 44.65 dB，比 MXFP8 低 6 dB、只省 0.16 GiB。NVFP4 已停用">实验权重</span>
           <select id="quantDev">
             <option value="" selected>跟随主面板</option>
-            <option value="nvfp4">NVFP4（小 token 下更慢）</option>
-            <option value="mixed">混合 FFN 4bit（−6 dB，省 0.16 GiB）</option>
+            <option value="mixed">混合 FFN 4bit（−6 dB，不建议）</option>
           </select>
           <span class="lk" title="tile 拼接方式：smooth=平滑羽化（默认，4K 实测无接缝）；align=逐块 DC 对齐（实测无收益）；off=线性羽化（对照用）">接缝修正</span>
           <select id="seamFix">
@@ -557,7 +556,7 @@ $('#bitdepth').addEventListener('change', updateEncHint);
 
   // 架构完全自动判定（不再提供手动选择）：NVFP4 需 sm120（Blackwell）；av1_nvenc 需 40 系+
   const HIDE = {
-    other: { enc: ['av1_nvenc'], quant: ['nvfp4'] },
+    other: { enc: ['av1_nvenc'], quant: [] },
     blackwell: { enc: [], quant: [] },
   };
 
@@ -593,18 +592,14 @@ $('#bitdepth').addEventListener('change', updateEncHint);
   function applyArch() {
     const a = effectiveArch();
     const conf = HIDE[a];
-    // 实验权重里的 NVFP4
-    const nv = $('#quantDev') && [...$('#quantDev').options].find(o => o.value === 'nvfp4');
-    if (nv) { nv.hidden = conf.quant.includes('nvfp4'); nv.disabled = nv.hidden; }
-    if (nv && nv.hidden && $('#quantDev').value === 'nvfp4') $('#quantDev').value = '';
     rebuildEncoders();
     const g = (CAPS && CAPS.gpu) || {};
     if (!g.name) {
-      hint.textContent = '未检测到 GPU 架构信息 → 隐藏 NVFP4（需 RTX 50 系 sm120）、av1_nvenc（需 40 系+）';
+      hint.textContent = '未检测到 GPU 架构信息 → 隐藏 av1_nvenc（需 40 系+）';
     } else if (a === 'blackwell') {
-      hint.textContent = `${g.name}（sm ${g.cap || '?'}）· Blackwell：NVFP4 / av1_nvenc 可用`;
+      hint.textContent = `${g.name}（sm ${g.cap || '?'}）· Blackwell：av1_nvenc 可用`;
     } else {
-      hint.textContent = `${g.name}（sm ${g.cap || '?'}）· 非 Blackwell：已隐藏 NVFP4（sm120）与 av1_nvenc（40 系+）`;
+      hint.textContent = `${g.name}（sm ${g.cap || '?'}）· 非 Blackwell：已隐藏 av1_nvenc（需 40 系+）`;
     }
   }
 

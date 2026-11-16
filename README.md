@@ -543,7 +543,7 @@ set FLASHVSR_PREVIEW_WIDTH=1600      REM 默认 1280，且不超过原片宽度
 
 
 - 显存不够会自动降档重试，进度里会写「自动降档重试（第 N 次）：tile=… kv=…」
-- `权重`：MXFP8（推荐，2.05 GiB / 41.56 dB / 最快）/ bf16（3.49 GiB）/ **W8A16**（2.03 GiB、43.33 dB，但不比 bf16 快，仅老卡兼容用）；NVFP4 与混合档在「开发模式」里（实测均有明显代价）
+- `权重`：MXFP8（推荐，2.05 GiB / 41.56 dB / 最快）/ bf16（3.49 GiB）/ **W8A16**（2.03 GiB、43.33 dB，但不比 bf16 快，仅老卡兼容用）；**NVFP4 已停用**（画质太差），混合档只在「开发模式」里且标注 −6 dB
 - `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `qsv`（Intel 核显 HEVC 8bit，**未在本机验证**：本机是 AMD 610M）/ `qsv_h264`（Intel 核显 H.264 8bit，兼容最老）/ `amf`（AMD，**仅 8 bit，同码率画质明显弱于 x264/x265**）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
 - 体积对比（业界 RD 基准，非本机实测）：AV1 比 x264 省 **40–50%** 码率、比 x265 省 **20–30%**；代价是 CPU 编码慢
 - `svtav1` 默认 **preset 4 + lp=4**：preset 越低画质越好、同 CRF 体积越小（p4 比 p10 小 ~30%），而编码耗时相对推理可忽略（4K/50 帧：p4≈7 s、p2≈13 s，推理要 30–90 分钟）。
@@ -726,7 +726,7 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 | 浮点解码（`hi_precision`） | 实验：内存 4×，端到端 PSNR 42.36 dB 的差异，收益未定 |
 | tile 提到 192 | 更快，但高分辨率素材更容易 OOM |
 | 接缝修正 `seam_fix` | `align` 实测无收益（0.54→0.59），只作对照；默认 `smooth` |
-| **实验权重**（`nvfp4` / `mixed`） | NVFP4 只在超大 token 下更快（小 token 反而慢）；混合档画质 44.65 dB、只省 0.16 GiB |
+| **实验权重**（`mixed`） | 混合档（FFN 4bit）画质 44.65 dB、比 MXFP8 低 6 dB，只省 0.16 GiB。NVFP4 已彻底停用 |
 | 附加编码参数（`extra_args`） | GPU 编码器的速率控制/调优没有统一入口，需要自己传 |
 
 固定量化档只剩三个（主面板「权重」）：MXFP8（推荐）、bf16（基准）、W8A16（老卡兼容）。

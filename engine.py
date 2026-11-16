@@ -48,7 +48,9 @@ ENCODER_LABEL = {
     "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
     "x265": "CPU · libx265（H.265，均衡）",
 }
-QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed", "w8")
+# NVFP4 已停用：画质太差（含它的混合档实测 44.65 dB，比 MXFP8 低 6 dB），
+# 小 token 下也不快；代码保留在 quantize_dit_nvfp4 里备查，但不再对外暴露。
+QUANT_CHOICES = ("none", "mxfp8", "mixed", "w8")
 
 
 TUNE_CHOICES = {
@@ -538,6 +540,7 @@ def _drop_weight(m):
 
 
 def quantize_dit_nvfp4(pipe, log=None):
+    # 【已停用】NVFP4 画质太差（混合档实测 44.65 dB），仅保留代码备查。
     """W4A4（NVFP4）。Blackwell 原生 FP4；单层微基准 FFN up 3.78×，误差 0.134。
     注意：激活/权重量化都要 pad_16x=True，否则 CUDA 内核越界（0xC0000005）。"""
     import comfy_kitchen as ck
@@ -1218,11 +1221,18 @@ def resolve_params(fields, src_path=None):
     if encoder not in ENCODER_CHOICES:
         encoder = "auto"
     quant = fields.get("quant") or "none"
+    note_nv = ""
+    if quant == "nvfp4":
+        # 老配置兜底：落到 MXFP8（显存接近、画质高 6 dB），不要静默变 bf16（更容易 OOM）
+        quant = "mxfp8"
+        note_nv = "NVFP4 已停用（画质差），本次改用 MXFP8"
     if quant not in QUANT_CHOICES:
         quant = "none"
     budget = fields.get("budget") or "auto"
     if budget not in ("auto", "fixed"):
         budget = "auto"
+    if note_nv:
+        auto_note = ((auto_note + "；") if auto_note else "") + note_nv
     preview = str(fields.get("preview", "1")).lower() not in ("0", "false", "off", "no")
     try:
         quality = int(float(fields.get("quality") or 15))
