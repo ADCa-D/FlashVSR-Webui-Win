@@ -176,6 +176,25 @@ REM qsv_h264（H.264 8bit，兼容最老）：
 3. **只降级，不中断**：每一步都往进度里写原因（如 `Error creating a MFX session: -9`），
    所以"跑不通"发生在第 1 段的前 2 秒，而不是跑完 87 段后才发现。
 
+降级顺序可以改（不用动代码）：
+
+```bat
+set FLASHVSR_FALLBACK_CHAIN=x265>svtav1>cpu          REM 对所有后端生效
+set FLASHVSR_FALLBACK_CHAIN=qsv=qsv_h264>x265>cpu    REM 只覆盖 qsv
+```
+
+默认链条里 AV1 排在 x265 **之后**，理由是本机 4K/50 帧实测（同样 4 线程）：
+
+| 编码器 | 耗时 | 体积 |
+|---|---|---|
+| x265 crf20 | **3.9 s** | **2.7 MB** |
+| svtav1 p4 crf24 | 8.1 s | 3.5 MB |
+| x264 crf18 | 13.3 s | 4.5 MB |
+
+（不是等画质对比，但足以说明：把 AV1 放兜底位置既不会更快也不会更小。）
+兜底要的是"大概率成功 + 代价可控"，所以先 x265；AV1 是**一等选择**——
+`svtav1` / `av1_nvenc` 都在编码器下拉框里，只是不进兜底位。
+
 `auto` 的实际选择顺序是 **cpu → x265 → nvenc → qsv → qsv_h264 → amf**：
 GPU 编码会和推理抢显存与功耗预算（实测 NVENC/AMF 都不划算），只当 CPU 不可用时兜底。
 
