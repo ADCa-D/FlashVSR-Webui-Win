@@ -45,7 +45,8 @@ def keys(src, **over):
                   pre_scale=P["pre_scale"], tile_overlap=P["tile_overlap"],
                   bitdepth=P["bitdepth"], hi_precision=P["hi_precision"],
                   max_frames=P["max_frames"], color_fix=P["color_fix"],
-                  seam_fix=P["seam_fix"], restart=False, seg_dir=ROOT_SEG)
+                  seam_fix=P["seam_fix"], tune=P["tune"], extra_args=P["extra_args"],
+                  restart=False, seg_dir=ROOT_SEG)
     eng = os.path.basename(os.path.join(ROOT_SEG, f"{E.quick_hash(src)}_{E._param_key(params)}"))
     app = os.path.basename(A._seg_key_dir(src, P, ROOT_SEG))
     return eng, app
@@ -66,7 +67,9 @@ def main():
     if e != base_eng:
         fails.append("bitdepth=10 不该换目录，却换了")
 
-    for tag, over in (("color_fix=0", {"color_fix": "0"}),
+    for tag, over in (("tune=psnr", {"tune": "psnr"}),
+                      ("extra_args 非空", {"extra_args": "-rc vbr"}),
+                      ("color_fix=0", {"color_fix": "0"}),
                       ("seam_fix=align", {"seam_fix": "align"}),
                       ("hi_precision=1", {"hi_precision": "1"}),
                       ("max_frames=48", {"max_frames": "48"}),

@@ -50,7 +50,20 @@ ENCODER_LABEL = {
 QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed", "w8")
 
 
-def encoder_args(backend, quality, bitdepth=8, svt_preset=None):
+TUNE_CHOICES = {
+    "cpu": ("ssim", "psnr", "film", "animation", "grain", "stillimage",
+            "fastdecode", "zerolatency"),
+    "x265": ("ssim", "psnr", "grain", "fastdecode", "zerolatency"),
+    "svtav1": ("vq", "psnr", "ssim", "ms_ssim", "vmaf"),
+}
+# SVT-AV1 的 tune 只认**数值**（名字会静默退回 PSNR）：
+# 0=VQ 1=PSNR 2=SSIM 3=IQ(仅 all-intra) 4=MS_SSIM 5=VMAF
+SVT_TUNE_NUM = {"vq": 0, "psnr": 1, "ssim": 2, "ms_ssim": 4, "vmaf": 5}
+TUNE_ALL = ("", "ssim", "psnr", "vq", "vmaf", "ms_ssim", "film", "animation",
+            "grain", "stillimage", "fastdecode", "zerolatency")
+
+
+def _encoder_base(backend, quality, bitdepth=8, svt_preset=None, tune=None):
     q = str(int(quality))
     # 10-bit：只有 x265 在本机验证可用（x264 是 8bit 构建、SVT-AV1 在 4K 下 10bit 会 OOM）
     pix = "yuv420p10le" if (int(bitdepth) == 10 and backend == "x265") else "yuv420p"
@@ -88,20 +101,69 @@ def encoder_args(backend, quality, bitdepth=8, svt_preset=None):
         # 用户主动选 svtav1 → 用 FLASHVSR_SVT_PRESET（默认 4，质量档）；
         # 作为**兜底**时由 encode_win 传 svt_preset="8"（4K 实测 p8 只要 p4 的 1/2.8 时间）
         preset = str(svt_preset or os.environ.get("FLASHVSR_SVT_PRESET", "4"))
-        return ["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
-                "-svtav1-params", "lp=4", "-g", "240", "-pix_fmt", "yuv420p"]
+        svt = ["lp=4"]
+        if tune in SVT_TUNE_NUM:
+            # 必须传数值：`tune=vq` 这种名字 form 会被拒（Error parsing option tune: vq）
+            # 然后**静默退回 PSNR**，不报错。IQ(3) 只支持 all-intra，视频会直接失败，故不提供。
+            svt.append(f"tune={SVT_TUNE_NUM[tune]}")
+        return (["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
+                 "-svtav1-params", ":".join(svt), "-g", "240", "-pix_fmt", "yuv420p"])
     if backend == "x265":
         # 共享功耗墙：CPU 编码线程开太多会抢走 GPU 的 boost 预算。
         # 注意：`-threads N` 对 libx265 **不生效** —— 实测 -threads 4 时它照样建 32 线程池，
         # 并发 16.1×；真正限住要写 `-x265-params pools=N`（实测 4.0×，代价 wall 3.9→8.9s）。
         pools = os.environ.get("FLASHVSR_X265_POOLS", "4")
-        args = ["-c:v", "libx265", "-preset", "medium", "-crf", q,
-                "-threads", str(pools), "-pix_fmt", pix]
+        x265_params = []
         if pools and str(pools).isdigit() and int(pools) > 0:
-            args += ["-x265-params", f"pools={pools}"]
+            x265_params.append(f"pools={pools}")
+        th = pools if (pools and str(pools).isdigit() and int(pools) > 0) else "4"
+        args = ["-c:v", "libx265", "-preset", "medium", "-crf", q,
+                "-threads", str(th), "-pix_fmt", pix]
+        if x265_params:
+            args += ["-x265-params", ":".join(x265_params)]
+        if tune and tune in TUNE_CHOICES["x265"]:
+            args += ["-tune", tune]
         return args
-    return ["-c:v", "libx264", "-preset", "slow", "-crf", q,
+    args = ["-c:v", "libx264", "-preset", "slow", "-crf", q,
             "-threads", "4", "-pix_fmt", "yuv420p"]
+    if tune and tune in TUNE_CHOICES["cpu"]:
+        args += ["-tune", tune]
+    return args
+
+
+def encoder_args(backend, quality, bitdepth=8, svt_preset=None, tune=None, extra=None):
+    """统一出口：所有后端的参数 + 开发模式附加参数（extra 一律追加在末尾，覆盖前值）。"""
+    return _encoder_base(backend, quality, bitdepth, svt_preset, tune) + list(extra or [])
+
+
+_SVT_TUNE_CAPS = None
+
+
+def svt_tune_caps(force=False):
+    """本机这个 SVT-AV1 版本实际支持哪些 tune（试编 1 帧，按退出码判断）。
+
+    版本差异真实存在：v4.2 是 0=VQ 1=PSNR 2=SSIM 3=IQ 4=MS_SSIM 5=VMAF，
+    更老的版本只有 0..2。写死映射迟早出错，所以每次装新 ffmpeg 都重新问它。
+    """
+    global _SVT_TUNE_CAPS
+    if _SVT_TUNE_CAPS is not None and not force:
+        return _SVT_TUNE_CAPS
+    ok = []
+    for name, num in SVT_TUNE_NUM.items():
+        try:
+            r = subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-f", "lavfi",
+                 "-i", "color=c=gray:s=160x120:r=5:d=0.2", "-frames:v", "1",
+                 "-c:v", "libsvtav1", "-crf", "32",
+                 "-svtav1-params", f"lp=2:tune={num}", "-f", "null", "-"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=90)
+            if r.returncode == 0:
+                ok.append(name)
+        except Exception:  # noqa
+            pass
+    _SVT_TUNE_CAPS = ok
+    return ok
 
 
 # 走 GPU 编码的引擎：初始化失败（驱动/核显不支持该 codec，或撑不住目标分辨率）时自动降级
@@ -654,6 +716,9 @@ def _param_key(params):
     d["seam_fix"] = str(params.get("seam_fix") or "smooth")
     d["hi_precision"] = bool(params.get("hi_precision"))
     d["max_frames"] = int(params.get("max_frames") or 0)
+    # 空串与缺省必须等价，否则面板（resolve_params 给 ""）和引擎（没传）会算出不同键
+    d["tune"] = str(params.get("tune") or "")
+    d["extra_args"] = str(params.get("extra_args") or "").strip()
     return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 
 
@@ -875,7 +940,7 @@ def extract_preview(path, idx, fps, out_path, width=640):
 
 
 def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend="cpu",
-                  bitdepth=8, svt_preset=None):
+                  bitdepth=8, svt_preset=None, tune=None, extra=None):
     h, w = frames_u8.shape[1], frames_u8.shape[2]
     cmd = [FFMPEG, "-y", "-v", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
@@ -884,7 +949,8 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         # 音轨和字幕流都无损 copy（字幕没有就静默跳过）
         cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
                 "-c:a", "copy", "-c:s", "copy", "-shortest"]
-    cmd += encoder_args(backend, quality, bitdepth, svt_preset) + ["-fps_mode", "cfr", out_path]
+    cmd += encoder_args(backend, quality, bitdepth, svt_preset, tune, extra) + \
+        ["-fps_mode", "cfr", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     for i in range(0, len(frames_u8), 8):
         proc.stdin.write(frames_u8[i:i + 8].tobytes())
@@ -894,7 +960,8 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         raise RuntimeError(f"{backend} 编码失败：" + err.strip()[-400:])
 
 
-def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=15, bitdepth=8):
+def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=15,
+                    bitdepth=8, tune=None, extra=None):
     if not seg_paths:
         raise RuntimeError("没有可拼接的分段")
     tmp_dir = os.path.dirname(seg_paths[0])
@@ -909,7 +976,8 @@ def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=
     r = subprocess.run(base + ["-c", "copy", silent],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not os.path.exists(silent) or os.path.getsize(silent) < 1024:
-        r = subprocess.run(base + encoder_args(backend, quality, bitdepth) + [silent],
+        r = subprocess.run(base + encoder_args(backend, quality, bitdepth, None, tune, extra)
+                           + [silent],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0:
             raise RuntimeError("分段拼接失败：" + (r.stderr or "")[-400:])
@@ -1043,6 +1111,10 @@ def resolve_params(fields, src_path=None):
 
     bitdepth = 10 if str(fields.get("bitdepth") or "8").strip() == "10" else 8
     hi_precision = str(fields.get("hi_precision") or "0").strip() in ("1", "true", "on", "yes")
+    tune = str(fields.get("tune") or "").strip().lower()
+    if tune not in TUNE_ALL:
+        tune = ""
+    extra_args = str(fields.get("extra_args") or "").strip()[:300]
     try:
         max_frames = max(0, int(fields.get("max_frames") or 0))
     except (TypeError, ValueError):
@@ -1056,7 +1128,7 @@ def resolve_params(fields, src_path=None):
                 quant=quant, budget=budget, pre_scale=pre_scale,
                 tile_overlap=tile_overlap, bitdepth=bitdepth,
                 hi_precision=hi_precision, color_fix=color_fix, seam_fix=seam_fix,
-                max_frames=max_frames,
+                max_frames=max_frames, tune=tune, extra_args=extra_args,
                 preview=preview, auto_note=auto_note)
 
 
@@ -1306,6 +1378,20 @@ class Engine:
                      f"{backend} 不支持 10 bit，本次按 8 bit 输出（要 10 bit 请用 x265 或 qsv）")
             bitdepth = 8
         budget_mode = params.get("budget") or "auto"
+        # 开发模式：用户自传编码参数（GPU 编码器的 -rc/-cq/-tune 之类没有统一入口）
+        extra_args = []
+        raw_extra = str(params.get("extra_args") or "").strip()
+        if raw_extra:
+            import shlex
+            if len(raw_extra) > 300 or "\n" in raw_extra:
+                on_stage("encode", 0, 0, "附加参数过长或含换行，已忽略")
+            else:
+                try:
+                    extra_args = shlex.split(raw_extra, posix=False)
+                    extra_args = [a.strip('"') for a in extra_args]
+                    on_stage("encode", 0, 0, "已附加自定义编码参数：" + " ".join(extra_args))
+                except ValueError as e:
+                    on_stage("encode", 0, 0, f"附加参数解析失败，已忽略：{e}")
 
         def encode_win(frames_in, path, audio_src=None):
             """统一编码入口：沿 FALLBACK_CHAIN 降级（qsv→qsv_h264→x265→cpu），并记住能用的那个。
@@ -1330,7 +1416,8 @@ class Engine:
                     svt_p = "8" if (be == "svtav1" and be != primary) else None
                     encode_frames(frames_in, info["fps"], path, audio_src,
                                   quality=quality, backend=be, bitdepth=bd,
-                                  svt_preset=svt_p)
+                                  svt_preset=svt_p, tune=params.get("tune"),
+                                  extra=extra_args)
                     if be != backend:
                         on_stage("encode", 0, 0,
                                  f"编码器 {backend} 不可用，已改用 {be}（后续段沿用）")
@@ -1499,7 +1586,8 @@ class Engine:
                      **({"preview": pv, "pv_cur": i + 1, "pv_total": n_seg} if pv else {}))
 
         on_stage("encode", 0, 1, f"拼接 {n_seg} 段 + 混入音轨")
-        concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality, bitdepth=bitdepth)
+        concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality,
+                        bitdepth=bitdepth, tune=params.get("tune"), extra=extra_args)
         got = probe_frames(dst)
         if got and got != total:
             on_stage("encode", 1, 1,

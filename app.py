@@ -450,8 +450,10 @@ async def presets(request):
 
 async def capabilities(request):
     caps = await asyncio.get_running_loop().run_in_executor(EXECUTOR, E.get_caps)
+    tunes = await asyncio.get_running_loop().run_in_executor(EXECUTOR, E.svt_tune_caps)
     return web.json_response({"encoders": caps, "labels": E.ENCODER_LABEL,
-                              "choices": list(E.ENCODER_CHOICES)})
+                              "choices": list(E.ENCODER_CHOICES),
+                              "svt_tunes": tunes})
 
 
 async def run(request):
@@ -565,6 +567,7 @@ async def run(request):
                        tile_overlap=tile_overlap, bitdepth=P["bitdepth"],
                        hi_precision=P["hi_precision"], max_frames=P["max_frames"],
                        color_fix=P["color_fix"], seam_fix=P["seam_fix"],
+                       tune=P["tune"], extra_args=P["extra_args"],
                        preview_dir=(os.path.join(WORK, "preview", jid) if preview else None),
                        restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))

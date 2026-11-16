@@ -140,7 +140,25 @@
         <option value="8" selected>8 bit</option>
         <option value="10">10 bit（仅 x265）</option>
       </select>
+      <span class="lk" title="编码器调优（只有 CPU 编码器有统一入口）：x264/x265 用 -tune，svtav1 用 tune=vq/psnr/ssim；GPU 编码器请用开发模式自传参数">调优</span>
+      <select id="tune">
+        <option value="" selected>默认</option>
+        <option value="ssim">ssim（结构相似）</option>
+        <option value="psnr">psnr（信噪比）</option>
+        <option value="vq">vq（AV1 主观）</option>
+        <option value="ms_ssim">ms_ssim（AV1）</option>
+        <option value="vmaf">vmaf（AV1，主观+锐化）</option>
+        <option value="film">film（x264 系）</option>
+        <option value="animation">animation（x264 系）</option>
+        <option value="grain">grain（保颗粒）</option>
+        <option value="stillimage">stillimage（x264）</option>
+        <option value="fastdecode">fastdecode（解码省算力）</option>
+        <option value="zerolatency">zerolatency（低延迟）</option>
+      </select>
       <label class="chk" title="解码走 libplacebo 的 gbrpf32le：YUV→RGB 全程 float32，不经 rgb24 的 8bit 量化。56 帧 1080p 约多花 0.8 s，内存 4×（超过 2 GB 窗口自动回退）"><input type="checkbox" id="hiPrec" /> 浮点解码</label>
+      <label class="chk" title="开发模式：显示「附加编码参数」。GPU 编码器的速率控制/调优没有统一入口，需要自己传（例如 -rc vbr -cq 22 -tune hq）"><input type="checkbox" id="devMode" /> 开发模式</label>
+      <input id="extraArgs" type="text" placeholder="附加参数：-rc vbr -cq 22"
+             style="display:none;width:240px;font-family:var(--mono, monospace)" />
       <span class="lk">权重</span>
       <select id="quant">
         <option value="mxfp8" selected>MXFP8（推荐）</option>
@@ -265,6 +283,8 @@ function collectFields(){
   o.quality = $('#quality').value;
   o.bitdepth = $('#bitdepth').value;
   o.hi_precision = $('#hiPrec').checked ? '1' : '0';
+  o.tune = $('#tune').value;
+  if ($('#devMode').checked) o.extra_args = $('#extraArgs').value;
   o.quant = $('#quant').value;
   o.budget = $('#budgetAuto').checked ? 'auto' : 'fixed';
   o.prescale = $('#prescale').value;
@@ -453,7 +473,11 @@ function updateEncHint(){
   else if (be === 'amf') parts.push('仅 8 bit（无 10 bit），同码率画质弱于 x264/x265；兜底用');
   else if (be === 'nvenc') parts.push('与推理共用独显，会占一点显存');
   else if (be === 'av1_nvenc') parts.push('硬件 AV1，40/50 系支持；体积比 H.264 小一半');
-  else if (be === 'svtav1') parts.push('CPU 软件 AV1：体积最小；preset 4（质量档，4K/50帧约 7 s），lp 固定 4');
+  else if (be === 'svtav1') {
+    const st = (CAPS && CAPS.svt_tunes) || [];
+    parts.push('CPU 软件 AV1：preset 4，lp 固定 4' +
+               (st.length ? '；本机 tune 支持 ' + st.join(' / ') : '；tune 支持面未知'));
+  }
   else if (be === 'x265') parts.push('CPU H.265，体积比 x264 小 30–40%，慢一倍');
   else parts.push('CPU 编码与 GPU 推理天然并行，通常最快');
   if ($('#bitdepth').value === '10' && be !== 'x265' && be !== 'qsv') {
@@ -467,6 +491,16 @@ function updateEncHint(){
   $('#qLabel').textContent = q;
 }
 $('#bitdepth').addEventListener('change', updateEncHint);
+
+// ---------- 开发模式：附加编码参数
+(() => {
+  const dev = $('#devMode');
+  const box = $('#extraArgs');
+  const apply = () => { box.style.display = dev.checked ? '' : 'none'; };
+  dev.checked = localStorage.getItem('fs_dev') === '1';
+  apply();
+  dev.onchange = () => { localStorage.setItem('fs_dev', dev.checked ? '1' : '0'); apply(); };
+})();
 function updatePresetLabels(){
   const up = $('#tileUp').checked;
   const quant = $('#quant').value;

@@ -592,6 +592,47 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 
 面板提交时会自动把 tile 对齐到安全步长，并在任务参数里显示实际使用值。
 
+## 编码器调优（tune）与开发模式
+
+### 各编码器的 tune 入口不一样
+
+| 编码器 | 写法 | 可用值 |
+|---|---|---|
+| `cpu`（x264） | `-tune X` | ssim、psnr、film、animation、grain、stillimage、fastdecode、zerolatency |
+| `x265` | `-tune X` | ssim、psnr、grain、fastdecode、zerolatency |
+| `svtav1` | `-svtav1-params ...:tune=N`（**只能传数字**） | 0=VQ、1=PSNR、2=SSIM、3=IQ、4=MS_SSIM、5=VMAF |
+| GPU（nvenc/qsv/amf） | 无统一入口 | 走「开发模式」自己传 |
+
+两个坑，都实测过：
+
+1. **SVT 传名字会被静默忽略**：`tune=vq` → 打一行 `Error parsing option tune: vq.`，
+   然后**退回 PSNR**，退出码仍是 0。所以本项目只传数字，并用 `svt_tune_caps()` 在启动时
+   实编 1 帧确认本机版本支持哪些（老版本只到 2=SSIM）。
+2. **`tune=3` 是 IQ**，只支持 all-intra / low-delay，视频会直接报
+   `Tune IQ only supports all-intra and low delay ...`，所以下拉框不提供。
+3. `tune=5`（VMAF）会启用 SVT 自己的锐化预处理（日志里有
+   `Tune VMAF: a pre-processing / unsharp masking is applied`），适合"对齐 VMAF 指标"，
+   不适合追求自然观感。
+
+### 开发模式（自定义编码参数）
+
+面板勾「开发模式」后出现一个输入框，内容会**原样追加**到 ffmpeg 编码参数末尾
+（后写的覆盖前面的），例如 NVIDIA：
+
+```text
+-rc vbr -cq 22 -tune hq -spatial-aq 1
+```
+
+用途：GPU 编码器的速率控制/调优各家不同，没法做统一 UI。注意它是**本机执行的命令行参数**，
+只给可信的人用（面板有登录，但别把账号密码给不该给的人）。服务端限制：≤300 字符、不含换行。
+
+CLI 等价写法：
+
+```bat
+python inference.py -s in.mp4 -o out.mp4 --tune ssim
+python inference.py -s in.mp4 -o out.mp4 --encoder nvenc --extra "-rc vbr -cq 22 -tune hq"
+```
+
 ## 命令行（CLI）
 
 面板不是唯一入口，`inference.py` 直接调引擎，参数语义与面板完全一致（共用 `engine.resolve_params`）：
