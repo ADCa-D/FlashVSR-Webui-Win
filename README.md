@@ -78,7 +78,8 @@ VAE 解码占 kernel 时间约 65%，理论上最值得加速。实测确实能�
 |---|---|---|
 | 权重加载 | `RAYON_NUM_THREADS=4` / `OMP_NUM_THREADS=4`（`config.py`） | 吞吐早被磁盘/PCIe 卡住，32 核全开只是更热 |
 | 权重下载 | `max_workers=4` | 同上 |
-| 视频解码 | `-threads 4`（`FLASHVSR_DEC_THREADS` 可覆盖） | 解码不是瓶颈，线程多只会抢 GPU 的功耗 |
+| 视频解码 | `-threads 4`（`FLASHVSR_DEC_THREADS` 可覆盖） | 4 线程是拐点：wall 0.71 s / CPU 6.1 s，比 8/32 线程又快又省 |
+| （不用硬件解码） | D3D11VA / NVDEC 实测更差 | 4K/50 帧：CPU 0.71 s vs d3d11va 1.06 s vs cuda 1.03 s；瓶颈是 YUV→rgb24 的 swscale，不是解码 |
 | CPU 编码（x264/x265） | `-threads 4` | 编码耗时相对推理可忽略，没必要吃满 CPU |
 | SVT-AV1 | `preset 4` + `lp=4` | 同上；且默认 32 核并行在 4K 下会 ENOMEM |
 
