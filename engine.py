@@ -91,9 +91,15 @@ def encoder_args(backend, quality, bitdepth=8, svt_preset=None):
         return ["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
                 "-svtav1-params", "lp=4", "-g", "240", "-pix_fmt", "yuv420p"]
     if backend == "x265":
-        # 共享功耗墙：CPU 编码线程开太多会抢走 GPU 的 boost 预算，而编码本身不是瓶颈
-        return ["-c:v", "libx265", "-preset", "medium", "-crf", q,
-                "-threads", "4", "-pix_fmt", pix]
+        # 共享功耗墙：CPU 编码线程开太多会抢走 GPU 的 boost 预算。
+        # 注意：`-threads N` 对 libx265 **不生效** —— 实测 -threads 4 时它照样建 32 线程池，
+        # 并发 16.1×；真正限住要写 `-x265-params pools=N`（实测 4.0×，代价 wall 3.9→8.9s）。
+        pools = os.environ.get("FLASHVSR_X265_POOLS", "4")
+        args = ["-c:v", "libx265", "-preset", "medium", "-crf", q,
+                "-threads", str(pools), "-pix_fmt", pix]
+        if pools and str(pools).isdigit() and int(pools) > 0:
+            args += ["-x265-params", f"pools={pools}"]
+        return args
     return ["-c:v", "libx264", "-preset", "slow", "-crf", q,
             "-threads", "4", "-pix_fmt", "yuv420p"]
 
