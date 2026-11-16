@@ -105,6 +105,9 @@
       <label class="chk"><input type="checkbox" id="chunkOn" checked /> 长视频分段</label>
       <input id="chunk" type="number" min="8" max="400" step="8" value="48" title="帧/段；填 0 = 按显存自动（太大时会自动下调）" />
       <span style="color:var(--dim);font-size:12px">帧/段</span>
+      <span class="lk" title="只跑前 N 帧：先用 2 秒验证参数（tile / overlap / 量化），别等整片跑完才发现不对">试跑</span>
+      <input id="maxFrames" type="number" min="0" max="9999" step="8" value="0" />
+      <span style="color:var(--dim);font-size:12px">帧（0=全片）</span>
       <label class="chk"><input type="checkbox" id="resume" checked /> 续跑</label>
       <label class="chk" title="每段跑完随机抽一帧推到进度下方"><input type="checkbox" id="previewOn" checked /> 分段预览</label>
     </div>
@@ -254,6 +257,7 @@ function collectFields(){
   const o = {};
   Object.entries(presetParams()).forEach(([k, v]) => o[k] = v);
   o.chunk = $('#chunkOn').checked ? $('#chunk').value : '0';
+  o.max_frames = $('#maxFrames').value || '0';
   o.restart = $('#resume').checked ? '0' : '1';
   o.mode = $('#mode').value;
   o.attention = $('#attention').value;

@@ -896,6 +896,10 @@ def resolve_params(fields, src_path=None):
 
     bitdepth = 10 if str(fields.get("bitdepth") or "8").strip() == "10" else 8
     hi_precision = str(fields.get("hi_precision") or "0").strip() in ("1", "true", "on", "yes")
+    try:
+        max_frames = max(0, int(fields.get("max_frames") or 0))
+    except (TypeError, ValueError):
+        max_frames = 0
     color_fix = str(fields.get("color_fix") or "1").strip() not in ("0", "false", "off", "no")
     seam_fix = str(fields.get("seam_fix") or "smooth").strip().lower()
     if seam_fix not in ("off", "smooth", "align"):
@@ -905,6 +909,7 @@ def resolve_params(fields, src_path=None):
                 quant=quant, budget=budget, pre_scale=pre_scale,
                 tile_overlap=tile_overlap, bitdepth=bitdepth,
                 hi_precision=hi_precision, color_fix=color_fix, seam_fix=seam_fix,
+                max_frames=max_frames,
                 preview=preview, auto_note=auto_note)
 
 
@@ -1096,6 +1101,10 @@ class Engine:
         # 分段时只解当前窗口需要的帧（原来会把整段视频一次解完，30 帧/段也照样吃满内存）
         info = probe(src)
         total = int(info.get("frames") or 0) or int(round(info.get("duration", 0) * info.get("fps", 25)))
+        # 试跑：只处理前 N 帧（0/缺省 = 全片）。分段、续跑、指标都跟着这个上限走。
+        max_frames = max(0, int(params.get("max_frames") or 0))
+        if max_frames and 0 < max_frames < total:
+            total = max_frames
         # 浮点解码：YUV→RGB 全程 float32（libplacebo），不再经过 rgb24 的 8bit 量化。
         # 不做预缩放时也有效（省掉 swscale 的四舍五入与抖动），代价是每帧内存 4×。
         fp32 = bool(params.get("hi_precision"))
@@ -1112,9 +1121,18 @@ class Engine:
                 on_stage("decode", 0, total, f"浮点解码（gbrpf32le，窗口约 {gb:.2f} GB）")
         frames = None
         if chunk <= 0 or total <= chunk or total <= 0:
-            frames, info = decode_frames(
-                src, on_progress=lambda n: on_stage("decode", n, 0, f"解码中 {n} 帧"),
-                pre_scale=pre_scale, fp32=fp32)
+            if max_frames:
+                # 试跑路径：只解前 total 帧，不把整段视频读进内存
+                frames = decode_frames_range(
+                    src, 0, total, pre_scale=pre_scale, fps=info["fps"], fp32=fp32,
+                    on_progress=lambda n: on_stage("decode", n, total, f"解码中 {n}/{total} 帧"))
+                if abs(pre_scale - 1.0) > 1e-6:
+                    info["w"] = max(2, int(round(info["w"] * pre_scale / 2)) * 2)
+                    info["h"] = max(2, int(round(info["h"] * pre_scale / 2)) * 2)
+            else:
+                frames, info = decode_frames(
+                    src, on_progress=lambda n: on_stage("decode", n, 0, f"解码中 {n} 帧"),
+                    pre_scale=pre_scale, fp32=fp32)
             total = len(frames)
             on_stage("decode", total, total, f"共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
         else:

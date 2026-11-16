@@ -562,7 +562,7 @@ async def run(request):
                        encoder=encoder, quality=quality,
                        quant=quant, budget=budget, pre_scale=pre_scale,
                        tile_overlap=tile_overlap, bitdepth=P["bitdepth"],
-                       hi_precision=P["hi_precision"],
+                       hi_precision=P["hi_precision"], max_frames=P["max_frames"],
                        preview_dir=(os.path.join(WORK, "preview", jid) if preview else None),
                        restart=restart,
                        seg_dir=os.path.join(WORK, "segments"))

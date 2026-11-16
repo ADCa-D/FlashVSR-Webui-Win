@@ -23,7 +23,8 @@ def build_params(args, src):
     fields = dict(preset=args.preset)
     if args.preset == "custom":
         fields.update(scale=args.scale, tile=args.tile, kv=args.kv)
-    fields.update(chunk=args.chunk, quant=args.quant, encoder=args.encoder,
+    fields.update(chunk=args.chunk, max_frames=args.frames,
+                  quant=args.quant, encoder=args.encoder,
                   bitdepth=args.bitdepth, hi_precision=1 if args.hi_precision else 0,
                   quality=args.crf, prescale=args.prescale,
                   tile_overlap=args.overlap, mode=args.mode,
@@ -61,6 +62,8 @@ def main():
     ap.add_argument("--kv", type=float, default=3.0)
     ap.add_argument("--overlap", type=int, default=24, help="tile 重叠（羽化带，越大接缝越稳）")
     ap.add_argument("--chunk", type=int, default=48, help="帧/段，0=不分段")
+    ap.add_argument("--frames", type=int, default=0,
+                    help="只处理前 N 帧（试跑用，0=全片）")
     ap.add_argument("--quant", default="mxfp8", choices=list(E.QUANT_CHOICES))
     ap.add_argument("--prescale", default="auto", choices=["auto", "half", "off"],
                     help="源预缩放：auto=目标 2× 时先 /2")
