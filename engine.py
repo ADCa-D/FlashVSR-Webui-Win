@@ -59,8 +59,8 @@ def encoder_args(backend, quality):
         return ["-c:v", "h264_amf", "-quality", "high_quality",
                 "-rc", "hqvbr", "-qvbr_quality_level", q, "-pix_fmt", "yuv420p"]
     if backend == "svtav1":
-        # SVT-AV1 的 crf 范围 0–63，preset 0–13（越大越快）
-        return ["-c:v", "libsvtav1", "-crf", q, "-preset", "8",
+        # SVT-AV1 的 crf 范围 0–63；preset 10≈实时档（4–8 是归档级，4K 下慢到不可用且吃 2–4 GB 内存）
+        return ["-c:v", "libsvtav1", "-crf", q, "-preset", "10",
                 "-g", "240", "-pix_fmt", "yuv420p"]
     if backend == "x265":
         return ["-c:v", "libx265", "-preset", "medium", "-crf", q, "-pix_fmt", "yuv420p"]
