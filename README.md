@@ -270,7 +270,7 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 - `权重`：MXFP8（推荐）/ bf16（基准）/ NVFP4（4bit，未必更快）/ 混合（FFN 4bit，省 0.16 GiB、画质 44.65 dB）/ **W8A16**（通用 fp8 权重，30/40 系也能用）
 - `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `amf`（AMD）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
 - 体积对比（业界 RD 基准，非本机实测）：AV1 比 x264 省 **40–50%** 码率、比 x265 省 **20–30%**；代价是 CPU 编码慢
-- `svtav1` 的坑：默认按逻辑核数并行，**4K + preset≤8 会直接 ENOMEM**（本机 32 核实测：`lp=4` 成功、`lp=8/12` 失败）。面板固定 `preset 10 + lp=4`，可用环境变量 `FLASHVSR_SVT_LP` 调整；追求更小体积再上 preset 8
+- `svtav1` 的坑：默认按逻辑核数并行，**4K + preset≤8 会直接 ENOMEM**（本机 32 核实测：`lp=4` 成功、`lp=8/12` 失败）。面板**固定 `preset 10 + lp=4`**（不给可调入口，避免踩回去）
 - `质量`：x264/x265/AOM 是 CRF（10–28，越小越好）；NVENC 是 CQ；AMF 是 QVBR；SVT-AV1 的 CRF 范围是 0–63（我们默认 15，已是高质量）
 - 输出统一 `yuv420p`，保证 Windows 播放器与剪辑软件兼容（AV1 需要系统装 AV1 扩展才能用「电影和电视」播放）
 
