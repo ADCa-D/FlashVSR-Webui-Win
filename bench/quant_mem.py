@@ -14,6 +14,13 @@ q = sys.argv[1] if len(sys.argv) > 1 else "none"
 def main():
     eng = E.Engine()
     eng.ensure_loaded("tiny-long", "sparse", quant=q)
+    # init_pipeline() 结尾会把 DiT offload 到 CPU；静态 bf16 若直接量只看到缓冲，
+    # 会得出"bf16 只占 0.1 GiB"的错误结论。统一搬回 GPU 再量。
+    try:
+        E.dit_to_cuda(eng.pipe)
+        E.dit_to_cuda(eng.pipe)  # 二次幂等，确保 LQ_proj_in 等子模块也在
+    except Exception as e:  # noqa
+        print(f"[warn] 搬回 GPU 失败：{e}", flush=True)
     torch.cuda.synchronize()
     alloc = torch.cuda.memory_allocated() / 2 ** 30
     reserved = torch.cuda.memory_reserved() / 2 ** 30

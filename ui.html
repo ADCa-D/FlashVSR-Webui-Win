@@ -160,7 +160,7 @@
       <select id="quant">
         <option value="mxfp8" selected>MXFP8（推荐）</option>
         <option value="none">bf16（基准）</option>
-        <option value="w8" title="权重存 fp8、前向反量化回 bf16：30/40 系等无 fp8 张量核的卡也能用（尚未实测显存/速度）">W8A16（通用 fp8，未实测）</option>
+        <option value="w8" title="实测：显存 2.03 GiB（比 MXFP8 还略省）、画质 43.33 dB（比 MXFP8 高 1.8 dB），但速度与 bf16 相同——因为它每次前向要把 fp8 权重反量化回 bf16。仅推荐给没有 fp8 张量核的 30/40 系">W8A16（老卡兼容，画质最好但不更快）</option>
       </select>
     </div>
     <div class="hint" id="encHint"></div>
