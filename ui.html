@@ -135,7 +135,7 @@
         <option value="auto">自动</option>
       </select>
       <span class="lk">质量<span id="qLabel" style="font-size:11px">（CRF）</span></span>
-      <input id="quality" type="number" min="10" max="28" step="1" value="15" />
+      <input id="quality" type="number" min="10" max="40" step="1" value="15" data-prevdef="15" />
       <span class="lk" title="10 位输出能保留模型浮点精度的低位，减少渐变处色带；仅 x265 支持">位深</span>
       <select id="bitdepth">
         <option value="8" selected>8 bit</option>
@@ -507,8 +507,19 @@ function watch(id){
 
 // ---------- 编码器能力
 let CAPS = null;
+const QUALITY_DEFAULT = { svtav1: 23, av1_nvenc: 23 };   // 实测甜点，见 README
+function qualityDefault(be){ return QUALITY_DEFAULT[be] || 15; }
+
 function updateEncHint(){
   const be = $('#encoder').value;
+  // 切换编码器时带上它自己的默认 CRF（只在用户没手动改过时切）
+  const qEl = $('#quality');
+  if (qEl) {
+    const prev = +qEl.dataset.prevdef || 15;
+    const next = qualityDefault(be);
+    if (+qEl.value === prev) qEl.value = next;
+    qEl.dataset.prevdef = next;
+  }
   const info = (CAPS && CAPS.encoders && CAPS.encoders[be]) || {};
   const parts = [];
   if (!info.ok && info.detail) parts.push('不可用：' + info.detail);
@@ -531,7 +542,7 @@ function updateEncHint(){
   $('#encHint').textContent = parts.join(' · ');
   const q = (be === 'nvenc' || be === 'av1_nvenc') ? '（CQ，越小越好）'
           : be === 'amf' ? '（QVBR，越小越好）'
-          : be === 'svtav1' ? '（CRF 0–63，越小越好）'
+          : be === 'svtav1' ? '（CRF 0–63，默认 23 已过肉眼阈值）'
           : '（CRF，越小越好）';
   $('#qLabel').textContent = q;
 }

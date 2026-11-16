@@ -1236,11 +1236,15 @@ def resolve_params(fields, src_path=None):
     if note_nv:
         auto_note = ((auto_note + "；") if auto_note else "") + note_nv
     preview = str(fields.get("preview", "1")).lower() not in ("0", "false", "off", "no")
+    # 默认 CRF 按编码器定：AV1 实测 23 已过肉眼阈值（再往下只增码率），其余保持 15
+    qdef = 23 if (fields.get("encoder") in ("svtav1", "av1_nvenc")) else 15
     try:
-        quality = int(float(fields.get("quality") or 15))
+        quality = int(float(fields.get("quality") or 0))
     except ValueError:
-        quality = 15
-    quality = max(10, min(28, quality))
+        quality = 0
+    if not quality:
+        quality = qdef
+    quality = max(10, min(40, quality))
 
     bitdepth = 10 if str(fields.get("bitdepth") or "8").strip() == "10" else 8
     hi_precision = str(fields.get("hi_precision") or "0").strip() in ("1", "true", "on", "yes")
