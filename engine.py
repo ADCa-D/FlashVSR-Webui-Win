@@ -153,6 +153,95 @@ def _should_quant(name: str) -> bool:
     return name.startswith("blocks.") or name.startswith("LQ_proj_in.")
 
 
+def _feather_mask(size, overlap, smooth=True):
+    """生成羽化权重 (1,1,H,W)；smooth=True 用 smoothstep（C1 连续），否则线性。"""
+    H, W = size
+    n = max(2, int(overlap))
+    t = torch.linspace(0.0, 1.0, n)
+    ramp = t * t * (3.0 - 2.0 * t) if smooth else t
+    mask = torch.ones(1, 1, H, W)
+    mask[:, :, :, :n] = torch.minimum(mask[:, :, :, :n], ramp.view(1, 1, 1, -1))
+    mask[:, :, :, -n:] = torch.minimum(mask[:, :, :, -n:], ramp.flip(0).view(1, 1, 1, -1))
+    mask[:, :, :n, :] = torch.minimum(mask[:, :, :n, :], ramp.view(1, 1, -1, 1))
+    mask[:, :, -n:, :] = torch.minimum(mask[:, :, -n:, :], ramp.flip(0).view(1, 1, -1, 1))
+    return mask
+
+
+def _install_smooth_feather(mod):
+    """monkeypatch 节点的 create_feather_mask 为 smoothstep（幂等）。"""
+    if getattr(mod.create_feather_mask, "_smooth", False):
+        return
+    orig = mod.create_feather_mask
+
+    def create_feather_mask(size, overlap):
+        if int(overlap) < 2:
+            return orig(size, overlap)
+        return _feather_mask(size, overlap, smooth=True)
+
+    create_feather_mask._smooth = True
+    mod.create_feather_mask = create_feather_mask
+
+
+def flashvsr_aligned(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
+                     sparse, kv, local, seed=0):
+    """逐 tile 推理 + **偏置对齐** 的拼接（对应节点的 tiled_dit 分支）。
+
+    与原版的唯一区别：每个新 tile 先在"重叠区且已有内容"的像素上估计一个
+    每通道 DC 偏差，把 tile 整体平移过去再加权累加，避免接缝两侧出现亮暗台阶。
+    """
+    pipe_cls = getattr(mod, "FlashVSRTinyLongPipeline", None)
+    device = pipe.device
+    dtype = pipe.torch_dtype
+    n0 = frames.shape[0]
+    add_n = mod.next_8n5(n0) - n0
+    if add_n > 0:
+        frames = torch.cat([frames, frames[-1:, :, :, :].repeat(add_n, 1, 1, 1)], dim=0)
+
+    N, H, W, C = frames.shape
+    canvas = torch.zeros((N, H * scale, W * scale, C), dtype=torch.float16, device="cpu")
+    wsum = torch.zeros_like(canvas)
+    coords = mod.calculate_tile_coords(H, W, tile, tile_overlap)
+
+    for x1, y1, x2, y2 in mod.cqdm(coords, desc="Processing Tiles"):
+        input_tile = frames[:, y1:y2, x1:x2, :]
+        LQ_tile, th, tw, F = mod.prepare_input_tensor(input_tile, device, scale=scale, dtype=dtype)
+        if pipe_cls is not None and not isinstance(pipe, pipe_cls):
+            LQ_tile = LQ_tile.to(device)
+        out_gpu = pipe(
+            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
+            tiled=True, LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
+            is_full_block=False, if_buffer=True,
+            topk_ratio=sparse * 768 * 1280 / (th * tw), kv_ratio=kv, local_range=local,
+            color_fix=color_fix, unload_dit=False, force_offload=False)
+        tile_cpu = mod.tensor2video(out_gpu).to("cpu")
+
+        mask = _feather_mask((tile_cpu.shape[1], tile_cpu.shape[2]),
+                             int(tile_overlap) * scale, smooth=True).permute(0, 2, 3, 1)
+        ox1, oy1 = x1 * scale, y1 * scale
+        ox2, oy2 = ox1 + tile_cpu.shape[2], oy1 + tile_cpu.shape[1]
+
+        patch = canvas[:, oy1:oy2, ox1:ox2, :]
+        wpatch = wsum[:, oy1:oy2, ox1:ox2, :]
+
+        have = wpatch[..., :1] > 1e-3
+        band = mask < 0.999
+        sel = (have & band).expand(-1, -1, -1, tile_cpu.shape[-1])
+        if int(sel.sum()) > 512 * tile_cpu.shape[-1]:
+            cur = patch / wpatch.clamp_min(1e-6)
+            d = (cur - tile_cpu)[sel].reshape(-1, tile_cpu.shape[-1]).mean(dim=0)  # 每通道偏差
+            tile_cpu = tile_cpu + d
+
+        patch += tile_cpu * mask
+        wpatch += mask
+
+        del LQ_tile, out_gpu, tile_cpu, input_tile
+        mod.clean_vram()
+
+    wsum[wsum == 0] = 1.0
+    out = canvas / wsum
+    return out[:n0]
+
+
 def _patch_tile_coords(mod):
     """节点的 calculate_tile_coords 只支持正方形 tile；这里换成支持 (th, tw)。
 
@@ -755,7 +844,7 @@ def resolve_params(fields, src_path=None):
         tile_overlap = int(fields.get("tile_overlap") or 24)
     except ValueError:
         tile_overlap = 24
-    tile_overlap = max(4, min(tile_overlap, max(8, tile // 4)))
+    tile_overlap = max(4, min(tile_overlap, max(8, tile // 2)))
 
     # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），
     # 8 GB 上这是 OOM 的主因（640×360/100 帧就已 2.2 GB，960×544 直接 5 GB）。
@@ -807,11 +896,16 @@ def resolve_params(fields, src_path=None):
 
     bitdepth = 10 if str(fields.get("bitdepth") or "8").strip() == "10" else 8
     hi_precision = str(fields.get("hi_precision") or "0").strip() in ("1", "true", "on", "yes")
+    color_fix = str(fields.get("color_fix") or "1").strip() not in ("0", "false", "off", "no")
+    seam_fix = str(fields.get("seam_fix") or "smooth").strip().lower()
+    if seam_fix not in ("off", "smooth", "align"):
+        seam_fix = "smooth"
     return dict(scale=scale, tile=tile, kv=kv, chunk=chunk, mode=mode,
                 attention=attention, encoder=encoder, quality=quality,
                 quant=quant, budget=budget, pre_scale=pre_scale,
                 tile_overlap=tile_overlap, bitdepth=bitdepth,
-                hi_precision=hi_precision, preview=preview, auto_note=auto_note)
+                hi_precision=hi_precision, color_fix=color_fix, seam_fix=seam_fix,
+                preview=preview, auto_note=auto_note)
 
 
 class Engine:
@@ -943,7 +1037,7 @@ class Engine:
             on_stage("load", 1, 1, "模型就绪")
 
     def _run_window(self, frames_u8, scale, tile, kv, on_tile=None, sparse=2.0, local=11,
-                    tile_overlap=24):
+                    tile_overlap=24, color_fix=True, seam_fix="smooth"):
         """tile 可以是 int（正方形）或 (th, tw)（矩形）。"""
         """force_offload=False：每 tile 结束把 2.84 GB DiT 卸到 CPU 再搬回要多花 ~2.9 s/tile。"""
         mod = self.mod
@@ -979,9 +1073,17 @@ class Engine:
             _f = torch.from_numpy(np.ascontiguousarray(frames_u8))
             # uint8 → [0,1] 需要缩放；float32 已是 [0,1]（不能原地除，否则会把 numpy 缓冲改坏）
             frames = _f.float().div_(255.0) if _f.dtype == torch.uint8 else _f.float()
-            out = mod.flashvsr(
-                self.pipe, frames, int(scale), True, True, True,
-                tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
+            if seam_fix == "align":
+                _install_smooth_feather(mod)
+                out = flashvsr_aligned(
+                    mod, self.pipe, frames, int(scale), bool(color_fix), tile,
+                    int(tile_overlap), float(sparse), float(kv), int(local), 0)
+            else:
+                if seam_fix != "off":
+                    _install_smooth_feather(mod)
+                out = mod.flashvsr(
+                    self.pipe, frames, int(scale), bool(color_fix), True, True,
+                    tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
             return (out.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
         finally:
             mod.cqdm = orig
@@ -1054,7 +1156,9 @@ class Engine:
             tw_t = int(params.get("tile_w") or base_w)
             tshape = (th_t, tw_t) if th_t != tw_t else th_t
             res = self._run_window(win, params["scale"], tshape, kk, cb, sparse=sp, local=lr,
-                                   tile_overlap=int(params.get("tile_overlap") or 24))
+                                   tile_overlap=int(params.get("tile_overlap") or 24),
+                                   color_fix=params.get("color_fix", True),
+                                   seam_fix=str(params.get("seam_fix") or "smooth"))
             return res, sp, lr, kk
 
         if not chunk or total <= chunk:
