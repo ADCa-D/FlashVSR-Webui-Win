@@ -50,7 +50,7 @@ ENCODER_LABEL = {
 QUANT_CHOICES = ("none", "nvfp4", "mxfp8", "mixed", "w8")
 
 
-def encoder_args(backend, quality, bitdepth=8):
+def encoder_args(backend, quality, bitdepth=8, svt_preset=None):
     q = str(int(quality))
     # 10-bit：只有 x265 在本机验证可用（x264 是 8bit 构建、SVT-AV1 在 4K 下 10bit 会 OOM）
     pix = "yuv420p10le" if (int(bitdepth) == 10 and backend == "x265") else "yuv420p"
@@ -85,7 +85,9 @@ def encoder_args(backend, quality, bitdepth=8):
         # SVT-AV1：preset 越低画质越好、同 CRF 体积越小（p4 比 p10 小 ~30%）。
         # 编码时间相对推理可忽略（4K/50 帧：p4≈7s、p2≈13s，而推理要 30–90 分钟），所以默认质量档。
         # lp 必须固定 4：默认按全部逻辑核并行，4K 下会 ENOMEM（本机 32 核实测 lp=8/12 失败）。
-        preset = os.environ.get("FLASHVSR_SVT_PRESET", "4")
+        # 用户主动选 svtav1 → 用 FLASHVSR_SVT_PRESET（默认 4，质量档）；
+        # 作为**兜底**时由 encode_win 传 svt_preset="8"（4K 实测 p8 只要 p4 的 1/2.8 时间）
+        preset = str(svt_preset or os.environ.get("FLASHVSR_SVT_PRESET", "4"))
         return ["-c:v", "libsvtav1", "-crf", q, "-preset", preset,
                 "-svtav1-params", "lp=4", "-g", "240", "-pix_fmt", "yuv420p"]
     if backend == "x265":
@@ -867,7 +869,7 @@ def extract_preview(path, idx, fps, out_path, width=640):
 
 
 def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend="cpu",
-                  bitdepth=8):
+                  bitdepth=8, svt_preset=None):
     h, w = frames_u8.shape[1], frames_u8.shape[2]
     cmd = [FFMPEG, "-y", "-v", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
@@ -876,7 +878,7 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         # 音轨和字幕流都无损 copy（字幕没有就静默跳过）
         cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
                 "-c:a", "copy", "-c:s", "copy", "-shortest"]
-    cmd += encoder_args(backend, quality, bitdepth) + ["-fps_mode", "cfr", out_path]
+    cmd += encoder_args(backend, quality, bitdepth, svt_preset) + ["-fps_mode", "cfr", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     for i in range(0, len(frames_u8), 8):
         proc.stdin.write(frames_u8[i:i + 8].tobytes())
@@ -1306,6 +1308,7 @@ class Engine:
             且只在第一次失败时付出探测成本（之后 backend 已经改成可用的那个）。
             """
             nonlocal backend, bitdepth
+            primary = backend
             chain = (backend,) + fallback_chain(backend)
             seen, last = set(), "未知错误"
             for be in chain:
@@ -1316,8 +1319,12 @@ class Engine:
                 if bd == 10 and be not in ("x265", "qsv"):
                     bd = 8                 # 只有 x265 / hevc_qsv 能出 10bit
                 try:
+                    # svtav1 若不是用户的选择（而是兜底），用 p8：4K 实测 2.7 s/50 帧、
+                    # VMAF 96.22，p4 要 7.7 s 才 96.90 —— 兜底不值得为 0.7 dB 多等 3 倍
+                    svt_p = "8" if (be == "svtav1" and be != primary) else None
                     encode_frames(frames_in, info["fps"], path, audio_src,
-                                  quality=quality, backend=be, bitdepth=bd)
+                                  quality=quality, backend=be, bitdepth=bd,
+                                  svt_preset=svt_p)
                     if be != backend:
                         on_stage("encode", 0, 0,
                                  f"编码器 {backend} 不可用，已改用 {be}（后续段沿用）")
