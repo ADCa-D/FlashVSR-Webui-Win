@@ -268,7 +268,7 @@ $env:FLASHVSR_FFMPEG="C:\ffmpeg\bin\ffmpeg.exe"
 
 - 显存不够会自动降档重试，进度里会写「自动降档重试（第 N 次）：tile=… kv=…」
 - `权重`：MXFP8（推荐）/ bf16（基准）/ NVFP4（4bit，未必更快）/ 混合（FFN 4bit，省 0.16 GiB、画质 44.65 dB）/ **W8A16**（通用 fp8 权重，30/40 系也能用）
-- `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `amf`（AMD）/ **`svtav1`（SVT-AV1，同画质体积最小，很慢）** / **`av1_nvenc`（40/50 系硬件 AV1）** / **`x265`（H.265，体积小 30–40%）**
+- `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `amf`（AMD）/ **`svtav1`（SVT-AV1，同画质体积最小；4K preset≤8 需 ~2–4 GB 空闲内存）** / **`av1_nvenc`（40/50 系硬件 AV1）** / **`x265`（H.265，体积小 30–40%）**
 - `质量`：x264/x265/AOM 是 CRF（10–28，越小越好）；NVENC 是 CQ；AMF 是 QVBR；SVT-AV1 的 CRF 范围是 0–63（我们默认 15，已是高质量）
 - 输出统一 `yuv420p`，保证 Windows 播放器与剪辑软件兼容（AV1 需要系统装 AV1 扩展才能用「电影和电视」播放）
 
