@@ -75,6 +75,17 @@ def main():
     a2, ext2 = E.preview_encoder("webp")
     checks.append(("预览可切 WebP", ext2 == ".webp" and "libwebp" in " ".join(a2)))
 
+    # tune 列表按编码器区分：硬件编码器没有统一入口
+    checks.append(("x264 有 film/animation",
+                   {"film", "animation"} <= set(E.tunes_for("cpu"))))
+    checks.append(("x265 没有 film/animation",
+                   not ({"film", "animation"} & set(E.tunes_for("x265")))))
+    checks.append(("svtav1 有 vq/vmaf/ms_ssim",
+                   {"vq", "vmaf", "ms_ssim"} <= set(E.tunes_for("svtav1"))))
+    checks.append(("硬件编码器无 tune",
+                   all(E.tunes_for(b) == () for b in ("nvenc", "qsv", "amf", "vulkan",
+                                                      "av1_nvenc", "qsv_h264"))))
+
     fails = [tag for tag, ok in checks if not ok]
     if fails:
         print(FAIL)

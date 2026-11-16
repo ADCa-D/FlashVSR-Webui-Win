@@ -715,12 +715,15 @@ vf = f"libplacebo=w={tw}:h={th}:downscaler=spline36,hwdownload,format=yuv420p"
 
 ### 各编码器的 tune 入口不一样
 
+面板的「调优」下拉**随编码器变化**，只列当前编码器真正支持的项
+（`/api/capabilities` 的 `tunes` 字段给出映射，前端据此重建；硬件编码器显示"该编码器无统一 tune"）：
+
 | 编码器 | 写法 | 可用值 |
 |---|---|---|
 | `cpu`（x264） | `-tune X` | ssim、psnr、film、animation、grain、stillimage、fastdecode、zerolatency |
 | `x265` | `-tune X` | ssim、psnr、grain、fastdecode、zerolatency |
 | `svtav1` | `-svtav1-params ...:tune=N`（**只能传数字**） | **0=VQ（默认，心理视觉最优）**、1=PSNR、2=SSIM、3=IQ、4=MS_SSIM、5=VMAF |
-| GPU（nvenc/qsv/amf） | 无统一入口 | 走「开发模式」自己传 |
+| GPU（nvenc/qsv/amf/vulkan） | 无统一入口 | 走「开发模式」自己传（`vulkan` 内部固定 `-tune hq`） |
 
 两个坑，都实测过：
 

@@ -454,7 +454,9 @@ async def capabilities(request):
     gpu = await asyncio.get_running_loop().run_in_executor(EXECUTOR, E.gpu_info)
     return web.json_response({"encoders": caps, "labels": E.ENCODER_LABEL,
                               "choices": list(E.ENCODER_CHOICES),
-                              "svt_tunes": tunes, "gpu": gpu})
+                              "svt_tunes": tunes, "gpu": gpu,
+                              "tunes": {be: list(E.tunes_for(be))
+                                        for be in E.ENCODER_CHOICES if E.tunes_for(be)}})
 
 
 async def run(request):

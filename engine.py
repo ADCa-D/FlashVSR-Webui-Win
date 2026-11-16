@@ -75,6 +75,11 @@ TUNE_ALL = ("", "ssim", "psnr", "vq", "vmaf", "ms_ssim", "film", "animation",
             "grain", "stillimage", "fastdecode", "zerolatency")
 
 
+def tunes_for(backend):
+    """某个编码器**真正支持**的 tune 列表（UI 按它渲染下拉，避免列一堆无效项）。"""
+    return TUNE_CHOICES.get(backend, ())
+
+
 def encoder_global_args(backend):
     """某些后端需要**输入前**的全局参数（Vulkan 要建 hw device）。"""
     if backend == "vulkan":

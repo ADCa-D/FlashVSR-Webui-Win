@@ -143,18 +143,7 @@
       </select>
       <span class="lk" title="编码器调优（只有 CPU 编码器有统一入口）：x264/x265 用 -tune；SVT-AV1 默认 tune=VQ（心理视觉，主观最优），VMAF/SSIM/PSNR 是对齐指标用；GPU 编码器走开发模式自传">调优</span>
       <select id="tune">
-        <option value="" selected>默认（AV1 = VQ 心理视觉）</option>
-        <option value="ssim">ssim（结构相似）</option>
-        <option value="psnr">psnr（信噪比）</option>
-        <option value="vq">vq（AV1 主观）</option>
-        <option value="ms_ssim">ms_ssim（AV1）</option>
-        <option value="vmaf">vmaf（AV1，指标对齐+锐化）</option>
-        <option value="film">film（x264 系）</option>
-        <option value="animation">animation（x264 系）</option>
-        <option value="grain">grain（保颗粒）</option>
-        <option value="stillimage">stillimage（x264）</option>
-        <option value="fastdecode">fastdecode（解码省算力）</option>
-        <option value="zerolatency">zerolatency（低延迟）</option>
+        <option value="" selected>默认</option>
       </select>
       <span class="lk">权重</span>
       <select id="quant">
@@ -510,8 +499,38 @@ let CAPS = null;
 const QUALITY_DEFAULT = { svtav1: 23, av1_nvenc: 23 };   // 实测甜点，见 README
 function qualityDefault(be){ return QUALITY_DEFAULT[be] || 15; }
 
+const TUNE_LABEL = {
+  ssim: 'ssim（结构相似）', psnr: 'psnr（信噪比）', vq: 'vq（AV1 主观，默认）',
+  ms_ssim: 'ms_ssim（AV1）', vmaf: 'vmaf（AV1，指标对齐+锐化）',
+  film: 'film（x264）', animation: 'animation（x264）', grain: 'grain（保颗粒）',
+  stillimage: 'stillimage（x264）', fastdecode: 'fastdecode（解码省算力）',
+  zerolatency: 'zerolatency（低延迟）',
+};
+
+// 按当前编码器重建 tune 下拉：只列它真正支持的项（硬件编码器没有统一入口）
+function rebuildTunes(be) {
+  const sel = $('#tune');
+  if (!sel) return;
+  const list = (CAPS && CAPS.tunes && CAPS.tunes[be]) || [];
+  const keep = sel.value;
+  sel.innerHTML = '';
+  const o0 = document.createElement('option');
+  o0.value = '';
+  o0.textContent = list.length ? '默认' : '该编码器无统一 tune';
+  sel.appendChild(o0);
+  list.forEach(t => {
+    const o = document.createElement('option');
+    o.value = t;
+    o.textContent = TUNE_LABEL[t] || t;
+    sel.appendChild(o);
+  });
+  sel.disabled = list.length === 0;
+  sel.value = list.indexOf(keep) >= 0 ? keep : '';
+}
+
 function updateEncHint(){
   const be = $('#encoder').value;
+  rebuildTunes(be);
   // 切换编码器时带上它自己的默认 CRF（只在用户没手动改过时切）
   const qEl = $('#quality');
   if (qEl) {
@@ -672,6 +691,7 @@ updatePresetLabels();
     sel.value = 'auto';
     sel.onchange = updateEncHint;
     if (window.__applyArch) window.__applyArch();
+    rebuildTunes($('#encoder').value);
     updateEncHint();
   } catch(e) {}
 })();
