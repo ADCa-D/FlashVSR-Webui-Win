@@ -505,6 +505,82 @@ def _expand(out, p, n):
     return out if p <= 1 else np.repeat(out, p, axis=0)[:n]
 
 
+def install_stream_loader():
+    """把节点的 safetensors 加载改成"逐个张量读 → 立刻转 dtype → 立刻上卡"。
+
+    原实现（utils.load_state_dict_from_safetensors）会攒一个完整的 CPU state_dict，
+    实测 commit 峰值 **12.6 GB**（f32 视图 5.4 + bf16 副本 2.8 + 分配器缓存 + 显存），
+    在 16 GB 内存的机器上加载时浏览器都得关掉。
+    流式之后 CPU 侧同时只持有一个张量，峰值降到"一个最大的张量"量级。
+
+    只影响加载路径，不改模型结构；失败就退回原实现。
+    """
+    try:
+        utils = sys.modules.get("flashvsr_node.src.models.utils")
+        if utils is None or getattr(utils, "_stream_patched", False):
+            return False
+        orig = utils.load_state_dict_from_safetensors
+
+        def patched(file_path, torch_dtype=None):
+            """不用 safe_open（它 mmap 整个文件，5.4 GB 文件页会常驻工作集）。
+
+            』 这里自己解析头 + read()，一次只读一个张量：
+              - 工作集峰值 ≈ 最大的那个张量（~50 MB），而不是整个 checkpoint
+              - 读出来 → 转 dtype → 立刻上卡 → 立刻释放
+            等价于 cpp-port 分支里 load_dit.cpp 的做法（那边 host 峰值 542 MiB）。
+            """
+            import json
+            import struct
+
+            import numpy as np
+            import torch as _t
+
+            dev = "cuda" if _t.cuda.is_available() else "cpu"
+            np_dtype = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16,
+                        "I64": np.int64, "I32": np.int32, "I16": np.int16,
+                        "I8": np.int8, "U8": np.uint8, "BOOL": np.bool_}
+            out = {}
+            with open(file_path, "rb") as f:
+                hlen = struct.unpack("<Q", f.read(8))[0]
+                hdr = json.loads(f.read(hlen))
+                base = 8 + hlen
+                for k, info in hdr.items():
+                    if k == "__metadata__" or not isinstance(info, dict):
+                        continue
+                    beg, end = info["data_offsets"]
+                    f.seek(base + beg)
+                    raw = f.read(end - beg)
+                    nd = np_dtype.get(info["dtype"])
+                    if nd is None:
+                        raise RuntimeError(f"不支持的 dtype {info['dtype']} ({k})")
+                    arr = np.frombuffer(raw, dtype=nd)
+                    if info["dtype"] == "BF16":
+                        # bf16 在 numpy 里没有原生类型：按 uint16 读，再用 view 转 torch
+                        ten = arr.copy().view(_t.bfloat16).reshape(info["shape"])
+                    else:
+                        ten = _t.from_numpy(arr.copy()).reshape(info["shape"])
+                    if torch_dtype is not None:
+                        ten = ten.to(torch_dtype)
+                    out[k] = ten.to(dev)
+                    del ten, arr, raw
+            return out
+
+        def guarded(file_path, torch_dtype=None):
+            try:
+                return patched(file_path, torch_dtype)
+            except Exception as e:  # noqa
+                print(f"[stream-load] 流式加载失败，回退原实现: {e}", flush=True)
+                return orig(file_path, torch_dtype)
+
+        utils.load_state_dict_from_safetensors = guarded
+        utils._stream_patched = True
+        print("[stream-load] 已启用：逐张量读→上卡，不再攒 CPU state_dict", flush=True)
+        return True
+    except Exception as e:  # noqa
+        print(f"[stream-load] 启用失败（不影响运行）: {e}", flush=True)
+        return False
+
+
 def _quant8(out):
     """float [0,1] → uint8。**这里是整条链路唯一的 8bit 量化点**。
 
@@ -1477,6 +1553,7 @@ class Engine:
             gc.collect()
             torch.cuda.empty_cache()
 
+        install_stream_loader()
         self.pipe = self.mod.init_pipeline("FlashVSR-v1.1", mode, "cuda:0", torch.bfloat16)
 
         import gc as _gc
