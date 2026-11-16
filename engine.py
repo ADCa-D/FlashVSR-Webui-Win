@@ -478,6 +478,33 @@ def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
     return out[:n0]
 
 
+def _drop_stride(frames, thr=0.5):
+    """检测"按 p 拍画"（p=2/3）。返回 p 或 1（不抽）。
+
+    判据：规整保留 i%p==0 时，**被丢掉的帧**是否都是前一张的复制：
+    |Δ(i, i−1)| < thr。丢错率 ≥5% 就认为这条内容不是按 p 拍的，不抽。
+
+    只允许 phase=0：这样插回就是 np.repeat(out, p)[:n]，不需要 keep 表。
+    """
+    n = len(frames)
+    if n < 8:
+        return 1
+    g = np.asarray(frames[:, ::4, ::4, :3], dtype=np.int16).mean(axis=-1)  # 低分辨率灰度
+    d1 = np.abs(np.diff(g, axis=0)).mean(axis=(1, 2))                     # d1[i-1] = |f(i)-f(i-1)|
+    for p in (2, 3):
+        if n <= p + 2:
+            continue
+        kept = set(range(0, n, p))
+        lost = [d1[i - 1] for i in range(1, n) if i not in kept]
+        if lost and float(np.mean(np.asarray(lost) >= thr)) < 0.05:
+            return p
+    return 1
+
+
+def _expand(out, p, n):
+    return out if p <= 1 else np.repeat(out, p, axis=0)[:n]
+
+
 def flashvsr_aligned(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
                      sparse, kv, local, seed=0):
     """逐 tile 推理 + **偏置对齐** 的拼接（对应节点的 tiled_dit 分支）。
@@ -1474,6 +1501,25 @@ class Engine:
         except Exception as e:  # noqa
             print(f"[FlashVSR] channels_last 未启用: {e}", flush=True)
 
+        # 抽帧复用：噪声必须按**完整时间轴**生成再抽样，否则帧数一变整段随机数全变
+        # （A/B 会比出 30 dB 的假损失）。这里包一层 generate_noise。
+        try:
+            _orig_noise = self.pipe.generate_noise
+            self._noise_stride = 1
+
+            def _noise(shape, seed=None, device=None, dtype=None):
+                p = int(getattr(self, "_noise_stride", 1) or 1)
+                if p <= 1:
+                    return _orig_noise(shape, seed=seed, device=device, dtype=dtype)
+                full_f = (shape[2] - 1) * p + 1
+                full = _orig_noise((shape[0], shape[1], full_f) + tuple(shape[3:]),
+                                   seed=seed, device=device, dtype=dtype)
+                return full[:, :, ::p][:, :, :shape[2]].contiguous()
+
+            self.pipe.generate_noise = _noise
+        except Exception as e:  # noqa
+            print(f"[FlashVSR] 抽帧噪声对齐未启用: {e}", flush=True)
+
         # VAE 解码换 TensorRT（逐帧 9 个 past，实测 ~1.8×；任何异常都回退 torch）
         try:
             import trt_decoder
@@ -1658,6 +1704,7 @@ class Engine:
         self.ensure_loaded(params.get("mode") or "tiny-long", params.get("attention") or "sparse",
                            on_stage, quant=params.get("quant") or "none",
                            prewarm=(max(16, int(params["tile"]) * int(params["scale"]) // 8),) * 2)
+        drop_on = os.environ.get("FLASHVSR_FRAME_DROP", "0") == "1"
         audio = src if info["has_audio"] else None
         quality = int(params.get("quality") or 15)
         bitdepth = int(params.get("bitdepth") or 8)
@@ -1746,10 +1793,18 @@ class Engine:
             return res, sp, lr, kk
 
         if not chunk or total <= chunk:
+            p_drop = _drop_stride(frames) if drop_on else 1
+            fin = frames[::p_drop] if p_drop > 1 else frames
+            if p_drop > 1:
+                on_stage("decode", 0, total,
+                         f"抽帧复用：检测到 {p_drop} 拍，{total} → {len(fin)} 帧"
+                         f"（省 {(1-len(fin)/max(1,total))*100:.0f}% 计算）")
+            self._noise_stride = p_drop
             out_t, sp, lr, kk = run_win(
-                frames, params["tile"], params["kv"],
+                fin, params["tile"], params["kv"],
                 lambda c, t: on_stage("infer", c, t, f"tile {c}/{t}"))
-            frames_out = out_t[:total]
+            self._noise_stride = 1
+            frames_out = _expand(out_t[:len(fin)], p_drop, total)
             on_stage("encode", 0, 1, f"编码中（sparse={sp} kv={kk} local={lr}）")
             encode_win(frames_out, dst, audio)
             on_stage("encode", 1, 1, f"编码完成（{backend}）")
@@ -1852,10 +1907,21 @@ class Engine:
                         f'  ffmpeg -i "输入.mp4" -fps_mode cfr -r 30 -c:v libx264 -crf 12 "输入_cfr.mp4"')
             on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg}：{win_start}–{win_end} 帧")
 
+            n_in = len(win)
+            p_drop = _drop_stride(win) if drop_on else 1
+            win_in = win[::p_drop] if p_drop > 1 else win
+            if p_drop > 1:
+                on_stage("seg", i, n_seg,
+                         f"段 {i + 1}/{n_seg} 抽帧：{p_drop} 拍，"
+                         f"{n_in} → {len(win_in)} 帧（省 {(1-len(win_in)/n_in)*100:.0f}%）")
+
             def tile_cb(c, t, i=i):
                 on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg} tile {c}/{t}")
 
-            res, sp, lr, kk = run_win(win, params["tile"], params["kv"], tile_cb)
+            self._noise_stride = p_drop
+            res, sp, lr, kk = run_win(win_in, params["tile"], params["kv"], tile_cb)
+            self._noise_stride = 1
+            res = _expand(res[:len(win_in)], p_drop, n_in)
             out_frames = res[keep_from:keep_from + keep]
             out_wh = [int(out_frames.shape[2]), int(out_frames.shape[1])]
             on_stage("encode", 0, 1, f"段 {i + 1}/{n_seg} 写盘（{backend}）")
