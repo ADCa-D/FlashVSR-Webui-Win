@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include "attn_jit.h"
+#include "dit_kernels.h"
 #include "safetensors.h"
 
 #define NOMINMAX
@@ -178,14 +179,14 @@ Tensor attention(const Tensor& q_in, const Tensor& k_in, const Tensor& v_in, int
 // dense score matrix is cheap; what killed the ATen version was 280 launches
 // per layer, not the FLOPs. 4 launches per layer instead.
 Tensor attention_fast(const Tensor& q, const Tensor& k, const Tensor& v, int64_t heads,
-                      const Tensor& mask_bias /* bf16 [B,H,S,Skv], 0 or -inf */) {
+                      const Tensor* mask_bias /* bf16 [B,H,S,Skv], 0 or -inf; null = no mask */) {
     const auto B = q.size(0), S = q.size(1), D = q.size(2), hd = D / heads;
     const auto Skv = k.size(1);
     auto qh = q.view({B, S, heads, hd}).transpose(1, 2);
     auto kh = k.view({B, Skv, heads, hd}).transpose(1, 2);
     auto vh = v.view({B, Skv, heads, hd}).transpose(1, 2);
     auto s = torch::matmul(qh, kh.transpose(2, 3)) * (1.0 / std::sqrt((double)hd));
-    s = s + mask_bias;
+    if (mask_bias != nullptr) s = s + *mask_bias;
     auto p = torch::softmax(s, -1);
     p = torch::nan_to_num(p, 0.0);
     auto o = torch::matmul(p, vh);
@@ -286,11 +287,12 @@ double meandiff(const Tensor& a, const Tensor& b) {
     return (a.to(torch::kFloat).cpu() - b.to(torch::kFloat).cpu()).abs().mean().item<double>();
 }
 
-void report(const char* tag, const Tensor& got, const Tensor& ref) {
+void report(const char* tag, const Tensor& got, const Tensor& ref, double tol = 0.2) {
     const double mx = maxdiff(got, ref);
     const double mn = meandiff(got, ref);
+    // tol 0.2 ~= 2 ULP at |x| ~ 16 in bf16; anything tighter is not meaningful
     std::printf("  %-9s maxdiff %.3e   meandiff %.3e   %s\n", tag, mx, mn,
-                mx < 1e-2 ? "OK" : "**FAIL**");
+                mx < tol ? "OK" : "**FAIL**");
 }
 
 }  // namespace
@@ -395,81 +397,103 @@ static int run_main() {
                                   -std::numeric_limits<double>::infinity())
                          .to(torch::kBFloat16);
 
+    // ---- per-layer constants, hoisted out of the loop ---------------------
+    // modulation (float, [dim] broadcast), norm weights (float), rope tables
+    // (float), and the cross-attention k/v cache (Python caches these too).
+    std::vector<std::vector<Tensor>> mods_all(kLayers);
+    std::vector<Tensor> nq_w(kLayers), nk_w(kLayers), cq_w(kLayers);
+    std::vector<Tensor> ck_all(kLayers), cv_all(kLayers);
+    auto rope_cos = rope.cos_t.to(torch::kFloat).contiguous();
+    auto rope_sin = rope.sin_t.to(torch::kFloat).contiguous();
+    for (int64_t i = 0; i < kLayers; ++i) {
+        const std::string p = "blocks." + std::to_string(i) + ".";
+        auto m = (w(p + "modulation") + t_mod).chunk(6, 1);
+        for (int j = 0; j < 6; ++j) mods_all[i].push_back(m[j].to(torch::kFloat).reshape({kDim}));
+        nq_w[i] = w(p + "self_attn.norm_q.weight").to(torch::kFloat).contiguous();
+        nk_w[i] = w(p + "self_attn.norm_k.weight").to(torch::kFloat).contiguous();
+        cq_w[i] = w(p + "cross_attn.norm_q.weight").to(torch::kFloat).contiguous();
+        auto ck = rms_norm(linear(ctx, w(p + "cross_attn.k.weight"), w(p + "cross_attn.k.bias")),
+                           w(p + "cross_attn.norm_k.weight"), kEps);
+        auto cv = linear(ctx, w(p + "cross_attn.v.weight"), w(p + "cross_attn.v.bias"));
+        ck_all[i] = ck;
+        cv_all[i] = cv;
+    }
+    cudaDeviceSynchronize();
+
     const bool prof = std::getenv("FLASH_DIT_PROF") != nullptr;
     auto run = [&](Tensor cur, const char* tag) {
         for (int64_t i = 0; i < kLayers; ++i) {
+            if (!cur.is_contiguous()) cur = cur.contiguous();
             const std::string p = "blocks." + std::to_string(i) + ".";
-            auto mods = (w(p + "modulation") + t_mod).chunk(6, 1);
-            const Tensor& shift_msa = mods[0];
-            const Tensor& scale_msa = mods[1];
-            const Tensor& gate_msa = mods[2];
-            const Tensor& shift_mlp = mods[3];
-            const Tensor& scale_mlp = mods[4];
-            const Tensor& gate_mlp = mods[5];
+            auto& mo = mods_all[i];
 
             // ---- self attention ----
-            auto inp = modulate(layer_norm_plain(cur, kEps), shift_msa, scale_msa);
-            auto q = rms_norm(linear(inp, w(p + "self_attn.q.weight"), w(p + "self_attn.q.bias")),
-                               w(p + "self_attn.norm_q.weight"), kEps);
-            auto k = rms_norm(linear(inp, w(p + "self_attn.k.weight"), w(p + "self_attn.k.bias")),
-                               w(p + "self_attn.norm_k.weight"), kEps);
+            auto inp = dk::ln_modulate(cur, mo[0], mo[1], kEps);           // norm+modulate
+            auto q = linear(inp, w(p + "self_attn.q.weight"), w(p + "self_attn.q.bias"));
+            auto k = linear(inp, w(p + "self_attn.k.weight"), w(p + "self_attn.k.bias"));
             auto v = linear(inp, w(p + "self_attn.v.weight"), w(p + "self_attn.v.bias"));
             if (i == 0 && ref.count("b0_inp")) {
-                report("b0_inp", inp, ref.at("b0_inp"));
-                report("b0_q_pre", q, ref.at("b0_q_pre"));
-                report("b0_k_pre", k, ref.at("b0_k_pre"));
-                report("b0_v_pre", v, ref.at("b0_v_pre"));
+                auto shift_b = mo[0].to(torch::kBFloat16).reshape({1, 1, kDim});
+                auto scale_b = mo[1].to(torch::kBFloat16).reshape({1, 1, kDim});
+                auto aten_inp = modulate(layer_norm_plain(cur, kEps), shift_b, scale_b);
+                report("inp=aten", aten_inp, ref.at("b0_inp"));
+                report("inp=kern", inp, aten_inp);
+                {
+                    auto r = ref.at("b0_inp").to(torch::kFloat).cpu();
+                    auto a = aten_inp.to(torch::kFloat).cpu();
+                    auto kk = inp.to(torch::kFloat).cpu();
+                    auto ra = r.accessor<float, 3>();
+                    auto aa = a.accessor<float, 3>();
+                    auto ka = kk.accessor<float, 3>();
+                    for (int row : {0, 1, 100, 383}) {
+                        std::printf("   row %3d ref %.5f %.5f | aten %.5f %.5f | kern %.5f %.5f\n",
+                                    row, ra[0][row][0], ra[0][row][1], aa[0][row][0],
+                                    aa[0][row][1], ka[0][row][0], ka[0][row][1]);
+                    }
+                    std::printf("   lib ok=%d  S=%lld  contiguous=%d\n", (int)dk::lib().ok,
+                                (long long)cur.size(1), (int)cur.is_contiguous());
+                }
             }
-            q = rope_apply(q, rope, kHeads);
-            k = rope_apply(k, rope, kHeads);
+            q = dk::rms_rope(q, nq_w[i], rope_cos, rope_sin, kDim / kHeads, kEps);
+            k = dk::rms_rope(k, nk_w[i], rope_cos, rope_sin, kDim / kHeads, kEps);
             if (i == 0 && ref.count("b0_q_rope")) {
                 report("b0_q_rope", q, ref.at("b0_q_rope"));
                 report("b0_k_rope", k, ref.at("b0_k_rope"));
             }
+
             // window partition -> (b block_n) block_s d -> b (block_n block_s) d
             q = partition3d(q, pf, ph, pw);
             k = partition3d(k, pf, ph, pw);
             v = partition3d(v, pf, ph, pw);
-            if (i == 0 && ref.count("q_w")) {
-                report("q_w", q, ref.at("q_w"));
-                report("k_w", k, ref.at("k_w"));
-            }
             const int64_t block_n = q.size(0);
             q = q.view({1, block_n * q.size(1), kDim});
             k = k.view({1, block_n * k.size(1), kDim});
             v = v.view({1, block_n * v.size(1), kDim});
-            auto attn = attention_fast(q, k, v, kHeads, mask_bias);
+            auto attn = attention_fast(q, k, v, kHeads, &mask_bias);
             if (i == 0) {
-                // cross-checks: dense fp32 reference and the fused JIT kernel
                 auto dense_mask = expand_mask(ref.at("mask"));
                 auto dense = attention(q, k, v, kHeads, &dense_mask);
                 report("fast=dense", attn, dense);
-                auto jit = attn::forward(q, k, v, blk_mask, kHeads, kDim / kHeads);
-                report("fast=jit  ", attn, jit);
             }
-            // b (block_n block_s) d -> (b block_n) block_s d -> reverse partition
             attn = attn.view({block_n, attn.size(1) / block_n, kDim});
             attn = reverse3d(attn, pf, ph, pw);
             attn = linear(attn, w(p + "self_attn.o.weight"), w(p + "self_attn.o.bias"));
-            cur = cur + gate_msa * attn;
+            dk::gate_res_(cur, mo[2], attn);                               // x += gate*attn
 
-            // ---- cross attention ----
-            auto n3 = layer_norm_affine(cur, w(p + "norm3.weight"), w(p + "norm3.bias"), kEps);
-            auto cq = rms_norm(linear(n3, w(p + "cross_attn.q.weight"), w(p + "cross_attn.q.bias")),
-                                w(p + "cross_attn.norm_q.weight"), kEps);
-            auto ck = rms_norm(linear(ctx, w(p + "cross_attn.k.weight"), w(p + "cross_attn.k.bias")),
-                                w(p + "cross_attn.norm_k.weight"), kEps);
-            auto cv = linear(ctx, w(p + "cross_attn.v.weight"), w(p + "cross_attn.v.bias"));
-            auto ca = attention(cq, ck, cv, kHeads, nullptr);
+            // ---- cross attention (k/v cached; q still per layer) ----
+            auto n3 = dk::ln_affine(cur, w(p + "norm3.weight"), w(p + "norm3.bias"), kEps);
+            auto cq = linear(n3, w(p + "cross_attn.q.weight"), w(p + "cross_attn.q.bias"));
+            cq = dk::rms_only(cq, cq_w[i], kEps);
+            auto ca = attention_fast(cq, ck_all[i], cv_all[i], kHeads, nullptr);
             ca = linear(ca, w(p + "cross_attn.o.weight"), w(p + "cross_attn.o.bias"));
-            cur = cur + ca;
+            dk::add2_(cur, ca);
 
             // ---- ffn ----
-            auto inp2 = modulate(layer_norm_plain(cur, kEps), shift_mlp, scale_mlp);
+            auto inp2 = dk::ln_modulate(cur, mo[3], mo[4], kEps);
             auto ff = linear(inp2, w(p + "ffn.0.weight"), w(p + "ffn.0.bias"));
             ff = torch::gelu(ff, "tanh");
             ff = linear(ff, w(p + "ffn.2.weight"), w(p + "ffn.2.bias"));
-            cur = cur + gate_mlp * ff;
+            dk::gate_res_(cur, mo[5], ff);
 
             if (i == 0 && ref.count("block00")) report("block00", cur, ref.at("block00"));
             if (i == 15 && ref.count("block15")) report("block15", cur, ref.at("block15"));
@@ -529,7 +553,7 @@ static int run_main() {
             auto bb = torch::where(expand_mask(ref.at("mask")), 0.0,
                                    -std::numeric_limits<double>::infinity())
                           .to(torch::kBFloat16);
-            ev("attn_fast(whole)", 30, [&] { auto r = attention_fast(qq, qq, qq, kHeads, bb); (void)r; });
+            ev("attn_fast(whole)", 30, [&] { auto r = attention_fast(qq, qq, qq, kHeads, &bb); (void)r; });
             auto qh = qq.view({1, 384, kHeads, 128}).transpose(1, 2);
             auto kh = qq.view({1, 384, kHeads, 128}).transpose(1, 2);
             ev("bmm qk", 30, [&] { auto r = torch::matmul(qh, kh.transpose(2, 3)); (void)r; });
