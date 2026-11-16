@@ -58,6 +58,8 @@ def encoder_args(backend, quality, bitdepth=8):
         return ["-c:v", "av1_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "vbr", "-cq", q, "-b:v", "0", "-pix_fmt", "yuv420p"]
     if backend == "amf":
+        # AMD AMF：只有 8 bit（没有 main10），且同码率画质明显弱于 x264/x265，
+        # 只当“显卡不支持 NVENC / CPU 又太慢”时的兜底；要画质请用 x265 或 svtav1。
         return ["-c:v", "h264_amf", "-quality", "high_quality",
                 "-rc", "hqvbr", "-qvbr_quality_level", q, "-pix_fmt", "yuv420p"]
     if backend == "svtav1":
@@ -1016,6 +1018,10 @@ class Engine:
         quality = int(params.get("quality") or 15)
         bitdepth = int(params.get("bitdepth") or 8)
         backend = resolve_encoder(params.get("encoder"))
+        if bitdepth == 10 and backend != "x265":
+            # 本机只有 libx265 能出 main10；其余编码器（含 AMF/NVENC）都是 8bit
+            on_stage("encode", 0, 0, f"{backend} 不支持 10 bit，本次按 8 bit 输出（要 10 bit 请用 x265）")
+            bitdepth = 8
         budget_mode = params.get("budget") or "auto"
 
         def budget_for(win_u8, kv):

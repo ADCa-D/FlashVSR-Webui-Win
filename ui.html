@@ -444,12 +444,15 @@ function updateEncHint(){
   const info = (CAPS && CAPS.encoders && CAPS.encoders[be]) || {};
   const parts = [];
   if (!info.ok && info.detail) parts.push('不可用：' + info.detail);
-  else if (be === 'amf') parts.push('核显 610M 只有 2 CU，1440p 以上通常比 CPU 慢');
+  else if (be === 'amf') parts.push('仅 8 bit（无 10 bit），同码率画质弱于 x264/x265；兜底用');
   else if (be === 'nvenc') parts.push('与推理共用独显，会占一点显存');
   else if (be === 'av1_nvenc') parts.push('硬件 AV1，40/50 系支持；体积比 H.264 小一半');
   else if (be === 'svtav1') parts.push('CPU 软件 AV1：体积最小；preset 4（质量档，4K/50帧约 7 s），lp 固定 4');
   else if (be === 'x265') parts.push('CPU H.265，体积比 x264 小 30–40%，慢一倍');
   else parts.push('CPU 编码与 GPU 推理天然并行，通常最快');
+  if ($('#bitdepth').value === '10' && be !== 'x265') {
+    parts.push('该编码器不支持 10 bit（只有 x265 支持），会按 8 bit 输出');
+  }
   $('#encHint').textContent = parts.join(' · ');
   const q = (be === 'nvenc' || be === 'av1_nvenc') ? '（CQ，越小越好）'
           : be === 'amf' ? '（QVBR，越小越好）'
@@ -457,6 +460,7 @@ function updateEncHint(){
           : '（CRF，越小越好）';
   $('#qLabel').textContent = q;
 }
+$('#bitdepth').addEventListener('change', updateEncHint);
 function updatePresetLabels(){
   const up = $('#tileUp').checked;
   const quant = $('#quant').value;
