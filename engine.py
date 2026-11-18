@@ -5,6 +5,8 @@
 复用 init_pipeline / flashvsr。这一层补：ffmpeg 编解码、进度回调、长视频分段落盘+续跑、
 运动感知预算、DiT 权重量化（MXFP8 / NVFP4）。
 """
+import collections
+import concurrent.futures
 import hashlib
 import importlib.util
 import json
@@ -49,9 +51,10 @@ ENCODER_LABEL = {
     "av1_nvenc": "GPU · NVENC AV1（40/50 系）",
     "x265": "CPU · libx265（H.265，均衡）",
 }
-# NVFP4 与混合档（FFN 用 NVFP4）都已停用：画质比 MXFP8 低 6 dB（44.65 dB vs 50.75 dB），
-# 显存还更大（3.40 GiB vs 2.05 GiB），速度只在超大 token 才占优。
-# 对外只保留三档：bf16 基准 / MXFP8 推荐 / W8A16 老卡兼容。
+# 只有三档：bf16 基准 / MXFP8 推荐 / W8A16 老卡兼容。
+# NVFP4 与混合档（FFN 用 NVFP4）实测画质比 MXFP8 低 6 dB（44.65 dB vs 50.75 dB），
+# 显存还更大（3.40 GiB vs 2.05 GiB），速度只在超大 token 才占优，已在 2026-11 删除实现；
+# 旧配置里的 nvfp4/mixed 由 resolve_params 与 ensure_loaded 自动降级到 MXFP8。
 QUANT_CHOICES = ("none", "mxfp8", "w8")
 
 
@@ -168,6 +171,36 @@ def encoder_args(backend, quality, bitdepth=8, svt_preset=None, tune=None, extra
     return _encoder_base(backend, quality, bitdepth, svt_preset, tune) + list(extra or [])
 
 
+def _inject_bt709_vf(enc_args, enabled=None):
+    """rgb24 → yuv 编码前按 BT.709 做全范围→有限范围转换。
+
+    历史问题：ffmpeg 对 rgb24 输入默认按 BT.601 转 yuv，1080p/4K 母版基本都是 BT.709，
+    结果成片偏绿/发灰（改之前没有 -colorspace/-color_primaries/-color_trc 标记）。
+    qsv/vulkan 的 -vf 是编码器必需的格式转换（format=nv12,hwupload…），不能整条替换，
+    只能把色彩转换拼到它前面。
+    """
+    out = list(enc_args or [])
+    if enabled is None:
+        enabled = os.environ.get("FLASHVSR_ENC_BT709", "1") != "0"
+    if not enabled:
+        return out
+    # setparams 必须带上：光写 -colorspace/-color_primaries 只有矩阵标记生效，
+    # 实测 primaries/transfer 仍是 unknown（libx264 的 VUI 从帧侧数据取，不从编码器
+    # 上下文取），播放器于是按 BT.601 解释 → 依旧偏色。
+    conv = ("scale=in_range=full:out_color_matrix=bt709:out_range=tv,"
+            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv")
+    idx = -1
+    for i in range(len(out) - 1):
+        if out[i] in ("-vf", "-filter:v", "-filter:v:0"):
+            idx = i
+            break
+    if idx >= 0:
+        out[idx + 1] = f"{conv},{out[idx + 1]}"
+    else:
+        out = ["-vf", conv] + out
+    return out + ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+
+
 _SVT_TUNE_CAPS = None
 
 
@@ -217,7 +250,8 @@ FALLBACK_CHAIN = {
 CAPS_TTL = 7 * 86400
 
 # 编码参数语义变更时 +1：让旧的分段缓存整体失效（否则会用旧语义的成片续跑）
-ENCODER_ARGS_REV = 2
+# 3: 注入 BT.709 色彩矩阵/范围转换（rgb24 → yuv 不再按默认 BT.601 偏色）
+ENCODER_ARGS_REV = 3
 
 
 def fallback_chain(backend):
@@ -448,7 +482,10 @@ def _feather_mask_nhwc(size, overlap, dtype, device, smooth=True):
         m = _feather_mask(size, overlap, smooth=smooth)
         m = m.permute(0, 2, 3, 1).to(dtype=dtype, device=device).contiguous()
         if len(_FEATHER_CACHE) > 24:
-            _FEATHER_CACHE.clear()
+            # 逐条淘汰最老的，不要 clear()：tile 尺寸/窗口帧数来回变时全清会把热点
+            # （同一尺寸的 mask 每个 tile 都要用）一起丢掉，紧接着重建 → 周期性抖动。
+            for _old in list(_FEATHER_CACHE)[:8]:
+                _FEATHER_CACHE.pop(_old, None)
         _FEATHER_CACHE[key] = m
     return m
 
@@ -461,6 +498,64 @@ def _tile_housekeeping(every=10):
             torch.cuda.empty_cache()
         except Exception:  # noqa
             pass
+
+
+_PI_STAGE = {}          # pinned 双缓冲暂存：{(shape, device): {...}}
+_PI_STAGE_MAX = 16
+
+
+def _stage_uint8_to_gpu(image_tensor, device):
+    """uint8 → float32（/255）并异步搬到 device，走 pinned 双缓冲。
+
+    /255 必须在 CPU 上做：GPU 的 float32 除法与 CPU 有 1 ULP 差异，经 fp8 量化放大后
+    整段输出 PSNR 只有 ~37 dB。但以前用 image_tensor.float() 临时分配的是 pageable 内存，
+    H2D 的 non_blocking=True 形同虚设（pageable 拷贝是阻塞实现，还要内部再转一次 staging）。
+    这里把 /255 写进 pinned 缓冲再做 H2D，并用两块缓冲轮换：
+
+        填 B（CPU）的同时，GPU 在搬 A —— canvas 逐 tile 调用，天然有下一个 tile 可填。
+        复用某块之前先等它上一次的拷贝事件，避免 CPU 覆盖 GPU 还在读的内存。
+
+    形状一直不变（逐 tile 切片），所以两块缓冲能反复用，省掉每 tile 的分配/页锁开销。
+    """
+    dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    key = (tuple(image_tensor.shape), str(dev))
+    if os.environ.get("FLASHVSR_PIN_STAGE", "1") == "0":
+        # 退路：万一某台机器的 pinned 池有副作用（锁页内存配额、老驱动），一行关掉
+        return image_tensor.float().div_(255.0).to(device=dev, non_blocking=True)
+    st = _PI_STAGE.get(key)
+    if st is None:
+        bufs, evs = [], []
+        for _ in range(2):
+            try:
+                b = torch.empty(image_tensor.shape, dtype=torch.float32, pin_memory=True)
+            except Exception:  # noqa  锁定内存不足 → 退回 pageable（只是不再异步）
+                b = torch.empty(image_tensor.shape, dtype=torch.float32)
+            bufs.append(b)
+            evs.append(torch.cuda.Event() if dev.type == "cuda" else None)
+        if len(_PI_STAGE) >= _PI_STAGE_MAX:
+            # 逐条淘汰：clear() 会把正在用的热点缓冲一起丢掉（下一窗立刻重建 + 重新锁页）。
+            # 丢弃前先等它上一次的 H2D 拷贝做完，否则释放 pinned 内存时 GPU 还在读。
+            for _old in list(_PI_STAGE)[:4]:
+                _st = _PI_STAGE.pop(_old, None)
+                if _st:
+                    for _ev in _st.get("evs") or ():
+                        try:
+                            if _ev is not None:
+                                _ev.synchronize()
+                        except Exception:  # noqa
+                            pass
+        st = {"bufs": bufs, "evs": evs, "i": 0}
+        _PI_STAGE[key] = st
+    i = st["i"]
+    st["i"] = 1 - i
+    buf, ev = st["bufs"][i], st["evs"][i]
+    if ev is not None:
+        ev.synchronize()          # 上一次从这块缓冲搬的拷贝必须做完，才能覆盖它
+    torch.div(image_tensor, 255.0, out=buf)
+    dst = buf.to(device=dev, non_blocking=True)
+    if ev is not None:
+        ev.record()
+    return dst
 
 
 def _prepare_input_gpu(mod, image_tensor, device, scale=4, dtype=torch.bfloat16):
@@ -480,7 +575,8 @@ def _prepare_input_gpu(mod, image_tensor, device, scale=4, dtype=torch.bfloat16)
         # 必须**在 CPU 上**做 /255：GPU 的 float32 除法与 CPU 有 1 ULP 差异
         # （实测一半元素差 5.96e-8），经 fp8 量化放大后整段输出 PSNR 只有 ~37 dB。
         # 只对"当前 tile 的切片"做，512 KB 级别，代价可忽略；整窗仍保持 uint8。
-        src = image_tensor.float().div_(255.0).to(device=device, non_blocking=True)
+        # _stage_uint8_to_gpu 用 pinned 双缓冲，让 H2D 真异步（见其 docstring）。
+        src = _stage_uint8_to_gpu(image_tensor, device)
     else:
         src = image_tensor.to(device=device, non_blocking=True)
         if src.dtype != torch.float32:
@@ -520,8 +616,12 @@ def _uninstall_gpu_prepare(mod):
         del mod._fs_pi_orig
 
 
+# 当前正在解码的 tile 坐标（静止块复用按"位置"缓存而不是按"上一次 decode"）
+_TILE_POS = [None]
+
+
 def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
-                        sparse, kv, local, seed=0):
+                        sparse, kv, local, seed=0, seam_fix="smooth"):
     """和节点的 tiled_dit 分支等价，但**画布与混合都在 GPU 上**。
 
     省掉的成本：每 tile 一次 `.to("cpu")`（8 帧 256² ≈ 3 MB PCIe）+ CPU 上的
@@ -535,14 +635,51 @@ def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
         frames = torch.cat([frames, frames[-1:, :, :, :].repeat(add_n, 1, 1, 1)], dim=0)
 
     N, H, W, C = frames.shape
-    canvas = torch.zeros((N, H * scale, W * scale, C), dtype=torch.float16, device=device)
-    wsum = torch.zeros((N, H * scale, W * scale, 1), dtype=torch.float16, device=device)
+    # 小视频的两个坑（都只在"窗口比 tile 小"的轴上出现）：
+    #   1) prepare_input_tensor 的目标边长是 max(128, floor(s/128)*128)，s < 128 时它
+    #      不补边、直接输出更小的 tile，却仍把 128 当 height/width 传给 pipe → 出图全黑；
+    #   2) 只有一个 tile 时，居中裁掉的边距没有邻居 tile 来补 → 右/下留黑边。
+    # 处理：把这条轴用边缘复制补到 128/scale 的整数倍，拼完再裁回原尺寸。
+    # 窗口 >= tile 的轴上每块都正好是 tile 大小、边距为零，走原来的逻辑（不改 544p 等常规路径）。
+    if isinstance(tile, (tuple, list)):
+        _th_t, _tw_t = int(tile[0]), int(tile[1])
+    else:
+        _th_t = _tw_t = int(tile)
+    unit = 128 // math.gcd(128, max(1, int(scale)))
+    Hp = ((H + unit - 1) // unit) * unit if H < _th_t else H
+    Wp = ((W + unit - 1) // unit) * unit if W < _tw_t else W
+    if Hp != H or Wp != W:
+        import torch.nn.functional as _F
+        _x = frames.permute(0, 3, 1, 2)
+        _x = _F.pad(_x, (0, Wp - W, 0, Hp - H), mode="replicate")
+        frames = _x.permute(0, 2, 3, 1)
+    # 累加精度：默认 fp32。实测同帧 fp16 vs fp32 只有 mean|d|=0.18/255（9% 像素），
+    # 耗时差 <1%，但 fp16 在重叠区最多叠 4 块时会丢尾数，hi_precision 下更敏感。
+    # FLASHVSR_CANVAS_FP32=0 可退回 fp16（显存占用减半，4K 输出省约 50 MiB/帧）。
+    _acc = torch.float32 if os.environ.get("FLASHVSR_CANVAS_FP32", "1") != "0" else torch.float16
+    canvas = torch.zeros((N, Hp * scale, Wp * scale, C), dtype=_acc, device=device)
+    wsum = torch.zeros((N, Hp * scale, Wp * scale, 1), dtype=_acc, device=device)
+    # run_win 可能传矩形 tile：(tile_h, tile_w)。以前这里直接 int(tile) → TypeError。
+    if isinstance(tile, (tuple, list)):
+        th_t, tw_t = int(tile[0]), int(tile[1])
+    else:
+        th_t = tw_t = int(tile)
     # 节点的 prepare_input_tensor 会把 tile 居中裁剪到 128 的倍数（nodes.py:53-71）。
     # tile*scale 不是 128 的倍数时，每块输出比自己的覆盖范围小 → 画布必然有空洞。
-    if (int(tile) * int(scale)) % 128 != 0:
-        print(f"[canvas] 警告：tile={tile}×scale={scale}={int(tile)*int(scale)} 不是 128 的倍数，"
-              f"接缝处会有 %128 的错位/空洞（建议 tile 取 {128//int(scale)} 的倍数）", flush=True)
-    coords = mod.calculate_tile_coords(H, W, tile, tile_overlap)
+    sc = int(scale)
+    if (th_t * sc) % 128 != 0 or (tw_t * sc) % 128 != 0:
+        step = 128 // math.gcd(128, max(1, sc))
+        if th_t == tw_t:
+            print(f"[canvas] 警告：tile={tile}×scale={scale}={th_t * sc} 不是 128 的倍数，"
+                  f"接缝处会有 %128 的错位/空洞（建议 tile 取 {step} 的倍数）", flush=True)
+        else:
+            print(f"[canvas] 警告：tile={th_t}×{tw_t}×scale={scale} 时 "
+                  f"{th_t * sc}×{tw_t * sc} 不是 128 的倍数，"
+                  f"接缝处会有 %128 的错位/空洞（建议 tile_h/tile_w 取 {step} 的倍数）", flush=True)
+    coords = mod.calculate_tile_coords(Hp, Wp, tile, tile_overlap)
+    if not coords:
+        # calculate_tile_coords 在 H/W <= overlap 时返回空表（num_rows=0）→ 从这里出去就是整帧全黑
+        coords = [(0, 0, Wp, Hp)]
     pipe_cls = getattr(mod, "FlashVSRTinyLongPipeline", None)
     _TILE_HK[0] = 0
 
@@ -551,6 +688,8 @@ def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
         LQ_tile, th, tw, F = mod.prepare_input_tensor(input_tile, device, scale=scale, dtype=dtype)
         if pipe_cls is not None and not isinstance(pipe, pipe_cls):
             LQ_tile = LQ_tile.to(device)
+        # 静止块复用的"位置键"：必须在 pipe(...) 之前设，解码发生在其内部
+        _TILE_POS[0] = (int(x1), int(y1), int(x2), int(y2))
         out_gpu = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
             tiled=True, LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
@@ -567,45 +706,98 @@ def flashvsr_gpu_canvas(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
             # pipe 内部还能再补帧（8n+1 对齐），多出来的尾帧不属于本窗
             tile_gpu = tile_gpu[:canvas.shape[0]]
         th_o, tw_o = int(tile_gpu.shape[1]), int(tile_gpu.shape[2])
+        # seam_fix 在 GPU 画布上也要生效（以前只有 CPU 回退路径才看得到这个参数）：
+        # off=硬边（不加羽化过渡），smooth=平滑羽化，align=羽化 + 逐 tile 亮度偏置对齐。
         mask_hw = _feather_mask_nhwc((th_o, tw_o), int(tile_overlap) * scale,
-                                     tile_gpu.dtype, tile_gpu.device)
+                                     tile_gpu.dtype, tile_gpu.device,
+                                     smooth=(seam_fix != "off"))
         # prepare_input_tensor 会把 tile 居中裁剪到 128 的倍数，裁掉的偏移必须补回来，
         # 否则 tile 尺寸不是 128/scale 的倍数时每块都会整体偏移 + 右/下留黑边。
         ct, cl = getattr(mod, _PI_CROP_KEY, (0, 0))
         ox1, oy1 = x1 * scale + int(cl), y1 * scale + int(ct)
         ox2, oy2 = ox1 + tw_o, oy1 + th_o
-        canvas[:, oy1:oy2, ox1:ox2, :] += (tile_gpu * mask_hw).to(torch.float16)
-        wsum[:, oy1:oy2, ox1:ox2, :] += mask_hw.to(torch.float16)
+        if seam_fix == "align":
+            # 只在"重叠区且已有内容、且不在本 tile 的实心区"的像素上估每通道 DC 偏差，
+            # 把整块 tile 平移到已有画布上，接缝两侧就没有亮暗台阶。
+            _wp = wsum[:, oy1:oy2, ox1:ox2, :]
+            _have = (_wp > 1e-3) & (mask_hw < 0.999)
+            if int(_have.sum()) > 512:
+                _cur = canvas[:, oy1:oy2, ox1:ox2, :] / _wp.clamp_min(1e-6)
+                _sel = _have.expand(-1, -1, -1, canvas.shape[3])
+                _d = (_cur.to(tile_gpu.dtype) - tile_gpu)[_sel].reshape(
+                    -1, canvas.shape[3]).mean(dim=0)
+                tile_gpu = tile_gpu + _d
+        canvas[:, oy1:oy2, ox1:ox2, :] += (tile_gpu * mask_hw).to(_acc)
+        wsum[:, oy1:oy2, ox1:ox2, :] += mask_hw.to(_acc)
         del LQ_tile, out_gpu, tile_gpu, mask_hw
+        _TILE_POS[0] = None
         _tile_housekeeping()
 
+    _debug_check_tensor("canvas", canvas)
+    _debug_check_tensor("wsum", wsum)
     if float(wsum.min()) <= 1e-6:
         # 以前这里是静默的：没覆盖到的像素除完就是黑边，只有肉眼能发现
         print("[canvas] 警告：有像素未被任何 tile 覆盖（会是黑边），检查 tile/overlap/裁剪偏移",
               flush=True)
     out = canvas / wsum.clamp_min_(1e-6)
-    return out[:n0]
+    out = out[:n0]
+    if out.shape[1] != H * scale or out.shape[2] != W * scale:
+        out = out[:, :H * scale, :W * scale, :]      # 去掉补边（复制的边缘像素）
+    return out
 
 
-def _drop_stride(frames, thr=0.5):
+def _drop_stride(frames, thr=0.5, blk_thr=None):
     """检测"按 p 拍画"（p=2/3）。返回 p 或 1（不抽）。
 
     判据：规整保留 i%p==0 时，**被丢掉的帧**是否都是前一张的复制：
     |Δ(i, i−1)| < thr。丢错率 ≥5% 就认为这条内容不是按 p 拍的，不抽。
 
     只允许 phase=0：这样插回就是 np.repeat(out, p)[:n]，不需要 keep 表。
+
+    thr 是**全局平均** MAE：暗场里一小块局部微动（人物手指、火星、水面小波纹）
+    被整幅图摊薄后很容易低于 thr，那一帧就被当成重复丢掉 → 微动消失。所以再加
+    一条网格分块判据：任一 ≤8×8 分块的平均 MAE ≥ blk_thr 就算"这一帧变了"。
+    两条判据（全局 / 局部）都不满足才算复制帧。
     """
     n = len(frames)
     if n < 8:
         return 1
-    g = np.asarray(frames[:, ::4, ::4, :3], dtype=np.int16).mean(axis=-1)  # 低分辨率灰度
+    sub = frames[:, ::4, ::4, :3]
+    if np.issubdtype(np.asarray(sub).dtype, np.floating):
+        # hi_precision 解码给的是 [0,1] float32：astype(int16) 会把每个像素截成 0，
+        # 帧差恒为 0 → 所有帧都算"复制帧"，抽帧会误删一半正常帧。
+        g = np.asarray(sub, dtype=np.float32).mean(axis=-1) * 255.0
+    else:
+        g = np.asarray(sub, dtype=np.int16).mean(axis=-1)  # 低分辨率灰度
     d1 = np.abs(np.diff(g, axis=0)).mean(axis=(1, 2))                     # d1[i-1] = |f(i)-f(i-1)|
+    if blk_thr is None:
+        try:
+            blk_thr = float(os.environ.get("FLASHVSR_DROP_BLK_THR", "2.0"))
+        except ValueError:
+            blk_thr = 2.0
+    bmax = None
+    h, w = g.shape[1], g.shape[2]
+    if blk_thr > 0 and h >= 4 and w >= 4 and n > 1:
+        d = np.abs(np.diff(g, axis=0))
+        ny, nx = min(8, h), min(8, w)
+        ys = np.linspace(0, h, ny + 1).astype(int)
+        xs = np.linspace(0, w, nx + 1).astype(int)
+        # 分块均值向量化：两次 reduceat（先按行段、再按列段）代替 8×8 次 Python
+        # 切片循环，帧多/分辨率高时省的是解释器开销而不是数学。
+        _sum = np.add.reduceat(np.add.reduceat(d, ys[:-1], axis=1), xs[:-1], axis=2)
+        _cnt = np.maximum(np.outer(np.diff(ys), np.diff(xs)).astype(np.float64), 1.0)
+        bmax = (_sum / _cnt).max(axis=(1, 2))
+    if bmax is not None:
+        # 全局差得少、但局部块变化明显 → 也算非复制帧
+        changed = (d1 >= thr) | (bmax >= blk_thr)
+    else:
+        changed = d1 >= thr
     for p in (2, 3):
         if n <= p + 2:
             continue
         kept = set(range(0, n, p))
-        lost = [d1[i - 1] for i in range(1, n) if i not in kept]
-        if lost and float(np.mean(np.asarray(lost) >= thr)) < 0.05:
+        lost = [changed[i - 1] for i in range(1, n) if i not in kept]
+        if lost and float(np.mean(np.asarray(lost))) < 0.05:
             return p
     return 1
 
@@ -614,7 +806,33 @@ def _expand(out, p, n):
     return out if p <= 1 else np.repeat(out, p, axis=0)[:n]
 
 
-def install_stream_loader():
+# 流式加载时"哪些权重可以不读盘"的配置：必须跟着 (checkpoint, quant) 变。
+# 历史 bug：install_stream_loader 初始化时把 mxfp8 的 skip 集合写死进闭包，
+# 切成 quant="none"/"w8" 后仍然跳过这些权重、只填未初始化的 torch.empty → 花屏。
+_STREAM_SKIP_CFG = {"ckpt": None, "keys": set()}
+
+
+def set_stream_skip(quant="none"):
+    """按当前 (checkpoint, quant) 重算流式加载的跳过集合（模块级，patched 每次读它）。"""
+    ckpt, keys = None, set()
+    try:
+        if str(quant or "none").lower() == "mxfp8" and                 os.environ.get("FLASHVSR_QCACHE", "1") != "0":
+            _ck = _dit_checkpoint()
+            if _ck:
+                ckpt = os.path.normcase(os.path.abspath(_ck))
+                keys = _qcache_keys(_qcache_path_static("mxfp8"))
+    except Exception as e:  # noqa
+        print(f"[stream-load] 计算跳过集合失败（改为全部读盘）: {e}", flush=True)
+        ckpt, keys = None, set()
+    _STREAM_SKIP_CFG["ckpt"] = ckpt
+    _STREAM_SKIP_CFG["keys"] = keys
+    if keys:
+        print(f"[stream-load] quant=mxfp8：{len(keys)} 个层命中量化缓存，加载时跳过读盘",
+              flush=True)
+    return len(keys)
+
+
+def install_stream_loader(quant="none"):
     """把节点的 safetensors 加载改成"逐个张量读 → 立刻转 dtype → 立刻上卡"。
 
     原实现（utils.load_state_dict_from_safetensors）会攒一个完整的 CPU state_dict，
@@ -624,6 +842,8 @@ def install_stream_loader():
 
     只影响加载路径，不改模型结构；失败就退回原实现。
     """
+    # 即使已经 patch 过也要重算：切 quant（none/w8）后旧集合会让权重被错误跳过
+    set_stream_skip(quant)
     try:
         utils = sys.modules.get("flashvsr_node.src.models.utils")
         if utils is None or getattr(utils, "_stream_patched", False):
@@ -633,8 +853,7 @@ def install_stream_loader():
         # 缓存里已有的层：不读盘、不转 bf16，直接在显存里占位（真张量，不是 meta，
         # 这样节点的 model.to(dtype, device) 不会崩）。随后 quantize_dit_mxfp8 会用
         # 缓存里的 fp8 覆盖 forward 并把占位丢掉，所以这些空张量只活几秒。
-        skip = _qcache_keys(_qcache_path_static("mxfp8")) if \
-            os.environ.get("FLASHVSR_QCACHE", "1") != "0" else set()
+        # 集合按文件判断：非本 DiT checkpoint 一律不跳过（否则别的模型也吃空张量）。
         dev_ph = "cuda" if torch.cuda.is_available() else "cpu"
 
         def patched(file_path, torch_dtype=None):
@@ -652,6 +871,10 @@ def install_stream_loader():
             import torch as _t
 
             dev = "cuda" if _t.cuda.is_available() else "cpu"
+            _tgt = _STREAM_SKIP_CFG["ckpt"]
+            _is_dit = _tgt is not None and \
+                os.path.normcase(os.path.abspath(file_path)) == _tgt
+            skip = _STREAM_SKIP_CFG["keys"] if _is_dit else set()
             skipped_n = 0
             np_dtype = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16,
                         "I64": np.int64, "I32": np.int32, "I16": np.int16,
@@ -726,6 +949,34 @@ def _bayer8(device):
     return m
 
 
+def _debug_check_tensor(name, t):
+    """FLASHVSR_DEBUG_CHECK=1 时打印张量的形状/设备/dtype/范围/NaN/Inf（不建梯度）。
+
+    整套流程里"花屏/黑屏/发灰"可能出在解码、拼缝、量化任何一步，肉眼只能看到最终
+    结果。插一行这个，就知道是哪一步把数据搞坏的（NaN 会一路传到输出成全黑）。
+    """
+    if os.environ.get("FLASHVSR_DEBUG_CHECK", "0") in ("", "0"):
+        return
+    if t is None:
+        print(f"[check] {name}: None", flush=True)
+        return
+    try:
+        with torch.no_grad():
+            f = t.detach()
+            finfo = torch.isfinite(f)
+            nan = int((torch.isnan(f)).sum()) if f.is_floating_point() else 0
+            inf = int((torch.isinf(f)).sum()) if f.is_floating_point() else 0
+            fin = f[finfo]
+            if fin.numel():
+                rng = f"min={float(fin.min()):.6g} max={float(fin.max()):.6g} mean={float(fin.mean()):.6g}"
+            else:
+                rng = "min/max/mean=空"
+            print(f"[check] {name}: shape={tuple(f.shape)} dtype={f.dtype} dev={f.device} "
+                  f"{rng} nan={nan} inf={inf}", flush=True)
+    except Exception as e:  # noqa
+        print(f"[check] {name}: 检查失败 {type(e).__name__}: {str(e)[:200]}", flush=True)
+
+
 def _quant8(out):
     """float [0,1] → uint8。**这里是整条链路唯一的 8bit 量化点**。
 
@@ -783,10 +1034,15 @@ def flashvsr_aligned(mod, pipe, frames, scale, color_fix, tile, tile_overlap,
             topk_ratio=sparse * 768 * 1280 / (th * tw), kv_ratio=kv, local_range=local,
             color_fix=color_fix, unload_dit=False, force_offload=False)
         tile_cpu = mod.tensor2video(out_gpu).to("cpu")
+        if tile_cpu.shape[0] != canvas.shape[0]:
+            tile_cpu = tile_cpu[:canvas.shape[0]]      # 8n+1 补齐多出来的尾帧不属本窗
 
         mask = _feather_mask((tile_cpu.shape[1], tile_cpu.shape[2]),
                              int(tile_overlap) * scale, smooth=True).permute(0, 2, 3, 1)
-        ox1, oy1 = x1 * scale, y1 * scale
+        # prepare_input_tensor 的居中裁剪偏移：和 flashvsr_gpu_canvas 用同一套补偿，
+        # 否则 GPU 画布关掉（显存不足回退）时每块整体偏 (cl, ct) 且右/下留黑边。
+        _ct, _cl = getattr(mod, _PI_CROP_KEY, (0, 0))
+        ox1, oy1 = x1 * scale + int(_cl), y1 * scale + int(_ct)
         ox2, oy2 = ox1 + tile_cpu.shape[2], oy1 + tile_cpu.shape[1]
 
         patch = canvas[:, oy1:oy2, ox1:ox2, :]
@@ -877,127 +1133,6 @@ def _take_weight(m):
 def _drop_weight(m):
     m._parameters.pop("weight", None)
     m.register_parameter("weight", None)
-
-
-def quantize_dit_nvfp4(pipe, log=None):
-    # 【已停用】NVFP4 画质太差（混合档实测 44.65 dB），仅保留代码备查。
-    """W4A4（NVFP4）。Blackwell 原生 FP4；单层微基准 FFN up 3.78×，误差 0.134。
-    注意：激活/权重量化都要 pad_16x=True，否则 CUDA 内核越界（0xC0000005）。"""
-    import comfy_kitchen as ck
-
-    def _ts(t):
-        return (t.abs().amax() / (6.0 * 448.0)).clamp(min=1e-8).float().reshape(1)
-
-    def _call(x, wq, wb, tw, bias, st=None):
-        shp = x.shape
-        x2 = x.reshape(-1, shp[-1]).contiguous()
-        m = x2.shape[0]
-        # 每层重算 abs+amax 占 fp4 每层开销的 42%（实测 0.78 → 0.46 ms）。
-        # 这里缓存标定值、每 N 次刷新一次，并留 25% 余量防止后续 batch 溢出。
-        every = int(os.environ.get("FLASHVSR_FP4_AMAX_EVERY", "16"))
-        if st is None or every <= 0:
-            tx = _ts(x2)
-        else:
-            if st.get("scale") is None or st["n"] % every == 0:
-                st["scale"] = _ts(x2) * 1.25
-            st["n"] = st.get("n", 0) + 1
-            tx = st["scale"]
-        xq, xb = ck.quantize_nvfp4(x2, tx, pad_16x=True)
-        y = ck.scaled_mm_nvfp4(xq, wq, tx, tw, xb, wb, bias=bias, out_dtype=x.dtype)
-        return y[:m].reshape(*shp[:-1], y.shape[-1])
-
-    n = skipped = 0
-    for name, m in _iter_linears(pipe.dit):
-        if not _should_quant(name):
-            skipped += 1
-            continue
-        w = _take_weight(m)
-        if w is None or w.shape[1] % 16 != 0:
-            skipped += 1
-            continue
-        try:
-            tw = _ts(w)
-            wq, wb = ck.quantize_nvfp4(w, tw, pad_16x=True)
-        except Exception as e:  # noqa
-            if log:
-                log(f"nvfp4 量化失败 {name}: {e}")
-            skipped += 1
-            continue
-        bias = None if m.bias is None else m.bias.detach()
-        _st = {"scale": None, "n": 0}
-        m.forward = (lambda x, _q=wq, _s=wb, _t=tw, _b=bias, _st=_st:
-                     _call(x, _q, _s, _t, _b, _st))
-        _drop_weight(m)
-        n += 1
-    torch.cuda.empty_cache()
-    if log:
-        log(f"NVFP4(pad16): {n} 个 Linear 已量化，跳过 {skipped}")
-    return n
-
-
-def quantize_dit_mixed(pipe, log=None):
-    # 【已停用】FFN 用 NVFP4，实测 44.65 dB（比 MXFP8 低 6 dB），仅保留代码备查。
-    """混合精度：FFN 用 NVFP4（权重最省、M 最大），注意力/投影保 MXFP8，
-    形状不兼容（列数不是 16/32 的倍数）的层自动退回 bf16。
-
-    动机：纯 NVFP4 在小 M 下比 MXFP8 慢 27%，且常驻多 1.35 GiB；
-    但 FFN 是最大的矩阵（8960×1536），也是 M 最大的地方，值得单独用 4bit。
-    """
-    import comfy_kitchen as ck
-
-    def _ts(t):
-        return (t.abs().amax() / (6.0 * 448.0)).clamp(min=1e-8).float().reshape(1)
-
-    def _call_fp4(x, wq, wb, tw, bias):
-        shp = x.shape
-        x2 = x.reshape(-1, shp[-1]).contiguous()
-        tx = _ts(x2)
-        xq, xb = ck.quantize_nvfp4(x2, tx, pad_16x=True)
-        y = ck.scaled_mm_nvfp4(xq, wq, tx, tw, xb, wb, bias=bias, out_dtype=x.dtype)
-        return y[:x2.shape[0]].reshape(*shp[:-1], y.shape[-1])
-
-    def _call_fp8(x, wq, wb, bias):
-        shp = x.shape
-        x2 = x.reshape(-1, shp[-1]).contiguous()
-        xq, xb = ck.quantize_mxfp8(x2)
-        y = ck.scaled_mm_mxfp8(xq, wq, xb, wb, bias=bias, out_dtype=x.dtype)
-        return y.reshape(*shp[:-1], y.shape[-1])
-
-    n_fp4 = n_fp8 = skipped = 0
-    for name, m in _iter_linears(pipe.dit):
-        if not _should_quant(name):
-            skipped += 1
-            continue
-        w = _take_weight(m)
-        if w is None:
-            skipped += 1
-            continue
-        bias = None if m.bias is None else m.bias.detach()
-        want_fp4 = ".ffn." in name and w.shape[1] % 16 == 0
-        try:
-            if want_fp4:
-                tw = _ts(w)
-                wq, wb = ck.quantize_nvfp4(w, tw, pad_16x=True)
-                m.forward = (lambda x, _q=wq, _s=wb, _t=tw, _b=bias: _call_fp4(x, _q, _s, _t, _b))
-                n_fp4 += 1
-            elif w.shape[1] % 32 == 0:
-                wq, wb = ck.quantize_mxfp8(w)
-                m.forward = (lambda x, _q=wq, _s=wb, _b=bias: _call_fp8(x, _q, _s, _b))
-                n_fp8 += 1
-            else:
-                skipped += 1
-                continue
-            _drop_weight(m)
-        except Exception as e:  # noqa
-            skipped += 1
-            if log:
-                log(f"mixed 量化失败 {name}: {e}")
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-    if log:
-        log(f"混合精度：FFN {n_fp4} 层 NVFP4 + {n_fp8} 层 MXFP8，跳过 {skipped}")
-    return n_fp4 + n_fp8
 
 
 def quantize_dit_w8a16(pipe, log=None):
@@ -1163,6 +1298,24 @@ def quantize_dit_mxfp8(pipe, log=None):
     use_cache = os.environ.get("FLASHVSR_QCACHE", "1") != "0"
     cache_path = _qcache_path(pipe, "mxfp8") if use_cache else None
     cached = _qcache_load(cache_path, log) if cache_path else None
+    # 流式加载已经把缓存里那些层换成**未初始化**的 torch.empty（省读盘）。此时若缓存
+    # 读不出来（文件截断 / 显存不够 / 版本不符），下面会把随机垃圾量化再落盘，之后每次
+    # 运行都从这份垃圾起跳 → 永久花屏。宁可报错并删掉坏缓存，让它下次从原模型重量化。
+    _skip_keys = set(_STREAM_SKIP_CFG.get("keys") or ())
+    if _skip_keys:
+        _have = set((cached or {}).keys())
+        _miss = _skip_keys - _have
+        if _miss:
+            if cache_path and os.path.exists(cache_path):
+                try:
+                    os.remove(cache_path)
+                    print(f"[FlashVSR] 量化缓存不完整，已删除 {os.path.basename(cache_path)}"
+                          f"（下次运行将从原模型重新量化）", flush=True)
+                except OSError as e:
+                    print(f"[FlashVSR] 删除损坏的量化缓存失败：{e}", flush=True)
+            raise RuntimeError(
+                f"MXFP8 量化缓存不完整（缺 {len(_miss)} 层），而权重是按「跳过读盘」"
+                f"加载的，继续跑会把未初始化显存量化后写回缓存。已清理缓存，请重新运行。")
     fresh = {}
 
     n = skipped = n_hit = 0
@@ -1244,6 +1397,11 @@ def _param_key(params):
     d["prescale_deband"] = bool(params.get("prescale_deband"))
     d["deband_grain"] = params.get("deband_grain")
     d["prescale_dither"] = str(params.get("prescale_dither") or "")
+    # 编码器/画质/位深同样改产物：换编码器后旧分段 concat -c copy 会直接失败，
+    # 画质不同则前后撕裂。历史上这三项漏在键外，改完参数仍命中旧分段。
+    d["encoder"] = str(params.get("encoder") or "auto")
+    d["quality"] = int(params.get("quality") or 15)
+    d["bitdepth"] = int(params.get("bitdepth") or 8)
     # 矩形 tile 会改接缝位置；budget=auto 会按运动量改 sparse/local/kv ——
     # 这两样历史上都漏在键外，切档后续跑会混用旧分段。
     d["tile_h"] = int(params.get("tile_h") or 0)
@@ -1341,14 +1499,41 @@ def load_node_module():
 
 
 # ---------------------------------------------------------------- 视频 IO
-def probe(path):
-    out = subprocess.check_output(
-        [FFPROBE, "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
-         "-show_entries", "format=duration", "-of", "json", path])
+def _probe_uncached(path):
+    """读容器/流信息（未缓存版）。w/h 是**显示朝向**尺寸（手机竖拍的 rotation 已换算）。"""
+    try:
+        out = subprocess.check_output(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
+             "-show_entries", "stream_side_data=rotation",
+             "-show_entries", "format=duration", "-of", "json", path],
+            stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        tail = (e.stderr or b"").decode("utf-8", "ignore").strip().splitlines()
+        raise RuntimeError(
+            f"无法读取视频 {os.path.basename(str(path))}：文件损坏、不是视频，或编码不受支持"
+            + (f"（{tail[-1][:160]}）" if tail else "")) from e
+    except FileNotFoundError as e:
+        raise RuntimeError(f"找不到 ffprobe（{FFPROBE}），请检查 ffmpeg 安装路径") from e
     j = json.loads(out.decode("utf-8", "ignore"))
     st = (j.get("streams") or [{}])[0]
     w, h = int(st.get("width", 0)), int(st.get("height", 0))
+    # Display Matrix 的 rotation：ffmpeg 自己的 autorotate 语义是 90→transpose=2、
+    # 270→transpose=1、180→hflip,vflip（本机实测与 -vf 逐像素一致）。默认 0。
+    rot = 0
+    for sd in (st.get("side_data_list") or []):
+        try:
+            if sd.get("rotation") is not None:
+                rot = int(round(float(sd["rotation"]))) % 360
+                break
+        except (TypeError, ValueError):
+            continue
+    if rot not in (0, 90, 180, 270):
+        rot = 0
+    if rot in (90, 270) and w > 0 and h > 0:
+        # 编码朝向 64×48 + rotation 90 → 显示是 48×64：处处按显示尺寸处理，
+        # 否则 in_wh/画布/预览全是侧躺的，成片方向也错。
+        w, h = h, w
     fr = st.get("avg_frame_rate") or st.get("r_frame_rate") or "25/1"
     try:
         num, den = fr.split("/")
@@ -1363,18 +1548,95 @@ def probe(path):
     has_audio = bool(json.loads(subprocess.check_output(
         [FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries",
          "stream=index", "-of", "json", path]).decode("utf-8", "ignore")).get("streams"))
-    return dict(w=w, h=h, fps=fps, duration=dur, frames=frames, has_audio=has_audio)
+    return dict(w=w, h=h, fps=fps, duration=dur, frames=frames, has_audio=has_audio,
+                rot=rot)
+
+
+# probe 在一条分段流式任务里会被反复调用（源头一次、每个窗口一次、每段产物校验一次），
+# 每次起 1~2 个 ffprobe 子进程（正片 30 段 ≈ 60 次进程启动）。按 (realpath, size,
+# mtime_ns) 做进程内 memoize：文件一旦被重写（原子改名、续跑重编）size/mtime 就变，
+# 键自然失效，不会把旧几何当成新的。返回副本，避免调用方改到缓存里的 dict。
+_PROBE_CACHE = {}
+_PROBE_CACHE_MAX = 32
+
+
+def probe(path):
+    """读容器/流信息（带缓存）；坏文件照旧抛 RuntimeError。"""
+    try:
+        st = os.stat(path)
+        key = (os.path.realpath(str(path)), int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        return _probe_uncached(path)
+    hit = _PROBE_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+    info = _probe_uncached(path)
+    if len(_PROBE_CACHE) >= _PROBE_CACHE_MAX:
+        for _old in list(_PROBE_CACHE)[:8]:
+            _PROBE_CACHE.pop(_old, None)
+    _PROBE_CACHE[key] = dict(info)
+    return info
+
+
+# 非 fp32 解码时 libplacebo 的输出/下载格式。bgra = 着色器里直接转 rgb（4:4:4、全精度），
+# 比旧写法的 yuv420p 中转少一次色度对半砍。本机 ffmpeg 9.0.1 实测 bgra/rgba/yuv444p 可用，
+# 但 hwdownload,format=rgb24 不行（vulkan 没有 24 位格式），所以用 bgra 再交给输出 pix_fmt rgb24。
+# 万一某个驱动不支持，可用 FLASHVSR_DEC_DL=yuv420p 退回旧行为。
+_DEC_DL = os.environ.get("FLASHVSR_DEC_DL", "bgra").lower()
+if _DEC_DL not in ("bgra", "rgba", "yuv444p", "yuv420p"):
+    _DEC_DL = "bgra"
+
+# 解码时的 fps 模式。默认 passthrough（按真实帧出图）。
+# 历史问题：分段 mp4 在"各段帧数不等"时用 -c copy 拼接后，容器里个别帧的
+# duration 会被写成 3 帧（0.04s → 0.12s，见 HANDOFF §11）。ffmpeg 默认按 CFR 补帧，
+# 会把这个空档当丢帧补回来——9 帧的成片能解出 11 帧，引擎校验就会报"帧数不符"。
+# 设 passthrough 后按真实帧出图；真要 CFR 行为可设 FLASHVSR_DEC_FPS=cfr（设空值关掉）。
+_DEC_FPS = os.environ.get("FLASHVSR_DEC_FPS", "passthrough").strip()
+
+
+def _start_stderr_drain(pipe, maxlen=40):
+    """后台线程排空子进程 stderr，只保留最后 maxlen 行。
+
+    历史 bug：decode/encode 只读 stdout/stdin，最后才 read() stderr。ffmpeg 的警告/错误
+    写满管道缓冲（Windows 4–64 KB）后，ffmpeg 自己阻塞在写 stderr 上，父进程则阻塞在
+    读 stdout（或写 stdin）→ 双方永久卡死，表现是任务"无声挂住"。
+    """
+    buf = collections.deque(maxlen=max(1, int(maxlen)))
+
+    def _pump():
+        try:
+            for line in iter(pipe.readline, b""):
+                buf.append(line.decode("utf-8", "ignore").rstrip())
+        except Exception:  # noqa
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:  # noqa
+                pass
+
+    th = threading.Thread(target=_pump, name="ffmpeg-stderr", daemon=True)
+    th.start()
+    return th, buf
+
+
+def _stderr_tail(buf, n=8):
+    return "\n".join([x for x in list(buf)[-n:] if x])
 
 
 def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, fp32=False,
-                scaler=None, deband=False, deband_grain=None, dither=""):
+                scaler=None, deband=False, deband_grain=None, dither="", fps_mode=None):
     """拼 ffmpeg 命令；start_frame/count 给定时只解这一段（输入侧 -ss + 精确 seek）。
 
     fp32=True 时走 libplacebo 的 gbrpf32le 输出：源精度一路保留到模型输入，
     不再经过 rgb24 的 8bit 量化（代价是每帧内存 4×）。
+
+    w/h 传**显示朝向**尺寸（probe 已按 rotation 互换过）。ffmpeg 对 rawvideo 输出
+    默认也会 autorotate（本机实测：rotation=90 的输出与 transpose=2 逐像素一致），
+    所以这里不能再加 transpose，否则会二次旋转；显式写 -autorotate 1 把这个隐式
+    依赖挑明。autorotate 的滤镜插在用户滤镜链之前，libplacebo 拿到的是显示朝向。
     """
     vf = None
-    tw, th = w, h
     scaler = scaler if scaler in SCALERS else DEFAULT_SCALER
     extra = ""                      # 附加的 libplacebo 选项（去色带 / 抖动）
     if deband:
@@ -1383,20 +1645,25 @@ def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, f
             extra += f":deband_grain={float(deband_grain):g}"
     if dither and dither in DITHERS:
         extra += f":dithering={dither}"
+    tw, th = w, h
     if abs(pre_scale - 1.0) > 1e-6:
         tw = max(2, int(round(w * pre_scale / 2)) * 2)
         th = max(2, int(round(h * pre_scale / 2)) * 2)
     if fp32:
         vf = (f"libplacebo=w={tw}:h={th}:downscaler={scaler}{extra}:format=gbrpf32le,"
               f"hwdownload,format=gbrpf32le")
-        w, h = tw, th
     elif abs(pre_scale - 1.0) > 1e-6 or extra:
-        vf = (f"libplacebo=w={tw}:h={th}:downscaler={scaler}{extra},"
-              f"hwdownload,format=yuv420p")
-        w, h = tw, th
+        # 旧写法是 hwdownload,format=yuv420p 再转 rgb24：10bit / 4:2:2 / 4:4:4 源先被
+        # 砍成 8bit 4:2:0，彩边和细纹理发灰。改成让 libplacebo 在着色器里直接输出 rgb。
+        vf = (f"libplacebo=w={tw}:h={th}:downscaler={scaler}{extra}:format={_DEC_DL},"
+              f"hwdownload,format={_DEC_DL}")
+    w, h = tw, th
     cmd = [FFMPEG, "-v", "error"]
-    if vf:
+    if vf and "libplacebo" in vf:
         cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+    # 手机竖拍等带 rotation 元数据的源：ffmpeg 默认会转，显式写出来更可靠
+    # （注意 -autorotate 是布尔开关，不能跟 "1"，否则 "1" 会被当成输出文件名）
+    cmd += ["-autorotate"]
     # 解码线程同样限 4：共享功耗墙下，解码多开线程只会抢 GPU 的 boost 预算
     cmd += ["-threads", str(int(os.environ.get("FLASHVSR_DEC_THREADS", "4")))]
     if start_frame:
@@ -1407,21 +1674,21 @@ def _decode_cmd(path, w, h, pre_scale, start_frame=None, count=None, fps=25.0, f
         cmd += ["-vf", vf]
     if count:
         cmd += ["-frames:v", str(int(count))]
+    fm = _DEC_FPS if fps_mode is None else str(fps_mode)
+    if fm:
+        cmd += ["-fps_mode", fm]
     cmd += ["-f", "rawvideo", "-pix_fmt", "gbrpf32le" if fp32 else "rgb24", "-"]
     return cmd, w, h
 
 
-def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress=None,
-                        fp32=False, scaler=None, deband=False, deband_grain=None,
-                        dither=""):
-    """只解 [start, start+count) 这一段，返回 NHWC（uint8 或 float32，内存只跟段长有关）。"""
-    info = probe(path)
-    if info["w"] <= 0 or info["h"] <= 0:
-        raise RuntimeError("读不到视频尺寸，文件可能不是视频")
+def _decode_range_cmd(path, info, start, count, pre_scale, fps, on_progress, fp32, scaler,
+                      deband, deband_grain, dither, fps_mode=None):
+    """解一次 [start, start+count)，返回 NHWC；可能短于 count（源真实帧数不够）。"""
     cmd, w, h = _decode_cmd(path, info["w"], info["h"], pre_scale, start, count, fps, fp32,
-                            scaler, deband, deband_grain, dither)
+                            scaler, deband, deband_grain, dither, fps_mode=fps_mode)
     frame_bytes = w * h * 3 * (4 if fp32 else 1)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err_th, err_buf = _start_stderr_drain(proc.stderr)
     # 预分配一次而不是 chunks + b"".join()：整窗多一次全量 memcpy（4K 下 100+ MB/窗）
     raw = bytearray(frame_bytes * count)
     mv = memoryview(raw)
@@ -1435,8 +1702,11 @@ def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress
         if on_progress and n % 10 == 0:
             on_progress(n)
     proc.wait()
+    err_th.join(timeout=2.0)
     del mv
     if n == 0:
+        if proc.returncode:
+            raise RuntimeError("解码失败：" + (_stderr_tail(err_buf) or f"ffmpeg 退出码 {proc.returncode}"))
         return np.zeros((0, h, w, 3), np.float32 if fp32 else np.uint8)
     buf = raw[:n * frame_bytes]
     if fp32:
@@ -1445,6 +1715,32 @@ def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress
         a = a[:, [2, 0, 1]].transpose(0, 2, 3, 1)
         return np.clip(a, 0.0, 1.0, out=a)
     return np.frombuffer(buf, np.uint8).reshape(-1, h, w, 3)
+
+
+def decode_frames_range(path, start, count, pre_scale=1.0, fps=25.0, on_progress=None,
+                        fp32=False, scaler=None, deband=False, deband_grain=None,
+                        dither=""):
+    """只解 [start, start+count) 这一段，返回 NHWC（uint8 或 float32，内存只跟段长有关）。
+
+    默认按真实帧出图（fps_mode=passthrough）。以前的默认是 CFR 补帧：容器时间戳有一点
+    空档就会补出重复帧，成片帧数比探测值多。反过来，VFR 源在 passthrough 下这一段可能
+    凑不满 count 帧，这时自动退回 cfr 再解一遍，保持旧行为（VFR 检查/提示照旧工作）。
+    """
+    info = probe(path)
+    if info["w"] <= 0 or info["h"] <= 0:
+        raise RuntimeError("读不到视频尺寸，文件可能不是视频")
+    out = _decode_range_cmd(path, info, start, count, pre_scale, fps, on_progress, fp32,
+                            scaler, deband, deband_grain, dither)
+    total = int(info.get("frames") or 0)
+    # 只有"请求区间落在片长之内却还是读不满"才怀疑 VFR。请求本来就超片长（末窗按
+    # 探测帧数给足 count，实际文件少一帧）属于正常短读，不能拿 CFR 去补——那正好会
+    # 把 concat 时长异常补成重复帧。
+    if count and len(out) < count and _DEC_FPS and (total <= 0 or start + count <= total):
+        alt = _decode_range_cmd(path, info, start, count, pre_scale, fps, None, fp32,
+                                scaler, deband, deband_grain, dither, fps_mode="cfr")
+        if len(alt) > len(out):
+            return alt
+    return out
 
 
 def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None,
@@ -1460,6 +1756,7 @@ def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None
         info["w"], info["h"] = w, h
     frame_bytes = w * h * 3 * (4 if fp32 else 1)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err_th, err_buf = _start_stderr_drain(proc.stderr)
     chunks, n = [], 0
     while True:
         buf = proc.stdout.read(frame_bytes)
@@ -1473,8 +1770,14 @@ def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None
             proc.kill()
             raise RuntimeError(f"帧太多（>{MAX_PIXELS // (w * h)} 帧 @ {w}x{h}），请先切段再跑")
     proc.wait()
+    err_th.join(timeout=2.0)
+    err = _stderr_tail(err_buf)
     if not chunks:
-        raise RuntimeError("没解出任何帧")
+        raise RuntimeError("没解出任何帧" + (("：" + err) if err else ""))
+
+    if proc.returncode:
+        print(f"[decode] 警告：ffmpeg 退出码 {proc.returncode}，已解出 {n} 帧"
+              + (("；" + err) if err else ""), flush=True)
     if fp32:
         a = np.frombuffer(b"".join(chunks), np.float32).reshape(-1, 3, h, w)
         a = a[:, [2, 0, 1]].transpose(0, 2, 3, 1)
@@ -1485,6 +1788,217 @@ def decode_frames(path, on_progress=None, pre_scale=1.0, fp32=False, scaler=None
 PREVIEW_WIDTH = int(os.environ.get("FLASHVSR_PREVIEW_WIDTH", "1280"))
 PREVIEW_FORMAT = os.environ.get("FLASHVSR_PREVIEW_FORMAT", "avif").lower()
 _PREVIEW_ENC = None
+
+
+def _shares(a, b):
+    """两块 ndarray 是否共用同一片底层内存。
+
+    不能用 is 比：read() 返回的是 arr[:n]（基本切片 → 新 ndarray 对象、同一片内存），
+    于是 ent[2] is not avoid 恒为 True，池子会把主线程正在读的那块交给预取线程覆盖。
+    """
+    if a is None or b is None:
+        return False
+    if a is b:
+        return True
+    try:
+        return bool(np.shares_memory(a, b))
+    except Exception:  # noqa
+        return False
+
+
+class _WindowStream(object):
+    """常驻一条 ffmpeg 解码进程，按窗口顺序连续取帧（替代每个窗口 Popen 一次）。
+
+    老做法 decode_frames_range 每窗口重开 ffmpeg：起进程 + vulkan 设备初始化 +
+    libplacebo 着色器编译在 Windows 上单次 0.3–0.6 s，而每段只有 4–9 帧
+    （重复软解本身 <5%，起进程才是大头）。这里一条管道顺着往下读：上一窗的尾巴
+    （overlap 部分）直接从上一窗缓冲切片，既不重复软解也不重开进程。
+
+    双缓冲：窗口帧直接读进 pinned 内存的池（默认 2 块）。主线程还在用第 N 块时，
+    预取线程往另一块里读，两块互不覆盖；pinned 也让后续 H2D 能真异步
+    （pageable 内存的 non_blocking=True 其实是同步拷贝）。池里 ndarray 与 tensor
+    互相持有引用，避免 pinned 块被回收。
+
+    只处理 uint8（8bit）主路径；浮点解码（hi_precision）仍走 decode_frames_range。
+    """
+
+    def __init__(self, path, fps=25.0, start=0, pre_scale=1.0, scaler=None,
+                 deband=False, deband_grain=None, dither="", blocks=2):
+        self.path = path
+        self.fps = float(fps or 25.0)
+        self.pre_scale = pre_scale
+        self.scaler = scaler
+        self.deband = bool(deband)
+        self.deband_grain = deband_grain
+        self.dither = str(dither or "")
+        info = probe(path)
+        if info["w"] <= 0 or info["h"] <= 0:
+            raise RuntimeError("读不到视频尺寸，文件可能不是视频")
+        # probe 给的已是显示朝向尺寸；ffmpeg 解码时自动按 rotation 摆正，尺寸一致
+        self.raw_wh = (int(info["w"]), int(info["h"]))
+        _, self.w, self.h = _decode_cmd(path, self.raw_wh[0], self.raw_wh[1], pre_scale,
+                                        fps=self.fps)
+        self.frame_bytes = self.w * self.h * 3
+        self._lock = threading.RLock()
+        self._nblocks = max(1, int(blocks))
+        self._blocks = []       # [(count, tensor, ndarray, pinned)]
+        self._cur = None        # 上一窗返回的 ndarray（池里的一块，别覆盖）
+        self._cur_start = 0
+        self._next = int(start)  # 下一条从管道读出的绝对帧号
+        self._raw = None
+        self._proc = None
+        self._err_th = None
+        self._err_buf = None
+        self.opened = 0
+        self.frames_read = 0
+        self._open(int(start))
+
+    # ---------------------------------------------------------------- 进程管理
+    def _open(self, start):
+        self._close_proc()
+        cmd, _, _ = _decode_cmd(self.path, self.raw_wh[0], self.raw_wh[1], self.pre_scale,
+                                int(start), None, self.fps, False, self.scaler,
+                                self.deband, self.deband_grain, self.dither)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._err_th, self._err_buf = _start_stderr_drain(self._proc.stderr)
+        self._next = int(start)
+        self.opened += 1
+
+    def _close_proc(self):
+        p = self._proc
+        self._proc = None
+        if p is not None:
+            try:
+                if p.poll() is None:
+                    p.kill()
+            except Exception:  # noqa
+                pass
+            try:
+                p.wait(timeout=10)
+            except Exception:  # noqa
+                pass
+        th, self._err_th = self._err_th, None
+        if th is not None:
+            # 先等排空线程自己读到 EOF 退出，再去关管道（反过来会从线程里抛 ValueError）
+            try:
+                th.join(timeout=3.0)
+            except Exception:  # noqa
+                pass
+        if p is not None:
+            for s in (p.stdout, p.stderr):
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:  # noqa
+                    pass
+
+    def close(self):
+        with self._lock:
+            self._close_proc()
+            self._blocks = []
+            self._cur = None
+            self._raw = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa
+            pass
+
+    # ---------------------------------------------------------------- 缓冲池
+    def _get_block(self, count, avoid):
+        """取一块 count 帧的缓冲（优先复用；避开 avoid 那块）。"""
+        for ent in self._blocks:
+            if ent[0] == count and not _shares(ent[2], avoid):
+                return ent[1], ent[2]
+        try:
+            ten = torch.empty(count * self.frame_bytes, dtype=torch.uint8, pin_memory=True)
+        except Exception:  # noqa  显存/锁定内存不足时退回 pageable（只是 H2D 不再异步）
+            ten = torch.empty(count * self.frame_bytes, dtype=torch.uint8)
+        arr = ten.numpy().reshape(count, self.h, self.w, 3)
+        self._blocks.append((count, ten, arr, bool(ten.is_pinned())))
+        if len(self._blocks) > self._nblocks:
+            # 池超限：丢掉最老的、且不是上一窗在用的那块
+            for k, ent in enumerate(self._blocks):
+                if not _shares(ent[2], avoid) and not _shares(ent[2], self._cur):
+                    del self._blocks[k]
+                    break
+        return ten, arr
+
+    # ---------------------------------------------------------------- 读帧
+    def _read_into(self, mv):
+        """恰好读满一帧返回 True；EOF 返回 False。"""
+        total = len(mv)
+        n = 0
+        while n < total:
+            got = self._proc.stdout.readinto(mv[n:])
+            if not got:
+                return False
+            n += got
+        return True
+
+    def _skip(self, k):
+        """丢掉 k 帧（续跑/跳段时才会走到），边丢边推进 _next。"""
+        if k <= 0:
+            return
+        if self._raw is None:
+            self._raw = bytearray(self.frame_bytes * 8)
+        per = max(1, len(self._raw) // self.frame_bytes)
+        left = int(k)
+        while left > 0:
+            m = min(per, left)
+            mv = memoryview(self._raw)[:m * self.frame_bytes]
+            if not self._read_into(mv):
+                return
+            left -= m
+            self._next += m
+
+    def read(self, start, count):
+        """取 [start, start+count) 帧，返回 NHWC uint8（pinned 视图）；不足时返回短的。"""
+        count = int(count)
+        if count <= 0:
+            return np.zeros((0, self.h, self.w, 3), np.uint8)
+        with self._lock:
+            pre = None
+            if self._cur is not None:
+                cs = self._cur_start
+                ce = cs + len(self._cur)
+                if cs <= start < ce:
+                    pre = self._cur[start - cs:]
+                    if len(pre) >= count:      # 整窗都在上一窗缓冲里（窗口不前移时）
+                        return pre[:count]
+            _, arr = self._get_block(count, avoid=self._cur)
+            have = 0
+            if pre is not None:
+                have = len(pre)
+                arr[:have] = pre               # overlap 复用：省掉重复软解
+            need0 = int(start) + have
+            if self._proc is None or self._next != need0:
+                # 正常流水线不会走到这里（窗口只前移、overlap 已复用）；只有续跑跳段、
+                # 或者上一窗短读造成错位才会。向前小幅错位就丢弃，向后就重开进程。
+                if self._proc is not None and need0 > self._next:
+                    # 跨过多个已完成分段时逐帧软解毫无意义（GOP 中间每帧都要真解再丢），
+                    # 大跳直接输入侧 -ss 重开；只有小幅错位才顺序读走。
+                    if need0 - self._next > 32:
+                        self._open(need0)
+                    else:
+                        self._skip(need0 - self._next)
+                else:
+                    self._open(need0)
+            n = have
+            mv = memoryview(arr).cast("B")
+            while n < count:
+                if not self._read_into(mv[n * self.frame_bytes:(n + 1) * self.frame_bytes]):
+                    break
+                n += 1
+            self.frames_read += n - have
+            out = arr[:n]
+            self._cur, self._cur_start = out, int(start)
+            self._next = int(start) + n
+            if n <= have and self._proc is not None and self._proc.returncode:
+                raise RuntimeError("解码失败：" + (_stderr_tail(self._err_buf) or
+                                                  f"ffmpeg 退出码 {self._proc.returncode}"))
+            return out
 
 
 def preview_encoder(fmt=None):
@@ -1557,19 +2071,32 @@ def encode_frames(frames_u8, fps, out_path, audio_src=None, quality=15, backend=
         # 音轨和字幕流都无损 copy（字幕没有就静默跳过）
         cmd += ["-i", audio_src, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
                 "-c:a", "copy", "-c:s", "copy", "-shortest"]
-    cmd += encoder_args(backend, quality, bitdepth, svt_preset, tune, extra) + \
-        ["-fps_mode", "cfr", out_path]
+    # BT.709 必须在 rgb24 进入编码器之前做，且要和后端自带的 -vf 合并
+    cmd += _inject_bt709_vf(encoder_args(backend, quality, bitdepth, svt_preset, tune, extra)) \
+        + ["-fps_mode", "cfr", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    for i in range(0, len(frames_u8), 8):
-        # 直接写 buffer：.tobytes() 每 8 帧多拷 400 MB（4K），这里零拷贝
-        chunk = np.ascontiguousarray(frames_u8[i:i + 8])
-        if chunk.dtype != np.uint8:
-            chunk = chunk.astype(np.uint8)
-        proc.stdin.write(memoryview(chunk).cast("B"))
-    proc.stdin.close()
-    err = proc.stderr.read().decode("utf-8", "ignore")
-    if proc.wait() != 0:
-        raise RuntimeError(f"{backend} 编码失败：" + err.strip()[-400:])
+    err_th, err_buf = _start_stderr_drain(proc.stderr)
+    try:
+        for i in range(0, len(frames_u8), 8):
+            # 直接写 buffer：.tobytes() 每 8 帧多拷 400 MB（4K），这里零拷贝
+            chunk = np.ascontiguousarray(frames_u8[i:i + 8])
+            if chunk.dtype != np.uint8:
+                chunk = chunk.astype(np.uint8)
+            try:
+                proc.stdin.write(memoryview(chunk).cast("B"))
+            except (BrokenPipeError, OSError, ValueError):
+                # ffmpeg 已提前退出（编码器初始化失败/磁盘满）：继续喂数据会永远阻塞
+                break
+    finally:
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+    err_th.join(timeout=2.0)
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"{backend} 编码失败：" +
+                           (_stderr_tail(err_buf) or f"ffmpeg 退出码 {rc}"))
 
 
 def concat_segments(seg_paths, out_path, audio_src=None, backend="cpu", quality=15,
@@ -1715,7 +2242,27 @@ def resolve_params(fields, src_path=None):
         prescale = "half" if int(scale) == 2 else "off"
     if prescale == "half":
         scale, pre_scale = 4, 0.5
-        tile = max(64, tile // 2)          # 输入减半，tile 相应缩小才是同一块画面
+        # 面板 tile 是「输出像素」的块大小，源/2 之后同一个输出块只需一半的 LQ tile
+        # —— 但一味折半会把 LQ 块缩小 4 倍、处理面积反而涨 40%：544p 输出 1920×1088
+        # 实测 LQ tile 64 → 82.8 s、96 → 61.2 s、128 → 58.9 s（面积模型见 HANDOFF）。
+        # 而单个 tile 输出超过约 400k px 模型会静默崩坏（geometry 错位），
+        # 4× 下就是 tile ≤ 128（512×512）；顺带挡掉「面板 tile 512 + 2× → 1024² 单块」
+        # 的 OOM（实测直接 CUDA out of memory）。所以这里只夹住上限，不再折半。
+        tile = max(64, min(tile, 128))
+        step = 128 // math.gcd(128, int(scale))
+        if tile % step:
+            tile = max(step, (tile // step) * step)
+
+    # 单块输出有硬上限。实测（2× 路径，相位相关对齐 + NCC 判定）：LQ 块 320²/输出 640²
+    # 正常（shift (0,0)、NCC 0.95），LQ 131k px（256×512，输出 512×1024）起就静默崩坏
+    # —— 几何错位 + 画面胡编，PSNR/肉眼在暗场里都未必看得出来；4× 下 tile 256
+    # （输出 1024²）更是直接 OOM。所以按输出块 640 px 夹：4× → 160、2× → 320。
+    _tile_cap = max(64, 640 // max(1, int(scale)))
+    _tile_note = None
+    if tile > _tile_cap:
+        _tile_note = (f"tile {tile} 在 {int(scale)}× 下单块输出 {tile * int(scale)}×"
+                      f"{tile * int(scale)} px，超出模型稳定上限，已降到 {_tile_cap}")
+        tile = _tile_cap
         step = 128 // math.gcd(128, int(scale))
         if tile % step:
             tile = max(step, (tile // step) * step)
@@ -1744,7 +2291,11 @@ def resolve_params(fields, src_path=None):
     if tile_overlap <= 0:
         # 自动：羽化带随 tile 走。4K 实测 tile256 用 12 时接缝处清晰度掉 13%，
         # 提到 64（=tile/4）后缝处/非缝比值 0.866 → 0.997，肉眼即消失。
-        tile_overlap = max(24, tile // 4)
+        # 但那条结论是在 tile256/4K 上量的；tile ≤ 160 时 tile/4 会给出 32，比文档
+        # 默认的 24 多一圈重叠，网格凭空变密：544p 4× 下 tile128 从 45 块涨到 60 块
+        # （实测 58.5 s → 83.0 s，+42%），而两者输出 NCC 0.9956、mean|d| 0.88/255
+        # （相位相关 shift (0,0)），肉眼无差别。所以 ≤160 用 24，≥192 才按 1/4 加宽。
+        tile_overlap = max(24, tile // 4) if tile >= 192 else min(tile // 4, 24)
     tile_overlap = max(4, min(tile_overlap, max(8, tile // 2)))
 
     # 自动分段：整段解码会缓存「帧数 × 输出分辨率」的 LQ 视频（bf16），
@@ -1793,8 +2344,9 @@ def resolve_params(fields, src_path=None):
     budget = fields.get("budget") or "auto"
     if budget not in ("auto", "fixed"):
         budget = "auto"
-    if note_nv:
-        auto_note = ((auto_note + "；") if auto_note else "") + note_nv
+    for _extra_note in (_tile_note, note_nv):
+        if _extra_note:
+            auto_note = ((auto_note + "；") if auto_note else "") + _extra_note
     preview = str(fields.get("preview", "1")).lower() not in ("0", "false", "off", "no")
     # 默认 CRF 按编码器定：AV1 实测 23 已过肉眼阈值（再往下只增码率），其余保持 15
     qdef = 23 if (fields.get("encoder") in ("svtav1", "av1_nvenc")) else 15
@@ -1849,13 +2401,22 @@ def resolve_params(fields, src_path=None):
                 reuse=reuse, preview=preview, auto_note=auto_note)
 
 
+# 整窗复用（model_fn_wan_video 包装器）的共享状态。
+# 历史 bug：ensure_loaded 每次都新建 self._win 字典，但包装器只装一次、闭包捕获的是
+# 第一次那个 dict → 命中标记写在旧 dict、_decode_cl 读新 dict，复用静默失效/错帧。
+# 现在所有地方共用这一个对象，ensure_loaded 只做原地 update。
+_WIN_STATE = {"prev": None, "n": 0, "skip": 0, "flag": False, "thr": 0.001, "on": False}
+
+
 class _SegEncoder(object):
     """单线程异步写盘：GPU 在跑下一窗时，上一段在 CPU 上编码。
 
     编码（x265 / AV1）占整条流水线的 10–15%，而这 10–15% 以前是**串行**的，
     GPU 在 ffmpeg 编码期间纯空转。现在只把 encode_win 挪到后台线程：
     提交点=每段推理完；join 点=①每段开头 drain（校验/预览/manifest）
-    ②concat_segments 之前。内存上限=队列 2 段。
+    ②concat_segments 之前。内存上限按「排队段数 + 正在编的段」算，默认 2 段
+    （= 在编 1 + 排队 1，也是能真正重叠的配置）；调小到 1 就退化成串行，
+    1080p/4K 段内存紧张时可用。
     FLASHVSR_ASYNC_ENCODE=0 可关。
     """
 
@@ -1867,13 +2428,20 @@ class _SegEncoder(object):
         self._res = []
         self._inflight = False
         self._closed = False
+        self._done = False          # close() 幂等标记：正常路径 try 里收一次、finally 再收一次
         self._th = threading.Thread(target=self._run, name="seg-encode", daemon=True)
         self._th.start()
 
     def submit(self, idx, frames, path, meta):
         with self._cv:
-            while len(self._q) >= self._max and not self._closed:
+            # 正在编的那段也要计入：worker 一 pop 队列就空了，只数队列等于允许
+            # 「在编 1 段 + 排队 1 段 + 主线程正在推理的 1 段」= 3 段输出帧同时驻留。
+            while (len(self._q) + int(bool(self._inflight))) >= self._max and not self._closed:
                 self._cv.wait(0.5)          # 背压：别把整条成片都堆在内存里
+            if self._closed:
+                # 收尾后才提交：编码线程已经走了，再塞队列就是静默丢段。
+                print(f"[encode] 警告：编码线程已关闭，段 {idx} 未提交（不会被编码）", flush=True)
+                return
             self._q.append((idx, frames, path, meta))
             self._cv.notify_all()
 
@@ -1908,10 +2476,47 @@ class _SegEncoder(object):
             return rows
 
     def close(self):
+        """幂等：upcale_video 的正常路径 try 里收一次、finally 里必须再收一次。
+
+        第二次直接返回。注意 _run 只在队列空时才退出，所以第一次 close() 会先把
+        队列里已提交的段编完（异常路径下也不会静默丢段），只是要等它们写完盘。
+        """
         with self._cv:
+            if self._done:
+                return
+            self._done = True
             self._closed = True
             self._cv.notify_all()
         self._th.join()
+
+
+def _tmp_name(path):
+    """x.mp4 → x.tmp.mp4：先写临时名，成功后再原子改名。
+
+    保留扩展名（ffmpeg 靠扩展名选封装器）。被强杀/断电只会留下 .tmp，
+    不会把半截文件当成"已完成"的产物。
+    """
+    root, ext = os.path.splitext(str(path))
+    return f"{root}.tmp{ext or '.mp4'}"
+
+
+def _seg_plans(total, chunk, overlap):
+    """把 total 帧切成 [(start, win_start, win_end), …]（纯函数，方便单测边界）。
+
+    start 是本段第一个**保留**帧；win_start/win_end 是实际解码=模型输入的区间，
+    前面多带 overlap 帧给模型当上下文。overlap 夹到 chunk-1：否则
+    win_end = start-overlap+chunk <= start，start 不再前进 → 死循环。
+    """
+    total = max(0, int(total))
+    chunk = max(1, int(chunk))
+    overlap = max(0, min(int(overlap), chunk - 1))
+    plans, start = [], 0
+    while start < total:
+        win_start = max(0, start - overlap)
+        win_end = min(total, win_start + chunk)
+        plans.append([start, win_start, win_end])
+        start = win_end
+    return plans
 
 
 class Engine:
@@ -1928,7 +2533,7 @@ class Engine:
             return
         if on_stage:
             on_stage("load", 0, 1, f"加载模型（mode={mode}, attn={attention}, quant={quant}）")
-        _set_cudnn_benchmark(True)
+        _set_cudnn_benchmark(os.environ.get("FLASHVSR_CUDNN_BENCH", "1") != "0")
         self.mod = load_node_module()
         _patch_tile_coords(self.mod)          # 支持矩形 tile（tile_h × tile_w）
         wan = sys.modules["flashvsr_node.src.models.wan_video_dit"]
@@ -1950,7 +2555,8 @@ class Engine:
             gc.collect()
             torch.cuda.empty_cache()
 
-        install_stream_loader()
+        # quant 决定"哪些权重已在量化缓存里、加载时可跳过读盘"，必须传进去
+        install_stream_loader(quant)
         self.pipe = self.mod.init_pipeline("FlashVSR-v1.1", mode, "cuda:0", torch.bfloat16)
 
         import gc as _gc
@@ -1967,6 +2573,20 @@ class Engine:
                 torch.cuda.empty_cache()
 
         self.mod.clean_vram = _fast_clean_vram
+
+        # 解码加速后端（FLASHVSR_DEC_BACKEND=trt|compile|stage）必须在 _decode_cl 之前
+        # 套上：它替换的正是 TCDecoder.decode_video，晚装就会把 channels_last 与
+        # tile/窗口复用整层盖掉（复用统计看不到真实解码，TRT 也会绕过 NHWC 路径）。
+        # 反过来先装它、再让 _decode_cl 包在外面，两条路互不干扰。
+        try:
+            import trt_decoder
+            self.trt = trt_decoder.maybe_enable(
+                self.pipe.TCDecoder,
+                os.path.join(os.environ.get("TEMP", "."), "flashvsr_trt_cache"),
+                log=lambda s: print(f"[TRT] {s}", flush=True))
+        except Exception as e:  # noqa
+            self.trt = None
+            print(f"[FlashVSR] TRT 解码未启用: {type(e).__name__}: {e}", flush=True)
 
         # VAE 解码走 NHWC：实测 625 → 540 ms（−13.6%），输出逐位一致（maxdiff 0）
         try:
@@ -1985,6 +2605,11 @@ class Engine:
                 "thr": float(os.environ.get("FLASHVSR_REUSE_THR", "0.002")),
                 "max_run": int(os.environ.get("FLASHVSR_REUSE_MAX_RUN", "8")),
                 "prev": None, "out": None, "run": 0, "skip": 0, "n": 0,
+                # key=seq：跟"上一次 decode"比（旧行为，实际比的是扫描序相邻 tile）
+                # key=pos：跟"同一坐标的上一次 decode"比（跨窗同位置，才能吃到静止块）
+                "key": os.environ.get("FLASHVSR_REUSE_KEY", "seq"),
+                "cache_cap": max(1, int(os.environ.get("FLASHVSR_REUSE_CACHE", "192"))),
+                "pos": {},
             }
             self._reuse_stats = _ru
 
@@ -2002,22 +2627,60 @@ class Engine:
                     wst["flag"] = False
                     if _ru["out"] is not None and _ru.get("out_t") == x.size(1):
                         wst["reused_frames"] = wst.get("reused_frames", 0) + 1
-                        return _ru["out"]
+                        return _ru["out"].clone()
                     # 形状对不上就不冒险：老老实实解码这一窗
                     print("[win-reuse] 形状不匹配，本窗退回真实解码", flush=True)
-                if (getattr(self, "_reuse_tile", False) and _ru["prev"] is not None
+                reuse_tile = getattr(self, "_reuse_tile", False)
+                if reuse_tile and cond is not None and _ru["key"] == "pos":
+                    pos = _TILE_POS[0]
+                    # decode_video 是按时轴 chunk 调用的（一个 tile 9 次左右），
+                    # 所以"位置键"要带 chunk 序号；判定只在 tile 的首个 chunk 做一次，
+                    # 避免每个 chunk 都 .item() 同步（实测每 chunk 同步净亏 2%）。
+                    if pos != _ru.get("cur_pos"):
+                        _ru["cur_pos"] = pos
+                        _ru["chunk_i"] = -1
+                        _ru["verdict"] = None
+                    _ru["chunk_i"] = _ru.get("chunk_i", -1) + 1
+                    pk = (pos, _ru["chunk_i"]) if pos is not None else None
+                    if _ru["verdict"] is None and pk is not None:
+                        ent0 = _ru["pos"].get(pk)
+                        if ent0 is not None and ent0[2] < _ru["max_run"]:
+                            d = (cond.float() - ent0[0]).abs().mean().item()
+                            _ru["verdict"] = "skip" if d < _ru["thr"] else "dyn"
+                        else:
+                            _ru["verdict"] = "miss"
+                    if _ru["verdict"] == "skip" and pk in _ru["pos"]:
+                        ent = _ru["pos"].pop(pk)
+                        _ru["pos"][pk] = (ent[0], ent[1], ent[2] + 1)
+                        _ru["skip"] += 1
+                        # 必须 clone：调用方会对返回值做 transpose(1,2).mul_(2).sub_(1) 原地缩放
+                        return ent[1].clone()
+                    out = _orig_decode(x, parallel=parallel,
+                                       show_progress_bar=show_progress_bar, cond=cond)
+                    if pk is not None:
+                        # 缓存留在 GPU（省掉每 chunk 一次 D2H+H2D）；cond 也 clone 一份，
+                        # 否则会钉住整段 LQ_video。
+                        _ru["pos"][pk] = (cond.detach().clone(), out.detach().clone(), 0)
+                        while len(_ru["pos"]) > _ru["cache_cap"]:
+                            _ru["pos"].pop(next(iter(_ru["pos"])))
+                    _ru["out_t"] = x.size(1)
+                    return out
+                if (reuse_tile and _ru["prev"] is not None
                         and cond is not None
                         and cond.shape == _ru["prev"].shape and _ru["run"] < _ru["max_run"]):
                     d = (cond.float() - _ru["prev"].float()).abs().mean().item()
                     if d < _ru["thr"]:
                         _ru["skip"] += 1
                         _ru["run"] += 1
-                        return _ru["out"]
+                        # 必须 clone：调用方拿到的是 transpose 视图，会原地 mul_(2).sub_(1)
+                        return _ru["out"].clone()
                 _ru["run"] = 0
                 out = _orig_decode(x, parallel=parallel, show_progress_bar=show_progress_bar,
                                    cond=cond)
                 _ru["prev"] = cond
-                _ru["out"] = out
+                # 存一份私有副本：调用方马上会通过 transpose 视图原地乘 2 减 1，
+                # 直接存 out 会让缓存变成 [-1,1]，下次复用再缩一次 → 画面越来越黑。
+                _ru["out"] = out.detach().clone()
                 _ru["out_t"] = x.size(1)
                 return out
 
@@ -2051,12 +2714,14 @@ class Engine:
         # ③④ 必须共用同一个 flag，否则会把纯噪声解码成画面。
         try:
             pl_mod = sys.modules.get("flashvsr_node.src.pipelines.flashvsr_tiny_long")
-            self._win = {"prev": None, "n": 0, "skip": 0, "flag": False,
-                         "thr": float(os.environ.get("FLASHVSR_WIN_THR", "0.001")),
-                         "on": os.environ.get("FLASHVSR_WIN_REUSE", "0") == "1"}
+            # 原地 update：包装器闭包捕获的是 _WIN_STATE 这个对象本身，换对象就断线
+            _WIN_STATE.update({"prev": None, "n": 0, "skip": 0, "flag": False,
+                               "thr": float(os.environ.get("FLASHVSR_WIN_THR", "0.001")),
+                               "on": os.environ.get("FLASHVSR_WIN_REUSE", "0") == "1"})
+            self._win = _WIN_STATE
             if pl_mod is not None and not getattr(pl_mod, "_win_wrapped", False):
                 _orig_fn = pl_mod.model_fn_wan_video
-                st = self._win
+                st = _WIN_STATE
 
                 def _win_fn(dit, x, timestep, context, **kw):
                     lat = kw.get("LQ_latents")
@@ -2112,15 +2777,7 @@ class Engine:
         except Exception as e:  # noqa
             print(f"[FlashVSR] 整窗复用未启用: {e}", flush=True)
 
-        # VAE 解码换 TensorRT（逐帧 9 个 past，实测 ~1.8×；任何异常都回退 torch）
-        try:
-            import trt_decoder
-            self.trt = trt_decoder.maybe_enable(
-                dec, os.path.join(os.environ.get("TEMP", "."), "flashvsr_trt_cache"),
-                log=lambda s: print(f"[TRT] {s}", flush=True))
-        except Exception as e:  # noqa
-            self.trt = None
-            print(f"[FlashVSR] TRT 解码未启用: {type(e).__name__}: {e}", flush=True)
+        # （TRT/compile 后端的启用已前移到 _decode_cl 安装之前，见上面的注释）
 
         # 建 TRT 引擎需要 3 GB workspace：临时把常驻的 DiT 挪到 CPU，建完搬回。
         # 引擎会缓存到磁盘（TEMP\flashvsr_trt_cache），只有第一次要付这个代价。
@@ -2157,17 +2814,27 @@ class Engine:
         # 在 DiT 上卡之前把解码引擎建好（此时显存最空；引擎同时落盘，后续 ~1 s 加载）
         if self.trt is not None and prewarm and hasattr(self.trt, "prewarm"):
             try:
-                self.trt.prewarm(int(prewarm[0]), int(prewarm[1]))
+                # prewarm 可以是 (h, w)，也可以是 [(h, w), …]（矩形 tile 每种尺寸都要预热）
+                pw = prewarm
+                if isinstance(pw, (tuple, list)) and len(pw) == 2 and \
+                        all(isinstance(v, (int, float)) for v in pw):
+                    pw = [tuple(pw)]
+                for _h, _w in pw:
+                    if int(_h) > 0 and int(_w) > 0:
+                        self.trt.prewarm(int(_h), int(_w))
             except Exception as e:  # noqa
                 print(f"[TRT] 预热失败（会在首次解码时重试）：{type(e).__name__}: {str(e)[:200]}",
                       flush=True)
 
-        if quant in ("nvfp4", "mxfp8", "mixed", "w8"):
+        if quant in ("nvfp4", "mixed"):
+            # 旧脚本可能直接 ensure_loaded(quant="nvfp4")：实现已删，静默降级到 MXFP8
+            print(f"[FlashVSR] quant={quant} 已移除（画质差），改用 mxfp8", flush=True)
+            quant = "mxfp8"
+        if quant in ("mxfp8", "w8"):
             dit_to_cuda(self.pipe)
             if on_stage:
                 on_stage("load", 0, 1, f"量化 DiT 权重（{quant.upper()}）…")
-            fn = {"nvfp4": quantize_dit_nvfp4, "mxfp8": quantize_dit_mxfp8,
-                  "mixed": quantize_dit_mixed, "w8": quantize_dit_w8a16}[quant]
+            fn = {"mxfp8": quantize_dit_mxfp8, "w8": quantize_dit_w8a16}[quant]
             print(f"[FlashVSR] {fn(self.pipe, log=print)} 个 Linear 已量化", flush=True)
 
         self.loaded_key = key
@@ -2177,8 +2844,10 @@ class Engine:
 
     def _run_window(self, frames_u8, scale, tile, kv, on_tile=None, sparse=2.0, local=11,
                     tile_overlap=24, color_fix=True, seam_fix="smooth"):
-        """tile 可以是 int（正方形）或 (th, tw)（矩形）。"""
-        """force_offload=False：每 tile 结束把 2.84 GB DiT 卸到 CPU 再搬回要多花 ~2.9 s/tile。"""
+        """tile 可以是 int（正方形）或 (th, tw)（矩形）。
+
+        force_offload=False：每 tile 结束把 2.84 GB DiT 卸到 CPU 再搬回要多花 ~2.9 s/tile，因此不做。
+        """
         mod = self.mod
         orig = mod.cqdm
 
@@ -2231,7 +2900,8 @@ class Engine:
             if use_gpu_canvas:
                 out = flashvsr_gpu_canvas(
                     mod, self.pipe, frames, int(scale), bool(color_fix), tile,
-                    int(tile_overlap), float(sparse), float(kv), int(local), 0)
+                    int(tile_overlap), float(sparse), float(kv), int(local), 0,
+                    seam_fix=str(seam_fix or "smooth"))
             elif seam_fix == "align":
                 _install_smooth_feather(mod)
                 out = flashvsr_aligned(
@@ -2245,6 +2915,7 @@ class Engine:
                 out = mod.flashvsr(
                     self.pipe, frames, int(scale), bool(color_fix), True, True,
                     tile, int(tile_overlap), False, float(sparse), float(kv), int(local), 0, False)
+            _debug_check_tensor("window_out", out)
             return _quant8(out)
         finally:
             mod.cqdm = orig
@@ -2304,13 +2975,39 @@ class Engine:
                 info["h"] = max(2, int(round(info["h"] * pre_scale / 2)) * 2)
             on_stage("decode", 0, total, f"分段解码：共 {total} 帧 {info['w']}x{info['h']} @{info['fps']:.2f}fps")
 
+        # 预热尺寸必须和 run_win 实际用的 tile 一致：矩形 tile 下以前按方形算 → 白预热一次
+        _bt = params.get("tile") or 0
+        _bh = _bt[0] if isinstance(_bt, (tuple, list)) else _bt
+        _bw = _bt[1] if isinstance(_bt, (tuple, list)) else _bt
+        _pth = max(1, int(params.get("tile_h") or _bh))
+        _ptw = max(1, int(params.get("tile_w") or _bw))
+        _psc = max(1, int(params["scale"]))
+        _prewarm = [(max(16, _pth * _psc // 8), max(16, _ptw * _psc // 8))]
         self.ensure_loaded(params.get("mode") or "tiny-long", params.get("attention") or "sparse",
                            on_stage, quant=params.get("quant") or "none",
-                           prewarm=(max(16, int(params["tile"]) * int(params["scale"]) // 8),) * 2)
+                           prewarm=_prewarm)
         drop_on = os.environ.get("FLASHVSR_FRAME_DROP", "0") == "1"
         reuse_mode = str(params.get("reuse") or "off")
         self._reuse_tile = reuse_mode in ("tile", "window")
         self._reuse_win = reuse_mode == "window"
+        # 复用缓存是"上一支视频"的：pos 里每项都持有 cond/out 两份 GPU 张量（最多
+        # 192 项 ≈ 几百 MB），不清就是跨任务显存泄漏，首窗还可能撞上一支的同坐标。
+        _ru0 = getattr(self, "_reuse_stats", None)
+        if isinstance(_ru0, dict):
+            _ru0["pos"].clear()
+            _ru0["prev"] = None
+            _ru0["out"] = None
+            _ru0["run"] = 0
+            _ru0["skip"] = 0
+            _ru0["verdict"] = None
+            if reuse_mode in ("tile", "window") and not os.environ.get("FLASHVSR_REUSE_KEY"):
+                # reuse=tile 的静止块判定必须「同坐标跨窗比」；默认 seq 比的是扫描序
+                # 相邻的不同 tile，永远不可能命中。
+                _ru0["key"] = "pos"
+        _wst0 = getattr(self, "_win", None)
+        if isinstance(_wst0, dict):
+            _wst0["prev"] = None
+            _wst0["flag"] = False
         if reuse_mode != "off":
             on_stage("infer", 0, 0,
                      "复用已开启：" + ("整窗跳过 DiT（≈50.6 dB）" if reuse_mode == "window"
@@ -2343,21 +3040,29 @@ class Engine:
                 except ValueError as e:
                     on_stage("encode", 0, 0, f"附加参数解析失败，已忽略：{e}")
 
+        # 编码器状态：后台编码线程会改、主线程会读，不能用 nonlocal 变量（赋值/读取跨线程
+        # 无同步，主线程可能读到旧值，on_stage 与 concat 的 backend 参数就会和实际产物不符）。
+        enc_lock = threading.Lock()
+        enc_state = {"backend": backend, "bitdepth": bitdepth}
+
+        def _cur_enc():
+            with enc_lock:
+                return enc_state["backend"], enc_state["bitdepth"]
+
         def encode_win(frames_in, path, audio_src=None):
             """统一编码入口：沿 FALLBACK_CHAIN 降级（qsv→qsv_h264→x265→cpu），并记住能用的那个。
 
             这样"哪代核显支持什么"不需要我们预先知道——本机当场试，失败就换下一个，
-            且只在第一次失败时付出探测成本（之后 backend 已经改成可用的那个）。
+            且只在第一次失败时付出探测成本（之后 enc_state 已经改成可用的那个）。
             """
-            nonlocal backend, bitdepth
-            primary = backend
-            chain = (backend,) + fallback_chain(backend)
+            primary, primary_bd = _cur_enc()
+            chain = (primary,) + fallback_chain(primary)
             seen, last = set(), "未知错误"
             for be in chain:
                 if be in seen:
                     continue
                 seen.add(be)
-                bd = bitdepth
+                bd = primary_bd
                 if bd == 10 and be not in ("x265", "qsv"):
                     bd = 8                 # 只有 x265 / hevc_qsv 能出 10bit
                 try:
@@ -2368,10 +3073,11 @@ class Engine:
                                   quality=quality, backend=be, bitdepth=bd,
                                   svt_preset=svt_p, tune=params.get("tune"),
                                   extra=extra_args)
-                    if be != backend:
+                    if be != primary:
                         on_stage("encode", 0, 0,
-                                 f"编码器 {backend} 不可用，已改用 {be}（后续段沿用）")
-                        backend, bitdepth = be, bd
+                                 f"编码器 {primary} 不可用，已改用 {be}（后续段沿用）")
+                        with enc_lock:
+                            enc_state["backend"], enc_state["bitdepth"] = be, bd
                     return
                 except RuntimeError as e:
                     last = (str(e).strip().splitlines() or ["未知错误"])[-1][:160]
@@ -2381,8 +3087,14 @@ class Engine:
         def budget_for(win_u8, kv):
             if budget_mode != "auto" or len(win_u8) < 2:
                 return 2.0, 11, kv
-            small = win_u8[:, ::8, ::8, 1].astype("int16")
-            motion = float(np.abs(np.diff(small, axis=0)).mean())
+            sub = win_u8[:, ::8, ::8, 1]
+            if np.issubdtype(np.asarray(sub).dtype, np.floating):
+                # hi_precision：[0,1] float32；astype(int16) 会全变 0 → 永远判成"静止"，
+                # 每窗都被压到最低预算（sparse 1.5 / local 9 / kv 2.0）。
+                small = np.asarray(sub, dtype=np.float32) * 255.0
+            else:
+                small = np.asarray(sub, dtype=np.int16)
+            motion = float(np.abs(np.diff(small.astype(np.float32), axis=0)).mean())
             if motion <= 3.0:
                 return 1.5, 9, min(kv, 2.0)
             if motion <= 9.0:
@@ -2416,8 +3128,13 @@ class Engine:
             self._noise_stride = 1
             frames_out = _expand(out_t[:len(fin)], p_drop, total)
             on_stage("encode", 0, 1, f"编码中（sparse={sp} kv={kk} local={lr}）")
-            encode_win(frames_out, dst, audio)
-            on_stage("encode", 1, 1, f"编码完成（{backend}）")
+            _tmp_out = _tmp_name(dst)
+            encode_win(frames_out, _tmp_out, audio)
+            try:
+                os.replace(_tmp_out, dst)      # 编码成功才落正式名
+            except OSError as e:
+                raise RuntimeError(f"编码完成但无法改名为 {dst}：{e}") from e
+            on_stage("encode", 1, 1, f"编码完成（{_cur_enc()[0]}）")
             return dict(frames=total, fps=info["fps"], in_wh=[info["w"], info["h"]],
                         out_wh=[int(frames_out.shape[2]), int(frames_out.shape[1])], segments=0)
 
@@ -2431,7 +3148,11 @@ class Engine:
         seg_dir = os.path.join(root, f"{src_sig['hash']}_{pkey}")
         if params.get("restart"):
             shutil.rmtree(seg_dir, ignore_errors=True)
-        os.makedirs(seg_dir, exist_ok=True)
+        try:
+            os.makedirs(seg_dir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(
+                f"无法创建分段缓存目录 {seg_dir}（磁盘满或没有写权限？）：{e}") from e
 
         man = load_manifest(seg_dir)
         expect = dict(src=src_sig, params_scale=params.get("scale"), params_tile=params.get("tile"),
@@ -2453,17 +3174,36 @@ class Engine:
             save_manifest(seg_dir, man)
         done = man.get("done", {})
 
-        plans, start = [], 0
-        while start < total:
-            win_start = max(0, start - overlap)
-            win_end = min(total, win_start + chunk)
-            plans.append([start, win_start, win_end])
-            start = win_end
+        # 上次被强杀/断电可能留下没改名成功的半成品段（*.tmp.mp4）。它们从没进过
+        # manifest，留着只占盘，直接清掉。
+        try:
+            for _name in os.listdir(seg_dir):
+                if _name.endswith(".tmp.mp4"):
+                    try:
+                        os.remove(os.path.join(seg_dir, _name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        plans = _seg_plans(total, chunk, overlap)
         n_seg = len(plans)
         step = max(1, chunk - overlap)
+        # 磁盘预检（只提示不阻断）：分段缓存 + 成片 ≈ 0.4 bpp（CRF 15 实测 ~0.2 bpp，
+        # 再留一倍余量）。不够时至少让人先知道，而不是中途 ENOSPC 崩在 ffmpeg 里。
+        _disk_note = ""
+        try:
+            _need = total * (int(info["w"]) * int(params["scale"])) \
+                * (int(info["h"]) * int(params["scale"])) * 0.4 / 8
+            _free = shutil.disk_usage(seg_dir).free
+            if _free < _need:
+                _disk_note = (f"；磁盘可能不够：预计约 {_need / 2**30:.1f} GB，"
+                              f"剩余 {_free / 2**30:.1f} GB")
+        except Exception:  # noqa  预检失败不影响主流程
+            pass
         on_stage("seg", 0, n_seg,
                  f"共 {n_seg} 段：{total} 帧，{chunk} 帧/段"
-                 f"（含 {overlap} 帧段间重叠 → 每段实际推进 {step} 帧）")
+                 f"（含 {overlap} 帧段间重叠 → 每段实际推进 {step} 帧）{_disk_note}")
         man["plans"] = plans
         save_manifest(seg_dir, man)
 
@@ -2493,13 +3233,61 @@ class Engine:
         async_encode = os.environ.get("FLASHVSR_ASYNC_ENCODE", "1") != "0"
         enc = _SegEncoder(encode_win) if async_encode else None
 
+        # 连续流式解码：一条常驻 ffmpeg 顺着窗口往下读，替代每段 Popen 一次
+        # （Windows 起进程 + vulkan/libplacebo 初始化 0.3–0.6 s/段，比软解本身贵）。
+        # 整段已在内存（frames is not None）和浮点解码（fp32）路径不走这里。
+        stream = None
+        dec_pool = None
+        pending = None          # (段号, future)：下一段的解码已经在线程里跑（双缓冲）
+
+        def _next_open(after):
+            """after（含）之后第一个还没完成的段号。"""
+            for j in range(after, n_seg):
+                if str(j) not in done:
+                    return j
+            return None
+
+        def _decode_win(ws, we, prog=None):
+            """逐段解码一个窗口（常驻流读短了时的兜底，内含 CFR 兜底）。"""
+            return decode_frames_range(src, ws, we - ws, pre_scale=pre_scale,
+                                       fps=info["fps"], fp32=fp32,
+                                       scaler=params.get("prescale_scaler"),
+                                       deband=bool(params.get("prescale_deband")),
+                                       deband_grain=params.get("deband_grain"),
+                                       dither=str(params.get("prescale_dither") or ""),
+                                       on_progress=prog)
+
+        if frames is None and not fp32 and os.environ.get("FLASHVSR_STREAM_DEC", "1") != "0":
+            _first = _next_open(0)
+            if _first is not None:
+                try:
+                    stream = _WindowStream(src, info["fps"], plans[_first][1],
+                                           pre_scale=pre_scale,
+                                           scaler=params.get("prescale_scaler"),
+                                           deband=bool(params.get("prescale_deband")),
+                                           deband_grain=params.get("deband_grain"),
+                                           dither=str(params.get("prescale_dither") or ""))
+                    dec_pool = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="dec")
+                except Exception as _e:  # noqa
+                    print(f"[stream-dec] 常驻解码不可用，退回逐段解码: {_e}", flush=True)
+                    stream = None
+                    dec_pool = None
+
         def _finish_seg(idx, seg_path, meta):
-            """写盘之后的收尾：校验帧数 → 记 manifest → 抽预览帧。"""
+            """写盘之后的收尾：校验帧数 → 原子改名 → 记 manifest → 抽预览帧。"""
             keep_n = int(meta.get("keep") or 0)
             got_n = probe_frames(seg_path)
             if got_n != keep_n:
                 raise RuntimeError(f"第 {idx + 1} 段校验失败：期望 {keep_n} 帧，实际 {got_n} 帧")
-            done[str(idx)] = dict(frames=keep_n, bytes=os.path.getsize(seg_path),
+            # 校验通过才把 *.tmp.mp4 改成正式名：进程被杀时只会留下 .tmp，
+            # 续跑逻辑永远看不到"半个段"，也就不会拼出坏成片。
+            final = seg_path
+            if ".tmp" in os.path.basename(seg_path):
+                final = os.path.join(os.path.dirname(seg_path),
+                                     os.path.basename(seg_path).replace(".tmp", "", 1))
+                os.replace(seg_path, final)
+            done[str(idx)] = dict(frames=keep_n, bytes=os.path.getsize(final),
                                   at=int(time.time()))
             man["done"] = done
             save_manifest(seg_dir, man)
@@ -2509,7 +3297,7 @@ class Engine:
                 try:
                     os.makedirs(pdir, exist_ok=True)
                     name = f"seg_{idx:04d}{preview_ext()}"
-                    if extract_preview(seg_path, random.randrange(keep_n), info["fps"],
+                    if extract_preview(final, random.randrange(keep_n), info["fps"],
                                        os.path.join(pdir, name)):
                         pv = name
                 except Exception as e:  # noqa
@@ -2528,88 +3316,119 @@ class Engine:
                     raise RuntimeError(f"第 {idx + 1} 段编码失败：{err}")
                 _finish_seg(idx, spath, meta)
 
-        for i, (start, win_start, win_end) in enumerate(plans):
-            _drain()
-            seg_path = os.path.join(seg_dir, f"seg_{i:04d}.mp4")
-            seg_paths.append(seg_path)
-            keep_from = start - win_start
-            keep = win_end - start
-            if str(i) in done:
-                on_stage("seg", i + 1, n_seg, f"段 {i + 1}/{n_seg} 已完成，跳过")
-                continue
-            if frames is not None:
-                win = frames[win_start:win_end]
-            else:
-                on_stage("decode", win_start, total, f"解码 {win_start}–{win_end} 帧")
-                win = decode_frames_range(src, win_start, win_end - win_start,
-                                          pre_scale=pre_scale, fps=info["fps"], fp32=fp32,
-                                          scaler=params.get("prescale_scaler"),
-                                          deband=bool(params.get("prescale_deband")),
-                                          deband_grain=params.get("deband_grain"),
-                                          dither=str(params.get("prescale_dither") or ""),
-                                          on_progress=lambda n, ws=win_start: on_stage(
-                                              "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
-                if len(win) != win_end - win_start:
-                    # 帧数与探测不符（典型：VFR 源）。以前只修正本段的 keep、
-                    # 不动后续段起点，结果是成片中间**静默缺帧**。宁可失败：
+        try:
+            for i, (start, win_start, win_end) in enumerate(plans):
+                _drain()
+                seg_final = os.path.join(seg_dir, f"seg_{i:04d}.mp4")
+                seg_paths.append(seg_final)     # 拼接用正式名（改名由 _finish_seg 完成）
+                seg_path = _tmp_name(seg_final)
+                keep_from = start - win_start
+                keep = win_end - start
+                if str(i) in done:
+                    on_stage("seg", i + 1, n_seg, f"段 {i + 1}/{n_seg} 已完成，跳过")
+                    continue
+                if frames is not None:
+                    win = frames[win_start:win_end]
+                elif stream is not None:
+                    on_stage("decode", win_start, total, f"解码 {win_start}–{win_end} 帧（常驻解码）")
+                    if pending is not None and pending[0] == i:
+                        win = pending[1].result()
+                        pending = None
+                    else:
+                        # 预取错位（上一段被跳过 / 上次异常）→ 丢掉旧结果，同步读本窗
+                        if pending is not None:
+                            try:
+                                pending[1].result()
+                            except Exception:  # noqa
+                                pass
+                            pending = None
+                        win = stream.read(win_start, win_end - win_start)
+                    if len(win) != win_end - win_start:
+                        # 常驻流水读短了（源已到尾，或 VFR 源按帧号取不满这一段）：
+                        # 这一窗退回逐段解码，那里有 CFR 兜底与明确的 VFR 报错。
+                        win = _decode_win(win_start, win_end, lambda n, ws=win_start: on_stage(
+                            "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
+                    # 本窗已到手，立刻让后台线程去读下一窗：GPU 跑推理时解码在重叠
+                    if pending is None:
+                        _j = _next_open(i + 1)
+                        if _j is not None:
+                            _ws, _we = plans[_j][1], plans[_j][2]
+                            pending = (_j, dec_pool.submit(stream.read, _ws, _we - _ws))
+                else:
+                    on_stage("decode", win_start, total, f"解码 {win_start}–{win_end} 帧")
+                    win = _decode_win(win_start, win_end, lambda n, ws=win_start: on_stage(
+                        "decode", ws + n, total, f"解码 {ws + n}/{total} 帧"))
+                if frames is None and len(win) != win_end - win_start:
+                    # 帧数与探测不符（典型：VFR 源，passthrough 下源的真实帧数不够）。
+                    # 以前只修正本段的 keep、不动后续段起点，结果是成片中间**静默缺帧**。
+                    # 宁可失败：
                     got_n = len(win)
                     raise RuntimeError(
                         f"解码帧数与探测不符：第 {i + 1}/{n_seg} 段期望 "
                         f"{win_end - win_start} 帧，实际 {got_n} 帧。\n"
                         f"这是 VFR（可变帧率）源的典型表现。先转成恒定帧率再跑：\n"
                         f'  ffmpeg -i "输入.mp4" -fps_mode cfr -r 30 -c:v libx264 -crf 12 "输入_cfr.mp4"')
-            on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg}：{win_start}–{win_end} 帧")
+                on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg}：{win_start}–{win_end} 帧")
 
-            n_in = len(win)
-            p_drop = _drop_stride(win) if drop_on else 1
-            win_in = win[::p_drop] if p_drop > 1 else win
-            if p_drop > 1:
-                on_stage("seg", i, n_seg,
-                         f"段 {i + 1}/{n_seg} 抽帧：{p_drop} 拍，"
-                         f"{n_in} → {len(win_in)} 帧（省 {(1-len(win_in)/n_in)*100:.0f}%）")
+                n_in = len(win)
+                p_drop = _drop_stride(win) if drop_on else 1
+                win_in = win[::p_drop] if p_drop > 1 else win
+                if p_drop > 1:
+                    on_stage("seg", i, n_seg,
+                             f"段 {i + 1}/{n_seg} 抽帧：{p_drop} 拍，"
+                             f"{n_in} → {len(win_in)} 帧（省 {(1-len(win_in)/n_in)*100:.0f}%）")
 
-            def tile_cb(c, t, i=i):
-                on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg} tile {c}/{t}")
+                def tile_cb(c, t, i=i):
+                    on_stage("seg", i, n_seg, f"段 {i + 1}/{n_seg} tile {c}/{t}")
 
-            self._noise_stride = p_drop
-            res, sp, lr, kk = run_win(win_in, params["tile"], params["kv"], tile_cb)
-            self._noise_stride = 1
-            res = _expand(res[:len(win_in)], p_drop, n_in)
-            out_frames = res[keep_from:keep_from + keep]
-            out_wh = [int(out_frames.shape[2]), int(out_frames.shape[1])]
-            on_stage("encode", 0, 1, f"段 {i + 1}/{n_seg} 写盘（{backend}）")
-            meta = dict(keep=keep, pdir=params.get("preview_dir"), sp=sp, kv=kk, local=lr)
-            if enc is None:
-                encode_win(out_frames, seg_path, None)
-                _finish_seg(i, seg_path, meta)
-            else:
-                # 异步写盘：GPU 立刻去跑下一窗，编码在后台线程里与推理重叠
-                enc.submit(i, out_frames, seg_path, meta)
-            del res, out_frames, win
+                self._noise_stride = p_drop
+                res, sp, lr, kk = run_win(win_in, params["tile"], params["kv"], tile_cb)
+                self._noise_stride = 1
+                res = _expand(res[:len(win_in)], p_drop, n_in)
+                out_frames = res[keep_from:keep_from + keep]
+                out_wh = [int(out_frames.shape[2]), int(out_frames.shape[1])]
+                on_stage("encode", 0, 1, f"段 {i + 1}/{n_seg} 写盘（{_cur_enc()[0]}）")
+                meta = dict(keep=keep, pdir=params.get("preview_dir"), sp=sp, kv=kk, local=lr)
+                if enc is None:
+                    encode_win(out_frames, seg_path, None)
+                    _finish_seg(i, seg_path, meta)
+                else:
+                    # 异步写盘：GPU 立刻去跑下一窗，编码在后台线程里与推理重叠
+                    enc.submit(i, out_frames, seg_path, meta)
+                del res, out_frames, win
 
-        if enc is not None:
-            enc.close()      # 等最后一两段写完，再拼接
-            _drain()
+            if enc is not None:
+                enc.close()      # 等最后一两段写完，再拼接
+                _drain()
+        finally:
+            # 异常路径也必须收掉后台编码线程（否则线程还持着整段输出帧在写盘）
+            if enc is not None:
+                enc.close()
+            if dec_pool is not None:
+                dec_pool.shutdown(wait=True)     # 先等预取线程退出，再关解码管道
+            if stream is not None:
+                stream.close()
 
+        # 全段续跑（resumed == n_seg）时主循环一次都没解，out_wh 还是 None：
+        # 直接从第一段探一下尺寸，别把 None 丢给前端。
+        if out_wh is None and seg_paths and os.path.exists(seg_paths[0]):
+            _sp = probe(seg_paths[0])
+            if _sp.get("w") and _sp.get("h"):
+                out_wh = [int(_sp["w"]), int(_sp["h"])]
+
+        be_now, bd_now = _cur_enc()      # 后台线程可能已降级过，不能再用旧值
         on_stage("encode", 0, 1, f"拼接 {n_seg} 段 + 混入音轨")
-        concat_segments(seg_paths, dst, audio_src=audio, backend=backend, quality=quality,
-                        bitdepth=bitdepth, tune=params.get("tune"), extra=extra_args)
+        concat_segments(seg_paths, dst, audio_src=audio, backend=be_now, quality=quality,
+                        bitdepth=bd_now, tune=params.get("tune"), extra=extra_args)
         got = probe_frames(dst)
         if got and got != total:
             on_stage("encode", 1, 1,
                      f"拼接完成，但输出 {got} 帧 ≠ 期望 {total} 帧（音画可能差 {(total - got) / info['fps']:.2f}s）")
         else:
-            on_stage("encode", 1, 1, f"拼接完成（{backend}，{got} 帧）")
+            on_stage("encode", 1, 1, f"拼接完成（{be_now}，{got} 帧）")
         if not params.get("keep_seg"):
             shutil.rmtree(seg_dir, ignore_errors=True)
         return dict(frames=total, fps=info["fps"], in_wh=[info["w"], info["h"]],
                     out_wh=out_wh, segments=n_seg, resumed=resumed,
                     frames_out=got if got and got > 0 else None)
 
-    def unload(self):
-        self.pipe = None
-        self.mod = None
-        self.trt = None
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()

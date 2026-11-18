@@ -8,6 +8,8 @@
 
 scale 用"首次 forward 标定一次"的常数（不做每帧 amax）；权重 per-tensor 量化。
 """
+import os
+
 import torch
 import torch.nn as nn
 
@@ -18,6 +20,12 @@ try:
     _HAS_TRITON = True
 except Exception:  # noqa
     _HAS_TRITON = False
+
+
+# 只替换 in_channels >= MIN_CIN 的 conv。核里 BLOCK_K = min(64, CIN)，CIN 很小时
+# K 维只有几个、tensor core 大部分空着，fp8 反而比 cuDNN 原生 conv 慢（还要多一次布局转换）。
+# 浅层（LQ_proj_in 之类）可能只有 16/32 通道，这类保留原生 conv。
+MIN_CIN = int(os.environ.get("FLASHVSR_FP8_MIN_CIN", "32"))
 
 
 def available():
@@ -59,12 +67,16 @@ if _HAS_TRITON:
             ww = w_ + dw
             ok = mask_m & (hh >= 0) & (hh < H) & (ww >= 0) & (ww < W)
             base = (n_idx * H * W + hh * W + ww) * CIN
+            # CIN 不一定能被 BLOCK_K 整除（TCDecoder 首层 768+16=784 = 12×64+16）：
+            # 最后一轮必须屏蔽越界的 k，否则会读到下一个像素 / 权重块外（末元素 OOB）。
             for k0 in tl.static_range(0, CIN, BLOCK_K):
                 ks = k0 + tl.arange(0, BLOCK_K)
-                a = tl.load(x_ptr + base[:, None] + ks[None, :], mask=ok[:, None], other=0.0)
+                mask_k = ks < CIN
+                a = tl.load(x_ptr + base[:, None] + ks[None, :],
+                            mask=ok[:, None] & mask_k[None, :], other=0.0)
                 a = (a * inv_sa).to(tl.float8e4nv)      # 寄存器内量化
                 b = tl.load(w_ptr + (tap * COUT + offs_n)[None, :] * CIN + ks[:, None],
-                            mask=mask_n[None, :], other=0.0)
+                            mask=mask_n[None, :] & mask_k[:, None], other=0.0)
                 acc += tl.dot(a, b, out_dtype=tl.float32)
 
         out = acc * (sw / inv_sa)
@@ -93,6 +105,7 @@ class Conv2dFP8(nn.Module):
         self._wq = (w.float() / sw).clamp(-448, 448).to(torch.float8_e4m3fn)
         self._wq = self._wq.permute(2, 3, 0, 1).contiguous()      # (3,3,COUT,CIN)
         self._sw = sw
+        self._swf = float(sw)          # 缓存成 python float：float(tensor) 每次都要同步流
 
     def forward(self, x):
         self._prep_weights()
@@ -101,15 +114,21 @@ class Conv2dFP8(nn.Module):
             x = x.contiguous(memory_format=torch.channels_last)
         n, c, h, w = x.shape
         x_nhwc = x.permute(0, 2, 3, 1)                            # channels_last 下是 view
+        # 标定只做一次，所以不能让首帧的黑场 / _shape_probe 的 zeros 把 inv_sa
+        # 锁死在 1e6 之类的极端值（之后每帧都会被截断成 0/溢出）。黑场帧本身
+        # 全是 0，用什么 scale 都等价，于是这次先不落锁，等有内容的帧再定。
         if self._inv_sa is None:
-            sa = (x_nhwc.abs().amax() / 448.0).clamp_min(1e-6).float()
-            self._inv_sa = (1.0 / sa)
+            amax0 = float(x_nhwc.abs().amax().item())
+            if amax0 > 1e-5:
+                self._inv_sa = 448.0 / amax0
+                self._inv_saf = float(self._inv_sa)
+        inv = self._inv_saf if self._inv_sa is not None else 1.0
         cout = self.conv.out_channels
         m = n * h * w
         out = torch.empty((m, cout), device=x.device, dtype=torch.bfloat16)
         grid = (triton.cdiv(m, 64), triton.cdiv(cout, 64))
         _conv3x3_bf16in_fp8w[grid](
-            x_nhwc, self._wq, out, m, cout, h, w, float(self._inv_sa), float(self._sw),
+            x_nhwc, self._wq, out, m, cout, h, w, inv, self._swf,
             CIN=c, BLOCK_M=64, BLOCK_N=64, BLOCK_K=min(64, c), num_warps=4, num_stages=3)
         y = out.reshape(n, h, w, cout).permute(0, 3, 1, 2)
         y = y.to(x.dtype)
@@ -130,7 +149,8 @@ def patch_module(mod, verbose=False):
             k = child.kernel_size if isinstance(child.kernel_size, tuple) else (child.kernel_size,) * 2
             s = child.stride if isinstance(child.stride, tuple) else (child.stride,) * 2
             p = child.padding if isinstance(child.padding, tuple) else (child.padding,) * 2
-            if k == (3, 3) and s == (1, 1) and p == (1, 1) and child.groups == 1:
+            if (k == (3, 3) and s == (1, 1) and p == (1, 1) and child.groups == 1
+                    and child.in_channels >= MIN_CIN):
                 setattr(mod, name, Conv2dFP8(child))
                 n += 1
                 continue

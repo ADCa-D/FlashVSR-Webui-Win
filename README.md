@@ -28,7 +28,7 @@ start.bat
 - **分段处理 + 断点续跑**：长视频按 48 帧切段，逐段落盘，完成后 `ffmpeg concat -c copy` 拼接（不二次编码）；崩溃/取消后重提同参数会先问「继续上次 / 从头开始 / 忘记历史缓存」
 - **崩溃隔离**：每次推理跑在独立子进程里，崩了只影响本次任务，显存自动归还
 - **自动降档**：显存不足时按 `tile/kv` 阶梯自动重试（原参数 → tile≤128/kv≤2 → tile96 → tile64）
-- **权重量化**：MXFP8（推荐）/ bf16 / NVFP4（实验），量化后自动把 tile 提到 192
+- **权重量化**：MXFP8（推荐）/ bf16 / W8A16（老卡兼容），量化后自动把 tile 提到 192
 - **运动自适应预算**：静止镜头自动降 `sparse_ratio/local_range` 省算力
 - **显存回收守卫**：任务运行时写 `pause.flag`，避免系统内存回收脚本打断推理（见 FAQ）
 
@@ -562,7 +562,7 @@ set FLASHVSR_PREVIEW_WIDTH=1600      REM 默认 1280，且不超过原片宽度
 - `权重`（只剩三档）：**bf16**（3.49 GiB，基准）/ **MXFP8**（2.05 GiB、41.56 dB、最快，默认）/
   **W8A16**（2.03 GiB、43.33 dB，但不比 bf16 快，仅无 fp8 张量核的 30/40 系用）。
   **NVFP4 与混合档（FFN 4bit）已停用**：实测 44.65 dB（比 MXFP8 低 6 dB）、显存反而更大（3.40 GiB），
-  速度只在超大 token 才占优。老配置写了这两个值会自动落到 MXFP8 并提示。
+  速度只在超大 token 才占优。实现已于 2026-11 删除（需要时从 git 历史取回）；老配置写了这两个值会自动落到 MXFP8 并提示。
 - `编码器`：`cpu`（libx264）/ `nvenc`（H.264 硬件）/ `qsv`（Intel 核显 HEVC 8bit，**未在本机验证**：本机是 AMD 610M）/ `qsv_h264`（Intel 核显 H.264 8bit，兼容最老）/ `amf`（AMD，**仅 8 bit，同码率画质明显弱于 x264/x265**）/ `svtav1`（SVT-AV1）/ `av1_nvenc`（40/50 系硬件 AV1）/ `x265`（H.265）
 - 体积对比（业界 RD 基准，非本机实测）：AV1 比 x264 省 **40–50%** 码率、比 x265 省 **20–30%**；代价是 CPU 编码慢
 - `svtav1` 默认 **preset 4 + lp=4**：preset 越低画质越好、同 CRF 体积越小（p4 比 p10 小 ~30%），而编码耗时相对推理可忽略（4K/50 帧：p4≈7 s、p2≈13 s，推理要 30–90 分钟）。
@@ -824,7 +824,7 @@ python inference.py -s in.mp4 -o out.mp4 --scale 4 --tile 128 --kv 3 --chunk 0 \
 python inference.py -s D:\素材 -o D:\成品 --batch --preset quality
 ```
 
-参数速查：`--quant none|nvfp4|mxfp8|mixed|w8`、`--prescale auto|half|off`、
+参数速查：`--quant none|mxfp8|w8`、`--prescale auto|half|off`、
 `--encoder auto|cpu|nvenc|qsv|qsv_h264|amf|vulkan|svtav1|av1_nvenc|x265`、`--tune ssim|psnr|vq|vmaf|...`、`--scaler ewa_lanczos4sharpest`、`--deband`、`--dither blue|ordered_fixed`、`--frames N`（试跑）、`--chunk 0=不分段`、`--overlap`（tile 羽化带）。
 
 ## 目录结构

@@ -63,9 +63,20 @@ def main():
     if base_eng != base_app:
         fails.append(f"面板键 {base_app} ≠ 引擎键 {base_eng}")
 
-    e, _ = keys(src, bitdepth="10")
-    if e != base_eng:
-        fails.append("bitdepth=10 不该换目录，却换了")
+    # bitdepth 参与编码（10bit 走 yuv420p10le / main10），换了它旧分段就不能复用：
+    # 以前它不在指纹里，改完还拿旧段 concat → -c copy 失败或画质前后撕裂。
+    e, a = keys(src, bitdepth="10")
+    if e == base_eng:
+        fails.append("bitdepth=10 应该换目录，却没换")
+    if e != a:
+        fails.append(f"bitdepth=10 面板键 {a} ≠ 引擎键 {e}")
+    for tag, over in (("encoder=cpu", {"encoder": "cpu"}),
+                      ("quality=20", {"quality": "20"})):
+        e2, a2 = keys(src, **over)
+        if e2 == base_eng:
+            fails.append(f"{tag} 应该换目录，却没换")
+        if e2 != a2:
+            fails.append(f"{tag} 面板键 {a2} ≠ 引擎键 {e2}")
 
     for tag, over in (("tune=psnr", {"tune": "psnr"}),
                       ("extra_args 非空", {"extra_args": "-rc vbr"}),

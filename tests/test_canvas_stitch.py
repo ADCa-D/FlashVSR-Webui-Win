@@ -10,6 +10,8 @@ ast 里抽出 5 个纯函数）做参考实现，验：
 2. 常数输入 → 常数输出，且权重图无空洞（wsum 覆盖满，没有黑边）。
 3. tile 64 / 128 两种切法输出几乎一致（拼接与 tile 尺寸解耦）。
 4. tile*scale 不是 128 的倍数的非法配置会被警告（以前静默出黑边）。
+5. 窗口比 tile 还小时（含 H/W <= overlap 的退化情况）补边后必须铺满、不留黑边
+   （以前 calculate_tile_coords 返回空表 → 整帧全黑）。
 
 跑法：
     <ComfyUI 便携包>\python_embeded\python.exe tests\test_canvas_stitch.py
@@ -71,20 +73,26 @@ class FakePipe(object):
     device = torch.device("cpu")
     torch_dtype = torch.float32
 
-    def __init__(self, trim_to=None):
+    def __init__(self, trim_to=None, dc=0.0):
         self.trim_to = trim_to
+        self.dc = dc
 
     def __call__(self, **kw):
         v = kw["LQ_video"]
+        if self.dc:
+            # 模拟"每个 tile 解码出来亮度不同"（真实接缝台阶的来源）：右侧 tile 整体 +dc
+            pos = E._TILE_POS[0]
+            if pos is not None and pos[0] > 0:
+                v = v + self.dc
         return v if self.trim_to is None else v[:, :, :self.trim_to]
 
 
-def run_canvas(frames, scale, tile, overlap, trim_to=None):
+def run_canvas(frames, scale, tile, overlap, trim_to=None, seam_fix="smooth", dc=0.0):
     mod = FakeMod()
     E._install_gpu_prepare(mod)
-    pipe = FakePipe(trim_to=trim_to)
+    pipe = FakePipe(trim_to=trim_to, dc=dc)
     out = E.flashvsr_gpu_canvas(mod, pipe, frames, scale, False, tile, overlap,
-                                0.1, 0.1, 0.1, seed=0)
+                                0.1, 0.1, 0.1, seed=0, seam_fix=seam_fix)
     E._uninstall_gpu_prepare(mod)
     return out
 
@@ -164,12 +172,48 @@ def main():
     if "不是 128 的倍数" not in text:
         fails.append("非法 tile 没有给出警告（以前会静默出黑边）")
 
+    # ---- 5. 小窗口（窗口比 tile 还小）：补边后必须铺满、不留黑边
+    #     以前这里会走 calculate_tile_coords 的 num_rows=0 分支 → 整帧全黑。
+    for (h0, w0, ov) in ((24, 32, 24), (12, 12, 24)):
+        out_s = run_canvas(torch.full((2, h0, w0, 3), 0.5), 2, 128, ov)
+        tag = f"小窗口 {h0}x{w0}"
+        if tuple(out_s.shape) != (2, h0 * 2, w0 * 2, 3):
+            fails.append(f"{tag} 输出尺寸错 {tuple(out_s.shape)}")
+            continue
+        if float((out_s - 0.5).abs().max()) > 2e-2:
+            fails.append(f"{tag} 不平（补边/羽化有问题）：{float((out_s - 0.5).abs().max()):.3f}")
+        if float(out_s.min()) < 0.4:
+            fails.append(f"{tag} 出现黑边：min={float(out_s.min()):.3f}")
+
+    # ---- 6. seam_fix 必须在 GPU 画布上真的生效（以前 GPU 画布默认开启，align/off 被旁路）
+    for mode in ("off", "smooth", "align"):
+        o = run_canvas(torch.full((2, 64, 64, 3), 0.5), 2, 32, 8, seam_fix=mode)
+        if tuple(o.shape) != (2, 128, 128, 3):
+            fails.append(f"seam_fix={mode} 输出尺寸错 {tuple(o.shape)}")
+        elif float(o.min()) < 0.4:
+            fails.append(f"seam_fix={mode} 出现黑边 min={float(o.min()):.3f}")
+
+    # 逐 tile 直流偏置：smooth 只能模糊台阶（左右内部亮度仍然差一截），
+    # align 必须把偏置估出来减掉，两块内部亮度拉平。
+    def _lvl_diff(mode, dc=0.2):        # tensor2video 会 (x+1)/2，dc 名义值要除 2
+        o = run_canvas(torch.full((2, 64, 64, 3), 0.5), 2, 32, 8, seam_fix=mode, dc=dc)
+        left = float(o[:, :, 40:56].mean())
+        right = float(o[:, :, 80:96].mean())
+        return abs(left - right)
+
+    d_smooth = _lvl_diff("smooth")
+    d_align = _lvl_diff("align")
+    if d_smooth < 0.06:
+        fails.append(f"测试自身失效：smooth 下两块亮度只差 {d_smooth:.3f}（应 >0.06）")
+    if d_align > 0.02:
+        fails.append(f"seam_fix=align 没拉平逐 tile 偏置：左右亮度差 {d_align:.3f}（>0.02）")
+
     if fails:
         print("FAIL")
         for f in fails:
             print("  -", f)
         return 1
-    print("PASS: 画布拼接 / prepare 等价 / 覆盖完整 / 非法 tile 有警告")
+    print("PASS: 画布拼接 / prepare 等价 / 覆盖完整 / 非法 tile 有警告 / seam_fix 生效")
     return 0
 
 

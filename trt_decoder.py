@@ -85,6 +85,34 @@ class _Step(torch.nn.Module):
         return (tuple(outs),) + tuple(mem[L] for L in self.mem_layers)
 
 
+class _PastPool:
+    """past 输出缓冲的 A/B 双缓冲池：省掉热循环里每帧 9 次 torch.empty。
+
+    past 是「本帧输出、下一帧输入」，所以相邻两帧只要用不同的一组缓冲，就不会踩到
+    正在被 TensorRT 当输入读的那组；第三帧再回到第一组时，第一组的内容早已作废。
+    形状按 session 固定，键用形状元组（多分辨率/多 tile 尺寸会各占一对）。
+    """
+
+    def __init__(self, device="cuda"):
+        self._device = device
+        self._sets = {}
+        self._i = 0
+
+    def get(self, shapes):
+        key = tuple(tuple(int(x) for x in s) for s in shapes)
+        pair = self._sets.get(key)
+        if pair is None:
+            pair = [[torch.empty(tuple(s), device=self._device, dtype=torch.float16)
+                     for s in shapes] for _ in range(2)]
+            self._sets[key] = pair
+        buf = pair[self._i]
+        self._i ^= 1
+        return buf
+
+    def clear(self):
+        self._sets.clear()
+        self._i = 0
+
 class TRTDecoder:
     def __init__(self, taehv, cache_dir, log=print):
         self.dec = taehv
@@ -95,6 +123,7 @@ class TRTDecoder:
                        if type(b).__name__ == "MemBlock"]
         self.sessions = {}
         self.mem = None            # 9 个 past，fp16，留在显存
+        self._pool = _PastPool()   # past 输出的 A/B 双缓冲（省每帧 9 次 torch.empty）
         self.off = False
         self.t_build = 0.0
         self.before_build = None      # 建引擎前腾显存（engine 里注入：把 DiT 挪到 CPU）
@@ -197,6 +226,7 @@ class TRTDecoder:
     # ---------------- 对外
     def clean_mem(self):
         self.mem = None
+        self._pool.clear()          # 窗口之间把双缓冲也还回去（否则常驻 2×9 个 past）
 
     def wrap(self, taehv):
         """接管 decode_video / clean_mem，保留原实现用于回退。"""
@@ -241,18 +271,28 @@ class TRTDecoder:
                     for i, m in enumerate(self.mem):
                         b.bind_input(f"past{i}", "cuda", 0, "float16",
                                      tuple(m.shape), m.data_ptr())
-                    new_mem = []
-                    for i, name in enumerate(out_names):
-                        shape = outs["frames"][i] if i < len(outs["frames"]) else outs["pasts"][i - len(outs["frames"])]
+                    nf = len(outs["frames"])
+                    # 帧输出必须各自独立（最后要 stack 成一整段），所以照旧每帧分配；
+                    # past 输出走 A/B 池：形状固定，交替复用两组，省掉每帧 9 次 empty。
+                    new_frames = []
+                    for i in range(nf):
+                        shape = outs["frames"][i]
                         buf = torch.empty(shape, device="cuda", dtype=torch.float16)
-                        b.bind_output(name, "cuda", 0, "float16", shape, buf.data_ptr())
-                        new_mem.append(buf)
+                        b.bind_output(out_names[i], "cuda", 0, "float16", shape, buf.data_ptr())
+                        new_frames.append(buf)
+                    new_mem = self._pool.get(outs["pasts"])
+                    for i, buf in enumerate(new_mem):
+                        b.bind_output(out_names[nf + i], "cuda", 0, "float16",
+                                      tuple(buf.shape), buf.data_ptr())
                     sess.run_with_iobinding(b)
-                    frames.extend(new_mem[:len(outs["frames"])])
-                    self.mem = new_mem[len(outs["frames"]):]
+                    frames.extend(new_frames)
+                    self.mem = new_mem
                 y = torch.stack([f.reshape(1, 3, f.shape[-2], f.shape[-1]) for f in frames], dim=1)
         except Exception as e:  # noqa
             self.log(f"TRT 推理失败，回退 torch：{type(e).__name__}: {str(e)[:160]}")
+            # 中途异常时 self.mem 可能已经指向半算的 past；现在靠 off=True 永久回退还不会
+            # 用错帧，但只要将来允许「单帧失败不关 TRT」，残留的 mem 会让下一窗漏掉首帧 trim。
+            self.mem = None
             self.off = True
             return self._fallback(x, parallel, show_progress_bar, cond)
 
@@ -447,6 +487,7 @@ class StageTRTDecoder(TRTDecoder):
             free, total = torch.cuda.mem_get_info()
             self.log(f"分段 TRT 失败，回退 torch（空闲 {free/2**30:.1f}/{total/2**30:.1f} GB）："
                      f"{type(e).__name__}: {str(e)[:260]}")
+            self.mem = None     # 同上：别把半算的 past 留到下一次
             self.off = True
             return self._fallback(x, parallel, show_progress_bar, cond)
         if first:
@@ -496,10 +537,13 @@ class CompiledDecoder:
         if key in self.steps:
             return self.steps[key]
         t0 = time.perf_counter()
-        shapes = self._probe(h, w, dt)
-        fn = torch.compile(_Step(self.dec.decoder, sorted(shapes)).eval(),
+        shapes = self._probe(h, w, dt)   # {layer_idx: shape}，是 dict 不是列表
+        layers = sorted(shapes)
+        fn = torch.compile(_Step(self.dec.decoder, layers).eval(),
                            mode=self.mode, dynamic=False)
-        self.steps[key] = (fn, shapes)
+        # 存**形状列表**（按层序），不是 dict：decode_video 里直接 for s in shapes 建
+        # mem，遍历 dict 拿到的是 layer_idx 整数 → torch.zeros(3) 建出 1D 张量，首帧必崩。
+        self.steps[key] = (fn, [shapes[L] for L in layers])
         self.log(f"torch.compile 解码器 {h}x{w}（编译 {time.perf_counter()-t0:.1f}s）")
         return self.steps[key]
 
