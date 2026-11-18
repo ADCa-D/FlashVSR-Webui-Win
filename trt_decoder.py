@@ -38,6 +38,11 @@ def _add_trt_dlls():
     return None
 
 
+# 模块导入时就挂上 DLL 目录：onnxruntime 在 import 阶段就会尝试注册 TRT 插件，
+# 晚于 import 再改 PATH 已经来不及（之前 _add_trt_dlls 从未被调用，TRT 一直没生效）。
+_add_trt_dlls()
+
+
 def trt_available():
     """onnxruntime 有 TRT provider 且 nvinfer 能加载。"""
     if not _add_trt_dlls():
@@ -215,7 +220,7 @@ class TRTDecoder:
             pasts=[shapes[L] for L in layers],
         )
         self.sessions[key] = (sess, outs, out_names)
-        self.log(f"TRT 解码器就绪 {h}x{w}（{self.t_build:.0f}s，{len(layers)} 个 past）")
+        self.log(f"TRT 解码器就绪 {h}x{w}（{self.t_build:.0f}s，{len(layers)} 个 past）providers={sess.get_providers()}")
         return self.sessions[key]
 
     def prewarm(self, h, w):

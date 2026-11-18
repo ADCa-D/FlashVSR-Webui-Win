@@ -1,0 +1,209 @@
+diff --git a/a/wan_video_vae.py b/b/wan_video_vae.py
+index 1233039..4350d01 100644
+--- a/a/wan_video_vae.py
++++ b/b/wan_video_vae.py
+@@ -33,23 +33,28 @@ def block_causal_mask(x, block_size):
+ class CausalConv3d(nn.Conv3d):
+     """
+     Causal 3d convolusion.
++
++    时间维靠 F.pad 补零（causal），**空间维交回 nn.Conv3d**：cuDNN 的 zero-padding
++    在算子内部完成，不需要先把整张 5D 特征图复制一份更大的。高分辨率解码层这里
++    每层都要多读写一整份激活。
+     """
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+-        self._padding = (self.padding[2], self.padding[2], self.padding[1],
+-                         self.padding[1], 2 * self.padding[0], 0)
+-        self.padding = (0, 0, 0)
++        pad = self.padding
++        self._t_pad = 2 * pad[0]
++        self.padding = (0, pad[1], pad[2])
+ 
+     def forward(self, x, cache_x=None):
+-        padding = list(self._padding)
+-        if cache_x is not None and self._padding[4] > 0:
++        t_pad = self._t_pad
++        if cache_x is not None and t_pad > 0:
+             cache_x = cache_x.to(x.device)
+-            # print('cache_x.shape', cache_x.shape, 'x.shape', x.shape)
+             x = torch.cat([cache_x, x], dim=2)
+-            padding[4] -= cache_x.shape[2]
+-        x = F.pad(x, padding)
+-
++            t_pad = t_pad - cache_x.shape[2]
++        if t_pad > 0:
++            x = F.pad(x, (0, 0, 0, 0, t_pad, 0))
++        elif t_pad < 0:
++            x = x[:, :, -t_pad:, :, :]      # 与原实现一致：负 pad = 从前面裁掉
+         return super().forward(x)
+ 
+ 
+@@ -75,9 +80,11 @@ class Upsample(nn.Upsample):
+ 
+     def forward(self, x):
+         """
+-        Fix bfloat16 support for nearest neighbor interpolation.
++        nearest-exact 是纯 gather，不做插值运算，bf16 下与 fp32 结果逐位相同
++        （PyTorch 2.1+ 原生支持 bf16）。原来的 x.float() 会在分辨率最高的两层
++        把激活放大 2 倍、带宽翻 3 倍。
+         """
+-        return super().forward(x.float()).type_as(x)
++        return super().forward(x)
+ 
+ 
+ class Resample(nn.Module):
+@@ -118,7 +125,10 @@ class Resample(nn.Module):
+         else:
+             self.resample = nn.Identity()
+ 
+-    def forward(self, x, feat_cache=None, feat_idx=[0]):
++    def forward(self, x, feat_cache=None, feat_idx=None):
++        # 可变默认参数会把计数器跨调用残留（第二次不传就 IndexError），改成 None + 就地新建
++        if feat_idx is None:
++            feat_idx = [0]
+         b, c, t, h, w = x.size()
+         if self.mode == 'upsample3d':
+             if feat_cache is not None:
+@@ -212,7 +222,10 @@ class ResidualBlock(nn.Module):
+         self.shortcut = CausalConv3d(in_dim, out_dim, 1) \
+             if in_dim != out_dim else nn.Identity()
+ 
+-    def forward(self, x, feat_cache=None, feat_idx=[0]):
++    def forward(self, x, feat_cache=None, feat_idx=None):
++        # 可变默认参数会把计数器跨调用残留（第二次不传就 IndexError），改成 None + 就地新建
++        if feat_idx is None:
++            feat_idx = [0]
+         h = self.shortcut(x)
+         for layer in self.residual:
+             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
+@@ -326,7 +339,10 @@ class Encoder3d(nn.Module):
+         self.head = nn.Sequential(RMS_norm(out_dim, images=False), nn.SiLU(),
+                                   CausalConv3d(out_dim, z_dim, 3, padding=1))
+ 
+-    def forward(self, x, feat_cache=None, feat_idx=[0]):
++    def forward(self, x, feat_cache=None, feat_idx=None):
++        # 可变默认参数会把计数器跨调用残留（第二次不传就 IndexError），改成 None + 就地新建
++        if feat_idx is None:
++            feat_idx = [0]
+         if feat_cache is not None:
+             idx = feat_idx[0]
+             cache_x = x[:, :, -CACHE_T:, :, :].clone()
+@@ -430,7 +446,10 @@ class Decoder3d(nn.Module):
+         self.head = nn.Sequential(RMS_norm(out_dim, images=False), nn.SiLU(),
+                                   CausalConv3d(out_dim, 3, 3, padding=1))
+ 
+-    def forward(self, x, feat_cache=None, feat_idx=[0]):
++    def forward(self, x, feat_cache=None, feat_idx=None):
++        # 可变默认参数会把计数器跨调用残留（第二次不传就 IndexError），改成 None + 就地新建
++        if feat_idx is None:
++            feat_idx = [0]
+         ## conv1
+         if feat_cache is not None:
+             idx = feat_idx[0]
+@@ -527,19 +546,30 @@ class VideoVAE_(nn.Module):
+         self.clear_cache()
+         ## cache
+         t = x.shape[2]
++        # t 必须是 1+4k：以前非 1+4k 的输入会被**静默丢掉尾巴**（t=48 → 只编到第 45 帧）。
++        # 这里把尾巴用最后一帧补齐（causal VAE 的常规做法），并提示一次。
++        pad_t = (-(t - 1)) % 4
++        if pad_t:
++            x = torch.cat([x, x[:, :, -1:, :, :].expand(-1, -1, pad_t, -1, -1)], dim=2)
++            if not getattr(self, "_warned_tail", False):
++                self._warned_tail = True
++                print(f"[VAE] encode: 输入 {t} 帧不是 1+4k，尾部补 {pad_t} 帧"
++                      f"（旧实现会静默丢弃尾帧）", flush=True)
++            t = x.shape[2]
+         iter_ = 1 + (t - 1) // 4
+ 
++        outs = []
+         for i in range(iter_):
+             self._enc_conv_idx = [0]
+             if i == 0:
+-                out = self.encoder(x[:, :, :1, :, :],
+-                                   feat_cache=self._enc_feat_map,
+-                                   feat_idx=self._enc_conv_idx)
++                outs.append(self.encoder(x[:, :, :1, :, :],
++                                         feat_cache=self._enc_feat_map,
++                                         feat_idx=self._enc_conv_idx))
+             else:
+-                out_ = self.encoder(x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+-                                    feat_cache=self._enc_feat_map,
+-                                    feat_idx=self._enc_conv_idx)
+-                out = torch.cat([out, out_], 2)
++                outs.append(self.encoder(x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
++                                         feat_cache=self._enc_feat_map,
++                                         feat_idx=self._enc_conv_idx))
++        out = outs[0] if len(outs) == 1 else torch.cat(outs, 2)
+         mu, log_var = self.conv1(out).chunk(2, dim=1)
+         if isinstance(scale[0], torch.Tensor):
+             scale = [s.to(dtype=mu.dtype, device=mu.device) for s in scale]
+@@ -562,20 +592,14 @@ class VideoVAE_(nn.Module):
+             z = z / scale[1] + scale[0]
+         iter_ = z.shape[2]
+         x = self.conv2(z)
++        outs = []
+         for i in range(iter_):
+             self._conv_idx = [0]
+-            if i == 0:
+-                out = self.decoder(x[:, :, i:i + 1, :, :],
+-                                   feat_cache=self._feat_map,
+-                                   feat_idx=self._conv_idx)
+-            else:
+-                out_ = self.decoder(x[:, :, i:i + 1, :, :],
+-                                    feat_cache=self._feat_map,
+-                                    feat_idx=self._conv_idx)
+-                out = torch.cat([out, out_], 2) # may add tensor offload
+-        return out
++            outs.append(self.decoder(x[:, :, i:i + 1, :, :],
++                                     feat_cache=self._feat_map,
++                                     feat_idx=self._conv_idx))
++        return outs[0] if len(outs) == 1 else torch.cat(outs, 2)
+ 
+-    
+     def stream_decode(self, z, scale):
+         # self.clear_cache()
+         # z: [b,c,t,h,w]
+@@ -588,18 +612,13 @@ class VideoVAE_(nn.Module):
+             z = z / scale[1] + scale[0]
+         iter_ = z.shape[2]
+         x = self.conv2(z)
++        outs = []
+         for i in range(iter_):
+             self._conv_idx = [0]
+-            if i == 0:
+-                out = self.decoder(x[:, :, i:i + 1, :, :],
+-                                   feat_cache=self._feat_map,
+-                                   feat_idx=self._conv_idx)
+-            else:
+-                out_ = self.decoder(x[:, :, i:i + 1, :, :],
+-                                    feat_cache=self._feat_map,
+-                                    feat_idx=self._conv_idx)
+-                out = torch.cat([out, out_], 2) # may add tensor offload
+-        return out
++            outs.append(self.decoder(x[:, :, i:i + 1, :, :],
++                                     feat_cache=self._feat_map,
++                                     feat_idx=self._conv_idx))
++        return outs[0] if len(outs) == 1 else torch.cat(outs, 2)
+ 
+     def reparameterize(self, mu, log_var):
+         std = torch.exp(0.5 * log_var)
+@@ -789,11 +808,14 @@ class WanVideoVAE(nn.Module):
+ 
+         videos = [video.to("cpu") for video in videos]
+         hidden_states = []
++        # tile 尺寸的 ×8 换算必须放在循环外：以前写在 for video 里，第 2 个视频会再乘 64，
++        # 第 3 个乘 512（多视频输入时直接爆显存/切错块）。
++        if tiled:
++            tile_size = (tile_size[0] * 8, tile_size[1] * 8)
++            tile_stride = (tile_stride[0] * 8, tile_stride[1] * 8)
+         for video in videos:
+             video = video.unsqueeze(0)
+             if tiled:
+-                tile_size = (tile_size[0] * 8, tile_size[1] * 8)
+-                tile_stride = (tile_stride[0] * 8, tile_stride[1] * 8)
+                 hidden_state = self.tiled_encode(video, device, tile_size, tile_stride)
+             else:
+                 hidden_state = self.single_encode(video, device)

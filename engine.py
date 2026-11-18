@@ -1278,17 +1278,83 @@ def _qcache_save(path, items, log=None):
             log(f"量化缓存落盘失败（不影响本次运行）: {e}")
 
 
+def _roundup(v, m):
+    return (v + m - 1) // m * m
+
+
+# ---------------------------------------------------------------- 激活量化缓冲复用
+# comfy_kitchen.quantize_mxfp8 每次调用都会 torch.empty(qx) + torch.zeros(sx) +
+# 3 次 DLPack 包装 + current_stream 查询，实测 83.6 µs/次；这些 shape 的 scale 没有
+# padding 尾巴（会被 _C 全量覆写），缓冲完全可以按 (rows, cols) 复用：
+#   复用后 23.8 µs/次（-71%），单步约 180 次调用 → 省 ~10 ms。
+# 安全性：首次遇到某 shape 时同时算两条路并逐字节比对，不一致就永久回退。
+# 但**实测单步只省 0.5 ms（-0.6%）**：这一步已经是 GPU-bound，砍 CPU 分配没有用；
+# 之前消融显示 -15 ms 是因为"复用缓存张量"让 GEMM 每次读同一块热内存（L2 命中）。
+# 因此默认关闭，仅为以后 GPU 侧也放松时留个口子。
+_QUANT_REUSE = os.environ.get("FLASHVSR_QUANT_REUSE", "0") == "1"   # 实测只有 -0.6%，默认关
+_QUANT_BUF = {}
+_QUANT_SELFCHECK = {}          # shape -> True（已校验一致）
+_QUANT_REUSE_ENABLED = [True]  # 出现任何异常/不一致 → 置 False
+_QUANT_REUSE_N = [0]
+
+
+def _quantize_mxfp8_reuse(x, ck):
+    """带缓冲复用的 quantize_mxfp8；任何异常都退回原实现。"""
+    if not _QUANT_REUSE or not _QUANT_REUSE_ENABLED[0]:
+        return ck.quantize_mxfp8(x)
+    try:
+        rows, cols = x.shape
+        if x.dim() != 2 or not x.is_contiguous() or rows % 32 or cols % 32:
+            return ck.quantize_mxfp8(x)
+        key = (rows, cols, x.device.index)
+        hit = _QUANT_BUF.get(key)
+        if hit is None:
+            qx = torch.empty((rows, cols), device=x.device, dtype=torch.float8_e4m3fn,
+                             memory_format=torch.contiguous_format)
+            sx = torch.zeros((_roundup(rows, 128), _roundup(cols // 32, 4)),
+                             device=x.device, dtype=torch.uint8)
+            hit = _QUANT_BUF[key] = (qx, sx)
+        qx, sx_u8 = hit
+        from comfy_kitchen.backends import cuda as ck_cuda
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ck_cuda._C.quantize_mxfp8(ck_cuda._wrap_for_dlpack(x),
+                                  ck_cuda._wrap_for_dlpack(qx),
+                                  ck_cuda._wrap_for_dlpack(sx_u8),
+                                  False, stream)
+        sx = sx_u8.view(torch.float8_e8m0fnu)
+
+        if not _QUANT_SELFCHECK.get(key):
+            # 一次性自检：同输入跑原实现，逐字节比对（约 84 µs，只在首见时发生）
+            rq, rs = ck.quantize_mxfp8(x)
+            ok = (rq.view(torch.uint8).equal(qx.view(torch.uint8))
+                  and rs.view(torch.uint8).equal(sx.view(torch.uint8)))
+            if not ok:
+                _QUANT_REUSE_ENABLED[0] = False
+                print(f"[quant] 缓冲复用自检失败（{rows}x{cols}），已回退原实现", flush=True)
+                return rq, rs
+            _QUANT_SELFCHECK[key] = True
+        _QUANT_REUSE_N[0] += 1
+        return qx, sx
+    except Exception as e:  # noqa
+        _QUANT_REUSE_ENABLED[0] = False
+        print(f"[quant] 缓冲复用不可用（{type(e).__name__}: {str(e)[:120]}），已回退", flush=True)
+        return ck.quantize_mxfp8(x)
+
+
 def quantize_dit_mxfp8(pipe, log=None):
     """MXFP8（e4m3 + 每 32 元素 e8m0）。Ada/Hopper/Blackwell 都有原生 FP8 张量核。
 
     实测：单段 77.0→65.4 s（−15%），峰值 6.19→4.93 GiB，PSNR 46.49 dB。
     """
     import comfy_kitchen as ck
+    # 只在**激活**量化处用缓冲复用版（权重量化绝不能复用：形状可能与激活相同，
+    # 缓冲会互相覆盖）。首次自检失败/异常自动回退原实现。
+    _qact = (lambda x2: _quantize_mxfp8_reuse(x2, ck)) if _QUANT_REUSE else ck.quantize_mxfp8
 
     def _call(x, wq, wb, bias):
         shp = x.shape
         x2 = x.reshape(-1, shp[-1]).contiguous()
-        xq, xb = ck.quantize_mxfp8(x2)
+        xq, xb = _qact(x2)
         y = ck.scaled_mm_mxfp8(xq, wq, xb, wb, bias=bias, out_dtype=x.dtype)
         return y.reshape(*shp[:-1], y.shape[-1])
 
@@ -1317,6 +1383,55 @@ def quantize_dit_mxfp8(pipe, log=None):
                 f"MXFP8 量化缓存不完整（缺 {len(_miss)} 层），而权重是按「跳过读盘」"
                 f"加载的，继续跑会把未初始化显存量化后写回缓存。已清理缓存，请重新运行。")
     fresh = {}
+
+    # ---- Fused QKV -------------------------------------------------------
+    # self_attn 的 q/k/v 吃同一个 input_x：现在各做一次 quantize_mxfp8 + scaled_mm_mxfp8。
+    # 沿输出维拼成 [3D, D] 后只需 1 次量化 + 1 次更大的 GEMM（N 从 1536 → 4608，
+    # 张量核利用率更高），三个 Linear 的量化次数直接降到 1/3。
+    # 关掉：FLASHVSR_FUSE_QKV=0
+    fused_n = 0
+    if os.environ.get("FLASHVSR_FUSE_QKV", "1") != "0":
+        name_of = {id(m): n for n, m in _iter_linears(pipe.dit)}
+
+        def _mk_fused(wq, wb, b):
+            def _f(x):
+                shp = x.shape
+                x2 = x.reshape(-1, shp[-1]).contiguous()
+                xq, xb = _qact(x2)
+                y = ck.scaled_mm_mxfp8(xq, wq, xb, wb, bias=b, out_dtype=x.dtype)
+                return y.reshape(*shp[:-1], y.shape[-1])
+            return _f
+
+        for blk in getattr(pipe.dit, "blocks", []):
+            sa = getattr(blk, "self_attn", None)
+            if sa is None or getattr(sa, "_qkv_fused", None) is not None:
+                continue
+            mods = [getattr(sa, t, None) for t in ("q", "k", "v")]
+            if any(m is None or getattr(m, "weight", None) is None for m in mods):
+                continue
+            shp0 = mods[0].weight.shape
+            if any(m.weight.shape != shp0 for m in mods):
+                continue
+            qname = name_of.get(id(mods[0]))
+            if not qname or not _should_quant(qname):
+                continue
+            fname = qname.rsplit(".", 1)[0] + ".qkv_fused"
+            try:
+                # 不写进量化缓存：fused 权重是 q/k/v 的派生品，落盘会把 _qcache_save 的
+                # 「整体覆盖写」变成只剩 fused 条目，把逐层缓存冲掉（重跑就要全量重量化）。
+                # 30 组 4.7 MB 的量化 ≈ 0.2 s，不值当冒这个风险。
+                wq, wb = ck.quantize_mxfp8(torch.cat([_take_weight(m) for m in mods], 0))
+            except Exception as e:  # noqa
+                if log:
+                    log(f"mxfp8 fused-qkv 失败 {fname}: {e}")
+                continue
+            bias = None
+            if all(m.bias is not None for m in mods):
+                bias = torch.cat([m.bias.detach() for m in mods], 0)
+            sa._qkv_fused = _mk_fused(wq, wb, bias)
+            for m in mods:
+                _drop_weight(m)          # 权重已被 fused 版本取代，释放显存
+            fused_n += 1
 
     n = skipped = n_hit = 0
     for name, m in _iter_linears(pipe.dit):
@@ -1348,7 +1463,8 @@ def quantize_dit_mxfp8(pipe, log=None):
         _qcache_save(cache_path, fresh, log)
     torch.cuda.empty_cache()
     if log:
-        log(f"MXFP8: {n} 个 Linear（缓存命中 {n_hit}，本次新量化 {len(fresh)}），跳过 {skipped}")
+        log(f"MXFP8: {n} 个 Linear（缓存命中 {n_hit}，本次新量化 {len(fresh)}），跳过 {skipped}"
+            + (f"，Fused QKV {fused_n} 组" if fused_n else ""))
     return n
 
 
@@ -2558,6 +2674,7 @@ class Engine:
         # quant 决定"哪些权重已在量化缓存里、加载时可跳过读盘"，必须传进去
         install_stream_loader(quant)
         self.pipe = self.mod.init_pipeline("FlashVSR-v1.1", mode, "cuda:0", torch.bfloat16)
+
 
         import gc as _gc
         state = {"n": 0}
